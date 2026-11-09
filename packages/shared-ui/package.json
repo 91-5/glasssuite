@@ -9,6 +9,9 @@
     "./glass.css": "./src/glass.css"
   },
   "types": "./src/index.tsx",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
   "peerDependencies": {
     "react": "^19.0.0"
   },
@@ -16,6 +19,7 @@
     "@glasssuite/ipc-types": "workspace:*"
   },
   "devDependencies": {
-    "@types/react": "^19.0.0"
+    "@types/react": "^19.0.0",
+    "typescript": "^5.8.0"
   }
 }

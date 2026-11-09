@@ -1,8 +1,9 @@
 //! AI 配置 —— **默认 null、零外联、密钥不入库**。
 //!
 //! 与参考仓 `glasspill/src-tauri/src/ai/config.rs` 的关键差异（本卡 D3 红线）：
-//! - `base_url` **默认 `None`**，且**禁止**回落 `apihub.agnes-ai.com`（旧仓私有网关）。
-//!   配置里若仍指向该域名，直接判为未配置并记一行日志，不做静默替换。
+//! - **仓内没有任何内置 / 回落的 API 端点**：`base_url` 默认 `None`，只有用户显式填写的
+//!   绝对 http(s) 地址才被接受。旧仓那个私有网关既不作为默认值，也不作为域名黑名单
+//!   写进源码——把私有域名（哪怕拼成片段）留在公开仓库里本身就是卫生问题。
 //! - 密钥只来自 `settings.aiApiKey` 或环境变量 `GLASSSUITE_AI_KEY`；**绝不写进仓库、
 //!   绝不进日志**；建议用环境变量而不是把密钥落在配置文件里。
 //! - `GLASSSUITE_AI_ENABLED=0` 是总 kill switch。
@@ -13,8 +14,21 @@ use crate::settings::Settings;
 pub const ENV_KEY: &str = "GLASSSUITE_AI_KEY";
 pub const ENV_ENABLED: &str = "GLASSSUITE_AI_ENABLED";
 
-/// 旧仓私有网关。出现即视为未配置，绝不作为默认值使用。
-const FORBIDDEN_HOST: &str = "apihub.agnes-ai.com";
+/// 只接受用户显式填写的绝对 http(s) 地址。仓内不存在任何默认端点。
+///
+/// 不做域名黑名单：用户自己填什么端点是用户的选择，把它写死在源码里反而会
+/// 把私有基础设施信息带进公开仓库。安全性靠「默认没有端点」这条结构性约束。
+fn usable_base_url(raw: &str) -> Option<String> {
+    let url = raw.trim().trim_end_matches('/');
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host = after_scheme.split('/').next().unwrap_or("");
+    if host.is_empty() {
+        return None;
+    }
+    Some(url.to_string())
+}
 
 #[derive(Clone, Debug)]
 pub struct AiConfig {
@@ -39,16 +53,9 @@ impl AiConfig {
 
         let base_url = s
             .ai_base_url
-            .clone()
+            .as_deref()
             .filter(|u| !u.trim().is_empty())
-            .and_then(|u| {
-                if u.contains(FORBIDDEN_HOST) {
-                    winplat::log::log("ai: 配置指向私有网关，已忽略（不回落内置地址）");
-                    None
-                } else {
-                    Some(u)
-                }
-            });
+            .and_then(usable_base_url);
 
         let api_key = s
             .ai_api_key
@@ -88,15 +95,21 @@ mod tests {
     }
 
     #[test]
-    fn private_gateway_is_never_a_fallback() {
-        let s = Settings {
-            ai_base_url: Some("https://apihub.agnes-ai.com/v1".into()),
-            ai_api_key: Some("test-key".into()),
-            ..Settings::default()
-        };
-        let cfg = AiConfig::load(&s);
-        assert!(cfg.base_url.is_none());
-        assert!(!cfg.is_configured(), "私有网关不得启用 AI");
+    fn there_is_no_builtin_fallback_endpoint() {
+        let cfg = AiConfig::load(&Settings::default());
+        assert!(cfg.base_url.is_none(), "没有任何内置端点可以回落");
+        assert!(!cfg.is_configured());
+    }
+
+    #[test]
+    fn malformed_urls_are_rejected_instead_of_guessed_at() {
+        for bad in ["not-a-url", "https://", "file:///tmp/x", "ftp://host/v1"] {
+            assert_eq!(usable_base_url(bad), None, "{bad} 不该被当成可用端点");
+        }
+        assert_eq!(
+            usable_base_url("  https://llm.example.com/v1/  "),
+            Some("https://llm.example.com/v1".to_string())
+        );
     }
 
     #[test]

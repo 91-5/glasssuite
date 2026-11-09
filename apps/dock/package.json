@@ -6,6 +6,7 @@
   "description": "GlassSuite 底部 dock 窗口前端。",
   "scripts": {
     "dev": "vite",
+    "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview"
   },

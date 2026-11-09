@@ -9,14 +9,19 @@ are redistributed with, or linked into, the project.
 | Vite | 6.x | MIT | build-time only |
 | @vitejs/plugin-react | 4.x | MIT | build-time only |
 | TypeScript | 5.x | Apache-2.0 | build-time only |
-| Tauri | 2.x | MIT / Apache-2.0 | linked (added in a later milestone) |
+| Tauri | 2.x | MIT / Apache-2.0 | linked |
 | `windows` crate | 0.62 | MIT / Apache-2.0 | linked |
+| `rusqlite` (bundled SQLite) | 0.32 | MIT / SQLite public domain | linked (notification WAL snapshot) |
+| `ureq`, `base64`, `sysinfo`, `windows-future` | — | MIT / Apache-2.0 | linked |
 
 ## Fonts
 
-No font files are currently redistributed. If a bundled font is added later, its license text
-**must** ship next to it (for example LXGW WenKai is OFL-1.1 — the full OFL text goes into
-`assets/fonts/OFL.txt`, not just a link).
+**No font files are currently redistributed.** The UI uses system font families only. The two ~19 MB
+font files from the predecessor project were intentionally not imported (38,068,020 bytes saved).
+
+`licenses/OFL-1.1.txt` contains the complete SIL Open Font License 1.1 text for **future** use: if a
+bundled/subsetted font is ever added, its copyright notice plus this license text must ship with it,
+and the font must be registered in this table. Today the OFL text applies to no file in this repo.
 
 ## Application icons
 

@@ -12,6 +12,6 @@
     "build": "pnpm -r build",
     "dev:dock": "pnpm --filter @glasssuite/dock dev",
     "dev:island": "pnpm --filter @glasssuite/island dev",
-    "check": "pnpm -r exec tsc --noEmit"
+    "check": "pnpm -r --if-present run typecheck"
   }
 }
