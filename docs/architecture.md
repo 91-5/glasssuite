@@ -46,15 +46,22 @@ All geometry is **physical pixels**, matching Win32 `RECT` (right/bottom exclusi
 
 - `Rect::centered_x(width)` — center a window within a given rect; relative to that rect's origin,
   so a secondary monitor with a non-zero origin is handled.
-- `Rect::bottom_anchored_y(height, margin)` — sit above the taskbar with a margin.
-- `Rect::is_plausible_taskbar(screen_height)` — reject phantom taskbar rects.
+- `Rect::above_anchored_y(height, margin)` — put a window sitting **above** a rect's top edge. This is
+  the dock anchor: the dock sits above the taskbar's *top* edge, never above the hidden taskbar rect's
+  bottom edge (which is off-screen by design).
+- `Rect::is_plausible_taskbar` / `looks_like_hidden_dock` — reject phantom taskbar rects.
 
 Phantom taskbar rects are real: after a full-screen app reveals an auto-hidden taskbar and the app
 exits, `GetWindowRect` can return the *visible* position (e.g. `top=1032`) while the taskbar is
-actually hidden and docked at `(0, 1078, 1920, 1126)`. Trusting it moves windows up by ~46 px.
+actually hidden and docked at `(0, 1078, 1920, 1126)`. Trusting it moves windows up by ~46 px. The
+discriminator: a genuinely hidden taskbar has *slid off-screen*, so its `bottom` exceeds the screen's
+bottom; a rect ending exactly at the screen bottom while reporting "hidden" is a phantom.
 
 Resize and reposition must happen **in one synchronous sequence**: resize keeps the top-left corner
 fixed, so resizing before recentering produces a visible two-step shift of existing content.
+
+Live check: `cargo run -p winplat --example probe` prints screen, taskbar and foreground-fullscreen
+values from the real desktop.
 
 ## 4. DPI (planned)
 
@@ -77,13 +84,20 @@ One detection routine, quality-number-system based, with the shell-window exclus
 from the dock. Reason: a purely geometric check misses exclusive-fullscreen apps, and two different
 answers in one process means the island hides while the dock shows.
 
-## 7. Logging and config (planned)
-
-One log file per user, one truncation policy, timestamps in local time plus a monotonic counter.
-Config lives under `%APPDATA%\com.glasssuite.app\`. On first run, config from the two legacy apps is
-migrated once (`dock.json`, `menu.json`), and the migration is logged.
-
-## 8. Single instance (planned)
+## 7. Single instance (implemented: `winplat::instance`)
 
 One named mutex (`Local\GlassSuite.SingleInstance`). A second launch exits 0 and logs
 `already running`; it does not steal focus.
+
+Implementation note that cost real time: the returned guard must be **bound in `main`'s scope**. Writing
+`match acquire() { Ok(Some(_g)) => ... }` drops the guard at the end of the match arm, releasing the
+mutex immediately — a second instance then starts happily. The probe binary hit exactly this.
+
+## 8. Logging and config (implemented: `winplat::{log,config}`)
+
+- Log: one file per user under `%APPDATA%\com.glasssuite.app\glasssuite.log`, local-time-ordered
+  lines, truncated in place when it exceeds 64 KB (keeps the tail, never a `.1` sidecar). Callers must
+  redact user home paths (`log::redact`); window titles and notification bodies never go to logs.
+- Config: plain JSON, atomic write (temp file + rename), corrupt file → `None` → defaults, never a
+  startup failure. Legacy `dev.glassdesk.app` / `dev.glasspill.app` files are copied **once** and
+  never overwritten.

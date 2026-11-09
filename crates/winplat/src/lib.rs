@@ -13,6 +13,22 @@
 //! **纪律**：`SetProcessDpiAwarenessContext` 全仓只允许在此 crate 调用一次，且必须在
 //! 任何窗口创建之前完成（旧 glasspill 主进程漏了这一步，导致窗口在高 DPI 下错位）。
 
+pub mod config;
+pub mod dpi;
+pub mod fullscreen;
 pub mod geom;
+pub mod log;
+pub mod screen;
+pub mod style;
+pub mod taskbar;
+
+#[cfg(windows)]
+pub mod instance;
 
 pub use geom::Rect;
+
+/// 本产品的标识符。派生配置目录（`%APPDATA%\com.glasssuite.app`）与 WebView2 数据目录。
+pub const IDENTIFIER: &str = "com.glasssuite.app";
+
+/// 旧产品标识符，仅用于一次性配置迁移，不得用于新建目录。
+pub const LEGACY_IDENTIFIERS: [&str; 2] = ["dev.glassdesk.app", "dev.glasspill.app"];
