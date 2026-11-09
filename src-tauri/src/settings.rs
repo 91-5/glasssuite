@@ -22,7 +22,27 @@ pub struct WeatherConfig {
     pub timezone: Option<String>,
 }
 
+/// 通知读取开关。**默认关闭**：读通知内容属于隐私操作，必须由用户显式打开。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct NotificationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// dock 行为配置。
+///
+/// `auto_hide` 默认 **false**：验收基线要求「两窗同时可见」，默认隐藏会让 dock
+/// 首帧不可见，也让人误以为程序没起来。用户在配置里显式打开即可。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DockSettings {
+    /// 自动隐藏（贴底 4px 唤出 / 离开 800ms 收起）。
+    #[serde(default)]
+    pub auto_hide: bool,
+}
+
 /// 应用配置。所有字段都有默认值：缺键 = 用默认（关闭）。
+///
+/// 硬约束 12：天气坐标、网络探测地址、AI `base_url`、歌词源，首启模板里**全部为 null**。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     /// 卡片顶部显示天气。`null` = 关闭（默认，不联网）。
@@ -37,6 +57,18 @@ pub struct Settings {
     /// AI 密钥。建议改用环境变量 `GLASSSUITE_AI_KEY`，避免把密钥写进磁盘。
     #[serde(default, rename = "aiApiKey")]
     pub ai_api_key: Option<String>,
+    /// 歌词源地址（LRCLIB 兼容 `/api/get`、`/api/search`）。`null` = 关闭（默认，不联网）。
+    #[serde(default, rename = "lyricsSourceUrl")]
+    pub lyrics_source_url: Option<String>,
+    /// AI 模型名。仅在 `aiBaseUrl` 与密钥都配好时生效。
+    #[serde(default, rename = "aiModel")]
+    pub ai_model: Option<String>,
+    /// 系统通知摘要读取。默认关闭。
+    #[serde(default)]
+    pub notifications: NotificationConfig,
+    /// dock 行为。
+    #[serde(default)]
+    pub dock: DockSettings,
 }
 
 /// 配置文件名。放在 `%APPDATA%\com.glasssuite.app\` 下。
@@ -84,6 +116,27 @@ mod tests {
         assert!(s.weather.is_none(), "天气默认关闭");
         assert!(s.network_probe_url.is_none(), "网络探测默认关闭");
         assert!(s.ai_base_url.is_none(), "AI 默认不指向任何地址");
+        assert!(s.ai_api_key.is_none());
+        assert!(s.lyrics_source_url.is_none(), "歌词源默认关闭");
+        assert!(!s.notifications.enabled, "通知读取默认关闭");
+
+        // 硬约束 12：首启模板里所有外联字段必须是 null，不能有内置地址。
+        let raw = std::fs::read_to_string(path(&dir)).unwrap();
+        let template: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for key in [
+            "weather",
+            "networkProbeUrl",
+            "aiBaseUrl",
+            "aiApiKey",
+            "lyricsSourceUrl",
+        ] {
+            assert!(
+                template.get(key).is_some_and(|v| v.is_null()),
+                "首启模板的 {key} 必须为 null，实际为 {:?}",
+                template.get(key)
+            );
+        }
+        assert_eq!(template["notifications"]["enabled"].as_bool(), Some(false));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

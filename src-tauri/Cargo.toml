@@ -24,3 +24,31 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = "0.33"
 ureq = { version = "2", features = ["tls"] }
+base64 = "0.22"
+# wpndatabase.db 是 WAL 模式的 SQLite，只读快照后打开副本
+rusqlite = { version = "0.32", features = ["bundled"] }
+# windows 0.62 不再转发 IAsyncOperation/AsyncStatus，直连同版本 windows-future
+windows-future = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+# 与 winplat 共用 workspace.dependencies 里的 0.62，feature 由 cargo 合并；
+# 此处只补 shell 层自己需要的 Win32/WinRT 面（媒体、通知、光标、dock）。
+windows = { workspace = true, features = [
+    "Foundation",
+    "Media_Control",
+    "Storage_Streams",
+    "ApplicationModel",
+    "UI_Notifications",
+    "UI_Notifications_Management",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

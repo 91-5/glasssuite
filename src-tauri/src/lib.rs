@@ -2,6 +2,7 @@
 //!
 //! 分层（对应卡内 `crates/shell` 的职责，落在 `src-tauri/` 这个 app crate 里）：
 //! - `shell`    ：建窗、摆位、内容自适应尺寸（几何全部来自 `winplat`）；
+//! - `state`    ：进程级共享状态（媒体通道、热区、穿透标志），供钩子和命令共用；
 //! - `island`   ：岛的功能域（系统指标 / 天气 / 网络 / 媒体 / 通知 / 歌词 / AI）；
 //! - `settings` ：用户配置（默认全部关闭需要联网或读取隐私数据的功能）。
 //!
@@ -14,6 +15,9 @@
 pub mod island;
 pub mod settings;
 pub mod shell;
+pub mod state;
+
+use std::sync::Arc;
 
 use tauri::Manager;
 
@@ -44,12 +48,17 @@ pub fn run() {
         }
     };
 
+    let shared = Arc::new(state::SharedState::default());
+
     tauri::Builder::default()
+        .manage(Arc::clone(&shared))
         .invoke_handler(tauri::generate_handler![
             shell::fit_dock,
             shell::fit_island,
             settings::settings_get,
             island::log_frontend,
+            island::media::media_control,
+            island::media::media_state,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -61,13 +70,37 @@ pub fn run() {
             shell::create_windows(&handle)?;
             winplat::log::log("窗口就绪：island + dock");
 
+            let st = app.state::<Arc<state::SharedState>>().inner().clone();
+            cache_hwnds(&handle, &st);
+
             // 功能域线程（各自内部按配置决定是否真的联网/读取）。
             let s = app.state::<settings::Settings>().inner().clone();
             island::metrics::spawn(handle.clone());
             island::weather::spawn(handle.clone(), s.weather.clone());
             island::network::spawn(handle.clone(), s.network_probe_url.clone());
+            island::media::spawn(handle.clone(), Arc::clone(&st));
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("Tauri 运行失败");
 }
+
+/// 把两窗的原生句柄与可见态写进共享状态，供鼠标钩子做样式对账。
+#[cfg(windows)]
+fn cache_hwnds(app: &tauri::AppHandle, state: &Arc<state::SharedState>) {
+    use std::sync::atomic::Ordering;
+    for (label, hwnd_slot, visible_slot) in [
+        ("island", &state.island_hwnd, &state.island_visible),
+        ("dock", &state.dock_hwnd, &state.dock_visible),
+    ] {
+        if let Some(win) = app.get_webview_window(label) {
+            if let Ok(h) = win.hwnd() {
+                hwnd_slot.store(h.0 as isize, Ordering::SeqCst);
+            }
+            visible_slot.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn cache_hwnds(_app: &tauri::AppHandle, _state: &Arc<state::SharedState>) {}

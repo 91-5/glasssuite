@@ -26,6 +26,15 @@ export const COMMANDS = {
   settingsGet: "settings_get",
   /** 前端诊断日志。 */
   logFrontend: "log_frontend",
+  /** 媒体控制：play | pause | play_pause | next | prev | seek。 */
+  mediaControl: "media_control",
+  /** 取最近一次 SMTC 快照（窗口重建 / 首帧补齐）。 */
+  mediaState: "media_state",
+  /** 上报交互热区（CSS 逻辑像素，相对窗口客户区原点）。 */
+  setHotzone: "set_hotzone",
+  /** 展开 / 收起岛面板（用 resize 实现，不引入固定尺寸热区窗）。 */
+  expandPanel: "expand_panel",
+  collapsePanel: "collapse_panel",
 } as const;
 
 /** 后端 → 前端事件名。 */
@@ -105,6 +114,12 @@ export interface Settings {
   networkProbeUrl?: string | null;
   aiBaseUrl?: string | null;
   aiApiKey?: string | null;
+  aiModel?: string | null;
+  /** 歌词源地址；null = 关闭（默认不联网）。 */
+  lyricsSourceUrl?: string | null;
+  /** 系统通知摘要读取，默认关闭。 */
+  notifications?: { enabled: boolean };
+  dock?: { autoHide: boolean };
 }
 
 export async function getSettings(): Promise<Settings> {
@@ -151,12 +166,24 @@ export interface MediaState {
   album?: string | null;
   /** 封面 data URL（由 Rust 侧从缩略图转码）。 */
   artwork?: string | null;
+  appId?: string | null;
+  status?: string | null;
   playing: boolean;
-  /** 当前进度（毫秒）。 */
+  /** 收到该快照时播放器报告的进度（毫秒）。 */
   positionMs: number;
+  /** 播放器报告 positionMs 的时刻（Unix 毫秒，FILETIME 换算）。 */
+  baseUnixMs: number;
+  /** 播放速率，通常为 1。 */
+  rate: number;
   /** 总时长（毫秒）；0 表示未知（直播流）。 */
   durationMs: number;
+  canPlay: boolean;
+  canPause: boolean;
+  canNext: boolean;
+  canPrev: boolean;
 }
+
+export type MediaAction = "play" | "pause" | "play_pause" | "next" | "prev" | "seek";
 
 /** 系统通知条目。 */
 export interface NotificationItem {
@@ -194,4 +221,44 @@ export function subscribe<T>(
     cancelled = true;
     unlisten?.();
   };
+}
+
+// ---------------------------------------------------------------------------
+// 媒体（SMTC，事件驱动）
+// ---------------------------------------------------------------------------
+
+/** 取最近一次媒体快照；无媒体时为 `null`（前端据此回落时钟）。 */
+export async function getMediaState(): Promise<MediaState | null> {
+  return invoke<MediaState | null>(COMMANDS.mediaState);
+}
+
+/**
+ * 下发媒体控制指令。`seek` 需要额外传 `positionMs`。
+ *
+ * 指令进入 SMTC 专用线程串行执行，调用方不等待 WinRT 完成——播放器回报滞后由后端
+ * 延迟补一次 Refresh 兜住，前端随后会收到新的 `media-state`。
+ */
+export async function mediaControl(action: MediaAction, positionMs?: number): Promise<void> {
+  await invoke(COMMANDS.mediaControl, { action, positionMs });
+}
+
+/** 上报当前窗口的交互热区（内容尺寸变化时重新上报）。 */
+export async function setHotzone(
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  target: "island" | "dock" = "island",
+): Promise<void> {
+  await invoke(COMMANDS.setHotzone, { x, y, w, h, target });
+}
+
+/** 展开面板（resize 到面板尺寸并取消穿透）。 */
+export async function expandPanel(): Promise<void> {
+  await invoke(COMMANDS.expandPanel);
+}
+
+/** 收起面板（resize 回内容尺寸并恢复穿透）。 */
+export async function collapsePanel(): Promise<void> {
+  await invoke(COMMANDS.collapsePanel);
 }

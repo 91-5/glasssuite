@@ -12,9 +12,125 @@
 
 .island-pill {
   gap: 10px;
-  height: 40px;
+  min-height: 40px;
   flex: 0 0 auto;
   white-space: nowrap;
+}
+
+/* 媒体模式：两行（信息行 + 进度条），高度由内容决定，窗口跟随 resize。 */
+.island-pill--media {
+  height: auto;
+}
+
+.island-media {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 300px;
+  min-width: 0;
+}
+
+.island-media-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.island-artwork {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  border-radius: 7px;
+  object-fit: cover;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.island-artwork--placeholder {
+  font-size: 16px;
+  color: var(--gs-text-dim);
+}
+
+.island-media-text {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+  flex: 1 1 auto;
+  line-height: 1.2;
+}
+
+.island-media-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.island-media-artist {
+  font-size: 10.5px;
+  color: var(--gs-text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.island-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.island-control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--gs-text, #fff);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.island-control:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.island-control:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.island-control--primary {
+  font-size: 13px;
+}
+
+.island-progress {
+  position: relative;
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.18);
+  overflow: hidden;
+}
+
+.island-progress.is-seekable {
+  cursor: pointer;
+}
+
+.island-progress-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--gs-accent, #8ad7ff);
+  /* 与 1Hz 插值同拍：把每秒一次的跳变抹成连续运动，不引入高频定时器。 */
+  transition: width 1s linear;
 }
 
 .island-clock {
