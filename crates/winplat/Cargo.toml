@@ -20,4 +20,5 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader",
+    "Win32_System_Power",
 ] }

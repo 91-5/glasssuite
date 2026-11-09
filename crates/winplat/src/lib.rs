@@ -25,6 +25,12 @@ pub mod taskbar;
 #[cfg(windows)]
 pub mod instance;
 
+/// GPU 与电源读数只在本产品需要「系统指标」时才用；仍是平台能力，故放本 crate。
+#[cfg(windows)]
+pub mod gpu;
+#[cfg(windows)]
+pub mod power;
+
 pub use geom::Rect;
 
 /// 本产品的标识符。派生配置目录（`%APPDATA%\com.glasssuite.app`）与 WebView2 数据目录。

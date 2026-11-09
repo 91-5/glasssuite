@@ -10,6 +10,10 @@ authors.workspace = true
 name = "GlassSuite"
 path = "src/main.rs"
 
+[lib]
+name = "glasssuite"
+path = "src/lib.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -18,3 +22,5 @@ tauri = { version = "2", features = [] }
 winplat = { path = "../crates/winplat" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sysinfo = "0.33"
+ureq = { version = "2", features = ["tls"] }
