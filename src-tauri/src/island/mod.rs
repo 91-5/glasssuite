@@ -9,6 +9,7 @@
 pub mod media;
 pub mod metrics;
 pub mod network;
+pub mod notification;
 pub mod weather;
 
 /// 前端诊断通道：让 UI 侧的关键事件也进日志，便于排查「后端有数据但界面没反应」。

@@ -27,6 +27,10 @@ pub struct WeatherConfig {
 pub struct NotificationConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// UIA 兜底轮询。默认关闭：旧仓实测会与主路径重复上报且依赖 Toast 窗口存续，
+    /// 只有确实需要覆盖「不走通知中心的来源」时才打开。
+    #[serde(default, rename = "uiaFallback")]
+    pub uia_fallback: bool,
 }
 
 /// dock 行为配置。

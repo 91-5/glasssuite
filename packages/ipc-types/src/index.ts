@@ -185,13 +185,19 @@ export interface MediaState {
 
 export type MediaAction = "play" | "pause" | "play_pause" | "next" | "prev" | "seek";
 
-/** 系统通知条目。 */
+/**
+ * 系统通知**摘要条**。
+ *
+ * 刻意没有 `body`：通知正文不进入前端、不落盘、不进日志，原文由 Windows 横幅展示。
+ * `source` 只标识事件来源类型（wpndatabase / user-notification-listener / uia-fallback）。
+ */
 export interface NotificationItem {
   app: string;
+  /** 已按字符截断（后端 60 字，前端再做 CSS 省略）。 */
   title: string;
-  body: string;
   /** 到达时间（Unix 毫秒）。 */
   arrivedAt: number;
+  source: string;
 }
 
 /**

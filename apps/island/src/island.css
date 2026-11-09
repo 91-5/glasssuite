@@ -176,3 +176,36 @@
   font-size: 13px;
   line-height: 1;
 }
+
+/* 通知摘要条：只显示应用名 + 截断标题，正文不进前端。 */
+.island-notification {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 320px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.island-notification-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--gs-accent, #8ad7ff);
+}
+
+.island-notification-app {
+  flex: 0 0 auto;
+  color: var(--gs-text-dim);
+}
+
+.island-notification-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.island-notification--privacy {
+  color: var(--gs-text-dim);
+}

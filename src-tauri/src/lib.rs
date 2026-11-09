@@ -79,6 +79,7 @@ pub fn run() {
             island::weather::spawn(handle.clone(), s.weather.clone());
             island::network::spawn(handle.clone(), s.network_probe_url.clone());
             island::media::spawn(handle.clone(), Arc::clone(&st));
+            island::notification::spawn(handle.clone(), s.notifications.clone());
             Ok(())
         })
         .run(tauri::generate_context!())
