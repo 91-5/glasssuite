@@ -1,0 +1,33 @@
+# 依赖与构建产物
+node_modules/
+dist/
+target/
+*.pdb
+*.lib
+*.exp
+
+# 本地环境与凭据（永不入库）
+.env
+.env.*
+*.local
+
+# 日志与崩溃转储
+*.log
+logs/
+*.dmp
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 内部工作流物（不进开源仓，见 OC-20261109-001 §6.3）
+.tasks/
+verdicts/
+artifacts/
+artifacts.json
+AGENTS.md
+HANDOFF.md
+PROGRESS.md
+ADR-*

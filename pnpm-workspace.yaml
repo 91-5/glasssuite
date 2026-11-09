@@ -1,0 +1,9 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# pnpm 11 默认拦截依赖的安装脚本（供应链安全），必须逐条白名单。
+# esbuild 需要下载/校验平台二进制，vite 构建依赖它；其余依赖一律不放行。
+# 升级 esbuild 时必须同步改这里的版本号，否则安装会被拦（报 ERR_PNPM_IGNORED_BUILDS）。
+allowBuilds:
+  esbuild@0.25.0: true

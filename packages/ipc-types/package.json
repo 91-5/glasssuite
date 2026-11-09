@@ -1,0 +1,11 @@
+{
+  "name": "@glasssuite/ipc-types",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "GlassSuite 前端与 Rust 侧共享的 IPC 契约（命令名、事件名、payload 类型）。",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "types": "./src/index.ts"
+}

@@ -1,0 +1,17 @@
+{
+  "name": "glasssuite",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "GlassSuite — a glass-styled desktop suite for Windows: top island + bottom dock, single process.",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@11.21.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev:dock": "pnpm --filter @glasssuite/dock dev",
+    "dev:island": "pnpm --filter @glasssuite/island dev",
+    "check": "pnpm -r exec tsc --noEmit"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "@glasssuite/shared-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "island 与 dock 共用的玻璃表面样式与基础组件（源码直供，由各 app 的 vite 编译）。",
+  "exports": {
+    ".": "./src/index.tsx",
+    "./glass.css": "./src/glass.css"
+  },
+  "types": "./src/index.tsx",
+  "peerDependencies": {
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0"
+  }
+}
