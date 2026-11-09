@@ -12,6 +12,7 @@
 //! 3. 创建窗口 → 设为工具窗口 + 不抢焦点 → 摆位 → 最后 show（避免先出现在默认位置）；
 //! 4. 窗口就绪后再启动功能域采样线程（早于窗口订阅会丢首帧事件）。
 
+pub mod dock;
 pub mod island;
 pub mod settings;
 pub mod shell;
@@ -64,6 +65,21 @@ pub fn run() {
             window::set_hotzone,
             window::panel::expand_panel,
             window::panel::collapse_panel,
+            dock::dock_state,
+            dock::dock_icon,
+            dock::dock_launch,
+            dock::dock_launch_path,
+            dock::dock_reorder,
+            dock::dock_auto_hide,
+            dock::dock_set_revealed,
+            dock::dock_set_free,
+            dock::dock_undock_free,
+            dock::dock_move_free,
+            dock::dock_menu_apps,
+            dock::dock_menu_favourites,
+            dock::dock_menu_toggle,
+            dock::dock_preview_show,
+            dock::dock_preview_hide,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -94,6 +110,14 @@ pub fn run() {
             winplat::log::log(&format!("cursor: island initial passthrough={passthrough}"));
 
             window::panel::spawn_fullscreen_watch(handle.clone(), Arc::clone(&st));
+
+            // dock 数据层：迁移旧配置 → 载入 → 建开始菜单/游离窗 → 起运行集合 watcher。
+            // 迁移必须先于 DockState::new：后者会在目标文件缺失时写种子 dock.json，
+            // 把迁移目标占住（真实启动验证时发现过，见 dock::init 文档注释）。
+            dock::config::migrate_legacy(&data_dir);
+            let dock_state = Arc::new(dock::DockState::new(data_dir.clone()));
+            app.manage(Arc::clone(&dock_state));
+            dock::init(&handle, &dock_state);
 
             // 功能域线程（各自内部按配置决定是否真的联网/读取）。
             let s = app.state::<settings::Settings>().inner().clone();

@@ -123,13 +123,17 @@ fn apply_styles(raw_hwnd: isize) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 计算并应用窗口位置与尺寸（逻辑 → 物理在此一次性换算）。
-pub fn place(
+/// 算出「新尺寸下窗口该在哪」——**中心锚定**，不是保持旧左上角。
+///
+/// 这是 v0.8.1 防跳修复 #4 的几何基础：窗口宽度随图标增减变化时，若让 `set_size`
+/// 以旧左上角为锚，内容会整体平移半个增量，前端 FLIP 会把这一帧当成图标位移，
+/// 于是整排图标一起跳动。正确做法是先用新宽度算出居中位置并同步 `set_position`。
+fn compute_geometry(
     window: &WebviewWindow,
     anchor: Anchor,
     w_logical: f64,
     h_logical: f64,
-) -> Result<(), String> {
+) -> Result<(PhysicalPosition<i32>, PhysicalSize<u32>), String> {
     let scale = window.scale_factor().map_err(|e| e.to_string())?;
     let pw = (w_logical * scale).round().max(1.0) as i32;
     let ph = (h_logical * scale).round().max(1.0) as i32;
@@ -162,15 +166,108 @@ pub fn place(
         }
         Anchor::Island => (screen.centered_x(pw), screen.top + ISLAND_MARGIN),
     };
+    Ok((
+        PhysicalPosition::new(x, y),
+        PhysicalSize::new(pw as u32, ph as u32),
+    ))
+}
 
+/// 计算并应用窗口位置与尺寸（逻辑 → 物理在此一次性换算）。
+pub fn place(
+    window: &WebviewWindow,
+    anchor: Anchor,
+    w_logical: f64,
+    h_logical: f64,
+) -> Result<(), String> {
+    let (position, size) = compute_geometry(window, anchor, w_logical, h_logical)?;
     // 先定位再改尺寸：set_size 保持左上角，顺序反过来会看到内容先挪再缩。
+    window.set_position(position).map_err(|e| e.to_string())?;
+    window.set_size(size).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 按绝对屏幕坐标摆放辅助窗口（开始菜单 / 游离图标）。
+///
+/// 与 `place` 的区别：这两个窗口不是「贴屏幕上沿 / 贴任务栏」，位置由内容决定，
+/// 所以不接受 `Anchor`。仍然保持「先定位后改尺寸」的同步顺序。
+pub fn place_at(
+    window: &WebviewWindow,
+    x_logical: f64,
+    y_logical: f64,
+    w_logical: f64,
+    h_logical: f64,
+) -> Result<(), String> {
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
     window
-        .set_position(PhysicalPosition::new(x, y))
+        .set_position(PhysicalPosition::new(
+            (x_logical * scale).round() as i32,
+            (y_logical * scale).round() as i32,
+        ))
         .map_err(|e| e.to_string())?;
     window
-        .set_size(PhysicalSize::new(pw as u32, ph as u32))
+        .set_size(PhysicalSize::new(
+            (w_logical * scale).round().max(1.0) as u32,
+            (h_logical * scale).round().max(1.0) as u32,
+        ))
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 开始菜单面板：在 dock 正上方居中摆放（物理像素偏移按当前缩放换算）。
+///
+/// 不引入固定尺寸热区窗：面板本身尺寸固定，但窗口尺寸就等于面板尺寸，
+/// 与 island 展开面板同一套 resize 模型。
+pub fn place_above_dock(
+    window: &WebviewWindow,
+    w_logical: f64,
+    h_logical: f64,
+    dock_h_logical: f64,
+) -> Result<(), String> {
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let (pos, size) = compute_geometry(window, Anchor::Dock, w_logical, h_logical)?;
+    let y = pos.y - (dock_h_logical * scale).round() as i32;
+    window
+        .set_position(PhysicalPosition::new(pos.x, y))
+        .map_err(|e| e.to_string())?;
+    window.set_size(size).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 按需创建辅助窗口（第三个及以后的窗口）。重复调用返回既有窗口，不新建。
+///
+/// 复用 `dock/index.html` 的 hash 路由，避免为开始菜单 / 游离图标再起一套前端构建。
+/// 窗口一律**先隐藏**创建，由调用方摆好位置再 show。
+pub fn ensure_window(
+    app: &AppHandle,
+    label: &str,
+    url: &str,
+    w: f64,
+    h: f64,
+) -> Result<WebviewWindow, String> {
+    if let Some(win) = app.get_webview_window(label) {
+        return Ok(win);
+    }
+    let win = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+        .title("GlassSuite")
+        .inner_size(w, h)
+        .decorations(false)
+        .transparent(true)
+        .resizable(false)
+        .maximizable(false)
+        .minimizable(false)
+        .closable(false)
+        .skip_taskbar(true)
+        .always_on_top(true)
+        .focused(false)
+        .shadow(false)
+        .visible(false)
+        .build()
+        .map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    if let Ok(hwnd) = win.hwnd() {
+        apply_styles(hwnd.0 as isize).map_err(|e| e.to_string())?;
+    }
+    Ok(win)
 }
 
 /// 记录内容尺寸、缩放与热区。
@@ -207,6 +304,14 @@ pub fn fit_dock(
 ) -> Result<(), String> {
     winplat::log::log(&format!("fit_dock w={w} h={h}"));
     remember(&window, state.inner().as_ref(), "dock", w, h);
+
+    // v0.8.1 防跳修复 #4：在**缩放之前**先按「新窗口中心 = 屏幕中心」同步 set_position。
+    // 若只调 place()，虽然 place 内部也是先定位后改尺寸，但那一步与 set_size 之间存在
+    // 一次 IPC/合成器往返；旧仓在图标连续增减时正是这一帧被 FLIP 读成整排位移。
+    // 这里先单独把原点摆到新尺寸的居中位置，place() 再幂等确认一次并改尺寸。
+    let (position, _) = compute_geometry(&window, Anchor::Dock, w, h)?;
+    window.set_position(position).map_err(|e| e.to_string())?;
+
     place(&window, Anchor::Dock, w, h)
 }
 

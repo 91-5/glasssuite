@@ -49,3 +49,160 @@
   flex: 0 0 auto;
   background: rgba(255, 255, 255, 0.16);
 }
+
+/* --- 自动隐藏 -------------------------------------------------------------
+ * 只做视觉位移；鼠标穿透由 Rust 侧 dock_set_revealed 同步打开，否则隐形药丸
+ * 仍会吃掉桌面点击。transform 不进布局，useFitWindow 用 offsetWidth 测量，
+ * 所以隐藏/唤出不会误报「内容变宽」触发 resize。 */
+.dock {
+  transition: transform 220ms cubic-bezier(.2, .8, .2, 1), opacity 180ms linear;
+}
+.dock--hidden {
+  transform: translateY(110%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.dock-icon-img {
+  width: 26px;
+  height: 26px;
+  object-fit: contain;
+  pointer-events: none;
+}
+.dock-start svg {
+  width: 22px;
+  height: 22px;
+}
+.dock-empty {
+  padding: 0 10px;
+  font-size: 12px;
+  color: var(--gs-text-dim);
+  white-space: nowrap;
+}
+
+/* --- 开始菜单面板 ---------------------------------------------------------
+ * 窗口尺寸 = 面板尺寸，不留透明宽区。 */
+.menu-panel {
+  width: 100%;
+  height: 100%;
+  border-radius: 16px;
+  padding: 10px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  background: var(--gs-glass-fill-strong);
+}
+.menu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 2px 4px;
+}
+.menu-close {
+  width: 26px;
+  height: 26px;
+  font-size: 18px;
+  line-height: 1;
+}
+.menu-section {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.menu-section--grow {
+  flex: 1 1 auto;
+}
+.menu-section h3 {
+  margin: 2px 4px 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--gs-text-dim);
+}
+.menu-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-y: auto;
+  max-height: 130px;
+}
+.menu-section--grow .menu-list {
+  max-height: none;
+  flex: 1 1 auto;
+}
+.menu-list button {
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: var(--gs-text);
+  padding: 6px 8px;
+  border-radius: 7px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.menu-list button:hover {
+  background: var(--gs-hover);
+}
+.menu-empty {
+  padding: 8px;
+  font-size: 12px;
+  color: var(--gs-text-dim);
+}
+.menu-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 4px 2px;
+  border-top: 1px solid var(--gs-glass-border);
+  font-size: 11px;
+  color: var(--gs-text-dim);
+}
+.menu-foot label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+/* --- 游离图标 ------------------------------------------------------------
+ * 每个窗口恰好等于图标大小，没有透明宽区，不需要点击穿透热区。 */
+.free-window {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.free-window .dock-icon {
+  width: 46px;
+  height: 46px;
+  border-radius: 14px;
+  background: var(--gs-glass-fill);
+  border: 1px solid var(--gs-glass-border);
+  box-shadow: var(--gs-glass-shadow);
+  cursor: grab;
+  touch-action: none;
+}
+.free-window .dock-icon:active {
+  cursor: grabbing;
+}
+
+/* --- DWM 预览承载层 ------------------------------------------------------ */
+.preview-surface {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  border-radius: 12px;
+  box-sizing: border-box;
+}
+.preview-surface--fallback {
+  background: var(--gs-glass-fill-strong);
+  border: 1px solid var(--gs-glass-border);
+  box-shadow: var(--gs-glass-shadow);
+}

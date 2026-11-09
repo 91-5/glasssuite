@@ -37,12 +37,42 @@ export const COMMANDS = {
   /** 展开 / 收起岛面板（用 resize 实现，不引入固定尺寸热区窗）。 */
   expandPanel: "expand_panel",
   collapsePanel: "collapse_panel",
+  /** dock 全量快照（固定 / 临时 / 游离 + 内容指纹）。 */
+  dockState: "dock_state",
+  /** 按需取一枚本机系统图标（带超时，失败返回 null）。 */
+  dockIcon: "dock_icon",
+  /** 启动 dock 上的应用（按稳定 key）。 */
+  dockLaunch: "dock_launch",
+  /** 启动开始菜单里的快捷方式（按路径）。 */
+  dockLaunchPath: "dock_launch_path",
+  /** 拖拽排序后持久化。 */
+  dockReorder: "dock_reorder",
+  /** 自动隐藏开关。 */
+  dockAutoHide: "dock_auto_hide",
+  /** 贴底唤出/收起时同步鼠标穿透。 */
+  dockSetRevealed: "dock_set_revealed",
+  /** 把固定项拖成游离图标。 */
+  dockSetFree: "dock_set_free",
+  /** 游离图标拖回 dock。 */
+  dockUndockFree: "dock_undock_free",
+  /** 移动游离图标。 */
+  dockMoveFree: "dock_move_free",
+  /** 开始菜单：本机快捷方式列表。 */
+  dockMenuApps: "dock_menu_apps",
+  /** 开始菜单：收藏（旧 menu.json 迁来）。 */
+  dockMenuFavourites: "dock_menu_favourites",
+  /** 开始菜单开合。 */
+  dockMenuToggle: "dock_menu_toggle",
+  /** 悬停注册 DWM 缩略图；false = 已降级。 */
+  dockPreviewShow: "dock_preview_show",
+  /** 注销 DWM 缩略图。 */
+  dockPreviewHide: "dock_preview_hide",
 } as const;
 
 /** 后端 → 前端事件名。 */
 export const EVENTS = {
   /** 运行中应用集合变化（增量或全量由 payload 的 `full` 标记）。 */
-  runningChanged: "running://changed",
+  runningChanged: "dock-running",
   /** 系统指标（1s 一次）。 */
   sysMetrics: "sys-metrics",
   /** 天气（15min 一次；未配置时永不触发）。 */
@@ -63,8 +93,12 @@ export const EVENTS = {
   dockReveal: "dock-reveal",
   /** 展开面板开/关（后端 resize 完成后才下发）。 */
   panelState: "panel-state",
-  /** 全屏让位状态变化（两窗同时显隐）。 */
+  /** 全屏让位状态变化（所有窗同时显隐）。 */
   fullscreenYield: "fullscreen-yield",
+  /** DWM 预览不可用/超时：前端显示纯色块。 */
+  dockPreviewFallback: "dock-preview-fallback",
+  /** 开始菜单开合状态（后端 show/hide 完成后下发）。 */
+  dockMenuState: "dock-menu-state",
 } as const;
 
 /** `fit_dock` / `fit_island` 入参（CSS 逻辑像素）。 */
@@ -309,4 +343,132 @@ export async function expandPanel(): Promise<void> {
 /** 收起面板（resize 回内容尺寸并恢复穿透）。 */
 export async function collapsePanel(): Promise<void> {
   await invoke(COMMANDS.collapsePanel);
+}
+
+// ---------------------------------------------------------------------------
+// dock（P4）
+// ---------------------------------------------------------------------------
+
+/** 游离图标的屏幕矩形（CSS 逻辑像素）。 */
+export interface FreeRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** dock 上的一个图标。`icon` 为 null 时用前端自绘 SVG 占位。 */
+export interface DockEntry {
+  /** `exe:<规范化路径>`，跨固定 / 临时 / 预览三处稳定。 */
+  key: string;
+  /** 固定项的配置 id；临时项等于 key。 */
+  id: string;
+  name: string;
+  path: string;
+  /** 本机 Shell API 运行时提取的 data URL，绝不随包分发第三方图标。 */
+  icon: string | null;
+  running: boolean;
+  pinned: boolean;
+  freeRect: FreeRect | null;
+}
+
+export interface DockSnapshot {
+  pinned: DockEntry[];
+  transients: DockEntry[];
+  free: DockEntry[];
+  autoHide: boolean;
+  /** 内容指纹：Rust watcher 与前端各比一次，不变就不重排。 */
+  fingerprint: string;
+}
+
+export interface MenuApp {
+  name: string;
+  path: string;
+}
+
+/** 空快照，用于非 Tauri 环境（浏览器里调布局）。 */
+export const EMPTY_DOCK: DockSnapshot = {
+  pinned: [],
+  transients: [],
+  free: [],
+  autoHide: false,
+  fingerprint: "",
+};
+
+export async function getDockState(): Promise<DockSnapshot> {
+  return invoke<DockSnapshot>(COMMANDS.dockState);
+}
+
+export async function getDockIcon(key: string): Promise<string | null> {
+  return invoke<string | null>(COMMANDS.dockIcon, { key });
+}
+
+export async function dockLaunch(key: string): Promise<boolean> {
+  return invoke<boolean>(COMMANDS.dockLaunch, { key });
+}
+
+export async function dockLaunchPath(path: string): Promise<boolean> {
+  return invoke<boolean>(COMMANDS.dockLaunchPath, { path });
+}
+
+export async function dockReorder(paths: string[]): Promise<void> {
+  await invoke(COMMANDS.dockReorder, { paths });
+}
+
+export async function dockAutoHide(enabled: boolean): Promise<void> {
+  await invoke(COMMANDS.dockAutoHide, { enabled });
+}
+
+export async function dockSetRevealed(revealed: boolean): Promise<void> {
+  await invoke(COMMANDS.dockSetRevealed, { revealed });
+}
+
+export async function dockSetFree(id: string, x: number, y: number): Promise<void> {
+  await invoke(COMMANDS.dockSetFree, { id, x, y });
+}
+
+export async function dockUndockFree(id: string): Promise<void> {
+  await invoke(COMMANDS.dockUndockFree, { id });
+}
+
+export async function dockMoveFree(id: string, x: number, y: number): Promise<void> {
+  await invoke(COMMANDS.dockMoveFree, { id, x, y });
+}
+
+export async function dockMenuApps(): Promise<MenuApp[]> {
+  return invoke<MenuApp[]>(COMMANDS.dockMenuApps);
+}
+
+export async function dockMenuFavourites(): Promise<MenuApp[]> {
+  return invoke<MenuApp[]>(COMMANDS.dockMenuFavourites);
+}
+
+/** `open` 省略时切换。返回切换后的状态。 */
+export async function dockMenuToggle(open?: boolean): Promise<boolean> {
+  return invoke<boolean>(COMMANDS.dockMenuToggle, { open: open ?? null });
+}
+
+/** 注册 DWM 缩略图。返回 false 或收到 `dockPreviewFallback` 时显示纯色块。 */
+export async function dockPreviewShow(
+  key: string,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+): Promise<boolean> {
+  return invoke<boolean>(COMMANDS.dockPreviewShow, { key, x, y, w, h });
+}
+
+export async function dockPreviewHide(): Promise<void> {
+  await invoke(COMMANDS.dockPreviewHide);
+}
+
+/**
+ * FLIP 诊断日志（B4 判据）。写进 `glasssuite.log`，一行一条，只记 dx 数值与原因，
+ * 不含应用名 / 路径。transient 增减时若判定为窗口几何变化，dx 必须全是 0。
+ */
+export async function logFlip(line: string): Promise<void> {
+  await logFrontend(`[flip] ${line}`).catch(() => {
+    /* 非 Tauri 环境 */
+  });
 }

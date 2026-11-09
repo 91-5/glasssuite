@@ -87,10 +87,14 @@ pub fn collapse_panel(
     Ok(())
 }
 
-/// 统一全屏让位：一个检测源（`winplat::fullscreen`）同时决定两窗显隐。
+/// 统一全屏让位：一个检测源（`winplat::fullscreen`）同时决定**所有**窗显隐。
 ///
 /// 旧两仓各判一次，出现过「岛藏了 dock 没藏」；合并后这里只问一次。
+/// P4 增加了开始菜单与游离图标窗，因此遍历 `webview_windows()` 而不是硬编码两窗，
+/// 并记住「让位前哪些窗是可见的」：退出全屏时不能把本来关着的开始菜单顺手弹出来。
 pub fn spawn_fullscreen_watch(app: AppHandle, state: Arc<SharedState>) {
+    let visible_before: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     std::thread::Builder::new()
         .name("glasssuite-fullscreen".into())
         .spawn(move || {
@@ -105,19 +109,28 @@ pub fn spawn_fullscreen_watch(app: AppHandle, state: Arc<SharedState>) {
 
                 let a = app.clone();
                 let st = Arc::clone(&state);
+                let seen = Arc::clone(&visible_before);
                 let _ = app.run_on_main_thread(move || {
-                    for label in ["island", "dock"] {
-                        if let Some(win) = a.get_webview_window(label) {
-                            let _ = if yielding { win.hide() } else { win.show() };
-                            if !yielding {
-                                // show() 后 tao 可能重设 ExStyle，补回工具窗 + 不抢焦点。
-                                if let Ok(h) = win.hwnd() {
-                                    let raw = h.0 as isize;
-                                    let _ = winplat::style::hide_from_alt_tab(raw);
-                                    let _ = winplat::style::set_no_activate(raw, true);
-                                }
+                    let mut seen = seen.lock().unwrap();
+                    for (label, win) in a.webview_windows() {
+                        if yielding {
+                            if win.is_visible().unwrap_or(false) {
+                                seen.insert(label);
+                            }
+                            let _ = win.hide();
+                        } else if seen.contains(&label) {
+                            let _ = win.show();
+                            // show() 后 tao 可能重设 ExStyle，补回工具窗 + 不抢焦点。
+                            #[cfg(windows)]
+                            if let Ok(h) = win.hwnd() {
+                                let raw = h.0 as isize;
+                                let _ = winplat::style::hide_from_alt_tab(raw);
+                                let _ = winplat::style::set_no_activate(raw, true);
                             }
                         }
+                    }
+                    if !yielding {
+                        seen.clear();
                     }
                     st.island_visible.store(!yielding, Ordering::Relaxed);
                     st.dock_visible.store(!yielding, Ordering::Relaxed);

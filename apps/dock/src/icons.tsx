@@ -1,22 +1,23 @@
-import type { ReactElement } from "react";
+import type { ButtonHTMLAttributes, ReactElement } from "react";
+import type { DockEntry } from "@glasssuite/ipc-types";
+import { useDockIcon } from "./useDock";
 
 /**
- * dock 的图标集合。
+ * 图标资源分两层：
+ * 1. 优先用系统 API 在用户本机运行时提取的位图（`dock_icon` 命令，带 800ms 超时）；
+ * 2. 取不到时用下面这些**原创 SVG 线条**占位。
  *
- * 这些是**占位图标**（原创 SVG 线条），不是从任何软件包里提取的资源——开源项目不打包
- * 他人商标，真实图标后续由系统 API（`SHGetFileInfo` / `IShellItemImageFactory`）
- * 在运行时换取 data URL。
- *
- * `running` 是「该程序正在运行」的小圆点：dock 里固定图标与临时运行图标共用一套按钮，
- * 用圆点而非改变图标底色来表示运行态，避免图标在运行/退出时整体变色（视觉跳动）。
+ * 开源包里不含任何第三方商标/图标文件；`title` 只显示应用名，不显示路径。
  */
-export interface DockItem {
-  key: string;
-  label: string;
-  glyph: GlyphName;
-}
 
-export type GlyphName = "files" | "browser" | "terminal" | "music" | "settings" | "editor" | "chat";
+export type GlyphName =
+  | "files"
+  | "browser"
+  | "terminal"
+  | "music"
+  | "settings"
+  | "editor"
+  | "chat";
 
 const GLYPHS: Record<GlyphName, ReactElement> = {
   files: (
@@ -63,25 +64,56 @@ const GLYPHS: Record<GlyphName, ReactElement> = {
   ),
 };
 
-export const PINNED: DockItem[] = [
-  { key: "files", label: "文件", glyph: "files" },
-  { key: "browser", label: "浏览器", glyph: "browser" },
-  { key: "terminal", label: "终端", glyph: "terminal" },
-  { key: "editor", label: "编辑器", glyph: "editor" },
-  { key: "settings", label: "设置", glyph: "settings" },
-];
+const GLYPH_ORDER = Object.keys(GLYPHS) as GlyphName[];
 
-/** 未固定但正在运行的程序（真实实现里由进程监视推送）。 */
-export const TRANSIENTS: DockItem[] = [
-  { key: "music", label: "音乐", glyph: "music" },
-  { key: "chat", label: "聊天", glyph: "chat" },
-];
+/** 按 key 稳定选一枚占位图标，避免每次渲染换花色。 */
+export function glyphFor(key: string): GlyphName {
+  let h = 0;
+  for (let i = 0; i < key.length; i += 1) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+  return GLYPH_ORDER[h % GLYPH_ORDER.length];
+}
 
-export function DockIcon({ item, running = false }: { item: DockItem; running?: boolean }) {
+export interface DockIconProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  entry: DockEntry;
+}
+
+/**
+ * 一枚 dock 图标。`data-flip-key` 供 `useFlip` 定位；`data-flip-key` 放在展开属性之后，
+ * 保证不会被调用方误覆盖。
+ */
+export function DockIcon({ entry, className, ...rest }: DockIconProps) {
+  const iconUrl = useDockIcon(entry.key, entry.icon);
   return (
-    <button className="gs-icon-button dock-icon" type="button" title={item.label}>
-      {GLYPHS[item.glyph]}
-      {running ? <span className="dock-running" aria-hidden="true" /> : null}
+    <button
+      type="button"
+      className={["gs-icon-button", "dock-icon", className].filter(Boolean).join(" ")}
+      title={entry.name}
+      {...rest}
+      data-flip-key={entry.key}
+    >
+      {iconUrl ? (
+        <img className="dock-icon-img" src={iconUrl} alt="" draggable={false} />
+      ) : (
+        GLYPHS[glyphFor(entry.key)]
+      )}
+      {entry.running ? <span className="dock-running" aria-hidden="true" /> : null}
+    </button>
+  );
+}
+
+/** 开始菜单按钮（不是应用图标，不参与 FLIP）。 */
+export function StartButton(props: ButtonHTMLAttributes<HTMLButtonElement>) {
+  return (
+    <button
+      type="button"
+      className="gs-icon-button dock-icon dock-start"
+      title="开始菜单"
+      aria-label="开始菜单"
+      {...props}
+    >
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z" />
+      </svg>
     </button>
   );
 }
