@@ -212,6 +212,8 @@ fn refresh(ctx: &Ctx, manager: &SessionManager) -> windows::core::Result<()> {
     let sessions = current_sessions(manager)?;
     let Some(active) = pick_active(&sessions) else {
         *ctx.state.last_media.lock().unwrap() = None;
+        // D1 删掉的歌词耦合在 D3 按契约补回：无会话时清歌词缓存并下发 null。
+        crate::island::lyrics::clear(&ctx.app);
         ctx.app.emit(EVENT, Value::Null).ok();
         return Ok(());
     };
@@ -242,6 +244,16 @@ fn refresh(ctx: &Ctx, manager: &SessionManager) -> windows::core::Result<()> {
     let duration_ms = tl.EndTime()?.Duration / 10_000;
     let updated = tl.LastUpdatedTime()?.UniversalTime;
     let base_unix_ms = (updated - WIN_EPOCH_100NS) / 10_000;
+
+    // 歌词：曲目变化才拉（内部按 title|artist|duration 缓存），未配置源时零外联。
+    // 独立线程执行，不阻塞本 SMTC 线程。
+    crate::island::lyrics::maybe_fetch(
+        ctx.app.clone(),
+        title.clone(),
+        artist.clone(),
+        album.clone(),
+        duration_ms as f64,
+    );
 
     let payload = json!({
         "title": title,

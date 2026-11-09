@@ -30,6 +30,8 @@ export const COMMANDS = {
   mediaControl: "media_control",
   /** 取最近一次 SMTC 快照（窗口重建 / 首帧补齐）。 */
   mediaState: "media_state",
+  /** 取当前歌词快照（前端挂载补齐，规避 emit 早于订阅）。 */
+  lyricsState: "lyrics_state",
   /** 上报交互热区（CSS 逻辑像素，相对窗口客户区原点）。 */
   setHotzone: "set_hotzone",
   /** 展开 / 收起岛面板（用 resize 实现，不引入固定尺寸热区窗）。 */
@@ -51,8 +53,10 @@ export const EVENTS = {
   mediaState: "media-state",
   /** 系统通知（新通知到达）。 */
   notification: "notification",
-  /** 歌词行（随播放进度推进）。 */
+  /** 歌词行（整曲一次下发，前端按 positionMs 选行）。 */
   lyrics: "lyrics",
+  /** AI / 本地规则产生的一行洞察（默认 AI 关闭时永不触发）。 */
+  aiInsight: "ai-insight",
 } as const;
 
 /** `fit_dock` / `fit_island` 入参（CSS 逻辑像素）。 */
@@ -257,6 +261,33 @@ export async function setHotzone(
   target: "island" | "dock" = "island",
 ): Promise<void> {
   await invoke(COMMANDS.setHotzone, { x, y, w, h, target });
+}
+
+// ---------------------------------------------------------------------------
+// 歌词 / AI
+// ---------------------------------------------------------------------------
+
+export interface LyricLine {
+  /** 起始时间（毫秒，相对曲首）。 */
+  t: number;
+  text: string;
+}
+
+/** `null` = 未配置歌词源或未匹配到歌词（负缓存）。 */
+export interface LyricsState {
+  lines: LyricLine[];
+}
+
+export interface AiInsight {
+  kind: string;
+  text: string;
+  source: "ai" | "local";
+  at: number;
+}
+
+/** 取当前歌词快照（前端挂载补齐）。 */
+export async function getLyricsState(): Promise<LyricsState | null> {
+  return invoke<LyricsState | null>(COMMANDS.lyricsState);
 }
 
 /** 展开面板（resize 到面板尺寸并取消穿透）。 */

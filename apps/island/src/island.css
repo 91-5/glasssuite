@@ -133,6 +133,16 @@
   transition: width 1s linear;
 }
 
+.island-lyric {
+  display: block;
+  font-size: 11px;
+  color: var(--gs-text-dim);
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .island-clock {
   font-size: 15px;
   font-weight: 600;

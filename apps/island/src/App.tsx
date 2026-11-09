@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { GlassSurface, useFitWindow } from "@glasssuite/shared-ui";
 import { useBattery, useSettings, useWeather } from "./hooks";
+import { useLyrics } from "./lyrics/useLyrics";
 import { Artwork, Controls, Progress, useMedia } from "./media";
 import { PrivacyNotice, SummaryBar } from "./notification/SummaryBar";
 import { useNotifications, usePrivacyNotice } from "./notification/useNotifications";
@@ -48,6 +49,7 @@ export default function App() {
   const weather = useWeather();
   const battery = useBattery();
   const { media, positionMs, control } = useMedia();
+  const lyric = useLyrics(positionMs);
   const notification = useNotifications();
   const showPrivacyNotice = usePrivacyNotice(Boolean(settings?.notifications?.enabled));
   useFitWindow("island", pillRef, ISLAND_PADDING);
@@ -89,6 +91,7 @@ export default function App() {
           durationMs={media.durationMs}
           onSeek={(ms) => control("seek", ms)}
         />
+        {lyric ? <span className="island-lyric" title={lyric}>{lyric}</span> : null}
       </div>
     );
   } else {

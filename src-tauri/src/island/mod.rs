@@ -6,6 +6,8 @@
 //! 需要联网或读取隐私数据的模块默认关闭（见 `crate::settings`）。
 //! 媒体是**事件驱动**（WinRT 回调只投 Refresh），进度推进由前端 1Hz 插值完成。
 
+pub mod ai;
+pub mod lyrics;
 pub mod media;
 pub mod metrics;
 pub mod network;

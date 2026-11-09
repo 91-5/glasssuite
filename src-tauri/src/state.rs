@@ -38,6 +38,18 @@ impl Hotzone {
     }
 }
 
+/// 最近一次系统采样（给 AI 本地规则用）。
+///
+/// 为什么要单独存一份：`metrics` 是唯一采样源，AI 不该再起一个 `sysinfo` 轮询；
+/// 后端模块之间共享快照即可，避免「一个进程两套 CPU 数字」。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetricsSnapshot {
+    pub cpu: f64,
+    pub mem_pct: f64,
+    pub battery: Option<f64>,
+    pub charging: bool,
+}
+
 #[derive(Default)]
 pub struct SharedState {
     /// SMTC 控制通道。`OnceLock` 而非 `Option`：线程启动后只写一次，之后只读。
@@ -59,6 +71,9 @@ pub struct SharedState {
     /// 全屏让位期间窗口不可见，钩子此时不做穿透切换。
     pub island_visible: AtomicBool,
     pub dock_visible: AtomicBool,
+
+    /// 1s 采样的最新系统指标（AI 只读）。
+    pub metrics: Mutex<MetricsSnapshot>,
 }
 
 #[cfg(test)]

@@ -59,6 +59,7 @@ pub fn run() {
             island::log_frontend,
             island::media::media_control,
             island::media::media_state,
+            island::lyrics::lyrics_state,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -75,11 +76,18 @@ pub fn run() {
 
             // 功能域线程（各自内部按配置决定是否真的联网/读取）。
             let s = app.state::<settings::Settings>().inner().clone();
-            island::metrics::spawn(handle.clone());
+
+            // 歌词源与 AI 配置必须在媒体/AI 线程启动前定下来：两者都遵循
+            // 「默认 null → 零外联」，配置没配齐时模块内部直接短路。
+            island::lyrics::configure(s.lyrics_source_url.clone());
+            let ai_cfg = island::ai::config::AiConfig::load(&s);
+
+            island::metrics::spawn(handle.clone(), Arc::clone(&st));
             island::weather::spawn(handle.clone(), s.weather.clone());
             island::network::spawn(handle.clone(), s.network_probe_url.clone());
             island::media::spawn(handle.clone(), Arc::clone(&st));
             island::notification::spawn(handle.clone(), s.notifications.clone());
+            island::ai::spawn(handle.clone(), ai_cfg, Arc::clone(&st));
             Ok(())
         })
         .run(tauri::generate_context!())
