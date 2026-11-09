@@ -1,35 +1,45 @@
 /* island 窗口：整窗透明，只有药丸可见；贴屏幕顶部居中（定位由 Rust 侧 winplat 负责）。 */
 
-html,
-body,
-#root {
-  margin: 0;
-  padding: 0;
-  width: 100%;
-  height: 100%;
-  background: transparent;
-  overflow: hidden;
-  font-family: "Segoe UI Variable", "Microsoft YaHei UI", system-ui, sans-serif;
-  -webkit-user-select: none;
-  user-select: none;
-}
-
 .island {
   width: 100%;
   height: 100%;
   display: flex;
   align-items: flex-start;
-  justify-content: center;
-  padding: 4px;
+  justify-content: center; /* 岛宽度随内容变化，居中锚定在这里是安全的：窗口宽度始终等于药丸宽度 */
+  padding: 4px; /* 必须与 App.tsx 的 ISLAND_PADDING 一致 */
   box-sizing: border-box;
 }
 
 .island-pill {
-  height: auto;
+  gap: 10px;
+  height: 40px;
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
-.island-hint {
+.island-clock {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  font-variant-numeric: tabular-nums;
+}
+
+.island-divider {
+  width: 1px;
+  height: 16px;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.island-date {
   font-size: 12px;
-  opacity: 0.55;
-  padding: 0 4px;
+  color: var(--gs-text-dim);
+}
+
+/* 媒体/通知指示点：后续阶段接入 SMTC 时点亮。 */
+.island-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--gs-accent);
+  opacity: 0.75;
 }

@@ -4,6 +4,7 @@
  * 纪律：前端只认这里导出的名字与类型，Rust 侧的 `#[tauri::command]` / `emit` 必须与本文件
  * 逐字一致。改名字等于破坏契约，两侧同一次提交内一起改。
  */
+import { invoke } from "@tauri-apps/api/core";
 
 /** 窗口 label（与 `tauri.conf.json` / 运行时 builder 中的 label 一致）。 */
 export const WINDOW_LABELS = {
@@ -49,4 +50,19 @@ export interface AppEntry {
   name: string;
   /** 图标由系统 API 运行时取得，前端只拿 data URL，不打包他人图标资源。 */
   iconDataUrl?: string;
+}
+
+/**
+ * 上报 dock 内容尺寸，窗口收缩并对齐任务栏。
+ *
+ * 为什么包成函数而不是让组件直接 `invoke("fit_dock")`：命令名是契约的一部分，
+ * 拼错字符串在运行时只会静默失败（窗口保持旧尺寸），集中在这里可以一处改、两处用。
+ */
+export async function fitDock(req: FitRequest): Promise<void> {
+  await invoke(COMMANDS.fitDock, { ...req });
+}
+
+/** 上报岛内容尺寸，窗口收缩并对齐屏幕上沿。 */
+export async function fitIsland(req: FitRequest): Promise<void> {
+  await invoke(COMMANDS.fitIsland, { ...req });
 }

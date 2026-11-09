@@ -70,10 +70,17 @@ importers:
         specifier: ^6.0.0
         version: 6.4.5
 
-  packages/ipc-types: {}
+  packages/ipc-types:
+    dependencies:
+      '@tauri-apps/api':
+        specifier: ^2.1.1
+        version: 2.12.4
 
   packages/shared-ui:
     dependencies:
+      '@glasssuite/ipc-types':
+        specifier: workspace:*
+        version: link:../ipc-types
       react:
         specifier: ^19.0.0
         version: 19.3.1
@@ -483,6 +490,9 @@ packages:
     resolution: {integrity: sha512-e/NRJFl48wL5DFNSzQrvm4kaB5dzNNmqWjIJ6And2Sjuw4klO3w3TXMvCAEF1tHTrQQgpOD4QVkBE/92/yBGrQ==}
     cpu: [x64]
     os: [win32]
+
+  '@tauri-apps/api@2.12.4':
+    resolution: {integrity: sha512-pVmfis+4zT8H0Qhp3xPZx9Ju7kpzvA6rr/PSJPyuwfvucTQ8sVt61NYU9KMkK703UFlYadFmjKA4HhybOtN0gg==}
 
   '@types/babel__core@7.20.5':
     resolution: {integrity: sha512-qoQprZvz5wQFJwMDqeseRXWv3rqMvhgpbXFfVyWhbx9X47POIA6i/+dXefEmZKoAgOaTdaIgNSMqMIU61yRyzA==}
@@ -990,6 +1000,8 @@ snapshots:
 
   '@rollup/rollup-win32-x64-msvc@4.68.0':
     optional: true
+
+  '@tauri-apps/api@2.12.4': {}
 
   '@types/babel__core@7.20.5':
     dependencies:

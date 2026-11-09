@@ -1,12 +1,49 @@
-/* GlassSuite 共享玻璃表面。
-   两窗共用一套 token：改这里等于改全部窗口外观，禁止在 app 内重复定义玻璃层级。 */
+/* GlassSuite 共享视觉层。
+ *
+ * 唯一 token 来源：island 与 dock 都从这里取色/取阴影，禁止在各自 app 内重复定义玻璃层级
+ * （否则两个窗口的玻璃深浅会慢慢漂移，用户一眼就能看出不是一套东西）。
+ *
+ * 暗色玻璃的理由：桌面壁纸亮度不可控，浅色半透明在亮壁纸上直接消失、在暗壁纸上又糊成一片。
+ * 深色底 + 高光边 + 白色文字在两种壁纸上都稳定可读。
+ *
+ * 关于真模糊：`backdrop-filter` 只能模糊 webview 内部内容，桌面壁纸在 webview 之外，
+ * 所以这里不做假模糊，只做半透明填充。真模糊需要 Rust 侧 `DwmEnableBlurBehindWindow`
+ * 或 acrylic，属于后续阶段，不在 CSS 里假装。
+ */
 
 :root {
-  --gs-glass-fill: rgba(255, 255, 255, 0.34);
-  --gs-glass-border: rgba(255, 255, 255, 0.55);
-  --gs-glass-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
-  --gs-glass-inner-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.65);
-  --gs-text: #1c1c1e;
+  --gs-glass-fill: rgba(22, 24, 28, 0.66);
+  --gs-glass-fill-strong: rgba(16, 18, 22, 0.86);
+  --gs-glass-border: rgba(255, 255, 255, 0.16);
+  --gs-glass-shadow: 0 10px 30px rgba(0, 0, 0, 0.34), 0 2px 8px rgba(0, 0, 0, 0.22);
+  --gs-glass-inner-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  --gs-text: rgba(255, 255, 255, 0.94);
+  --gs-text-dim: rgba(255, 255, 255, 0.58);
+  --gs-accent: #6cc7ff;
+  --gs-hover: rgba(255, 255, 255, 0.12);
+}
+
+/* 两个窗口都整窗透明；任何滚动条都会在透明窗口里变成一条可见的灰带。 */
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: "Segoe UI Variable Display", "Segoe UI Variable", "Microsoft YaHei UI",
+    system-ui, sans-serif;
+  color: var(--gs-text);
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .gs-glass {
@@ -17,4 +54,36 @@
   display: flex;
   align-items: center;
   box-sizing: border-box;
+}
+
+/* 图标按钮：dock 内所有可点元素共用，hover / active 反馈只在这里定义。 */
+.gs-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--gs-text);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: background-color 120ms ease, transform 120ms ease;
+}
+
+.gs-icon-button:hover {
+  background: var(--gs-hover);
+}
+
+.gs-icon-button:active {
+  transform: scale(0.94);
+}
+
+.gs-icon-button svg {
+  width: 22px;
+  height: 22px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }

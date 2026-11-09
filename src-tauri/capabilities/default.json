@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "GlassSuite 主窗口能力：只开放核心权限，自定义命令由 Rust 侧显式注册。",
+  "windows": ["dock", "island", "startmenu"],
+  "permissions": ["core:default"]
+}
