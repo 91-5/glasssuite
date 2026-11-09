@@ -74,6 +74,17 @@ pub struct SharedState {
 
     /// 1s 采样的最新系统指标（AI 只读）。
     pub metrics: Mutex<MetricsSnapshot>,
+
+    /// 两窗逻辑→物理换算用的缩放因子。由 `set_hotzone` 命令刷新（唯一写入点），
+    /// 钩子回调只读；窗口实时原点由 `GetWindowRect` 现取，因此窗口移动后热区自动跟随。
+    pub island_scale: Mutex<f64>,
+    pub dock_scale: Mutex<f64>,
+
+    /// 展开态标记。展开时 `fit_island` 忽略内容尺寸上报（否则 ResizeObserver
+    /// 会把窗口缩回药丸大小）；收起时用缓存的折叠尺寸复位。
+    pub island_expanded: AtomicBool,
+    pub island_collapsed_size: Mutex<(f64, f64)>,
+    pub dock_size: Mutex<(f64, f64)>,
 }
 
 #[cfg(test)]

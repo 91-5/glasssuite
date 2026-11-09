@@ -1,13 +1,21 @@
 import { useEffect, useRef, useState } from "react";
+import {
+  collapsePanel,
+  EVENTS,
+  expandPanel,
+  PANEL_SIZE,
+  subscribe,
+} from "@glasssuite/ipc-types";
 import { GlassSurface, useFitWindow } from "@glasssuite/shared-ui";
 import { useBattery, useSettings, useWeather } from "./hooks";
 import { useLyrics } from "./lyrics/useLyrics";
 import { Artwork, Controls, Progress, useMedia } from "./media";
 import { PrivacyNotice, SummaryBar } from "./notification/SummaryBar";
 import { useNotifications, usePrivacyNotice } from "./notification/useNotifications";
+import { Panel } from "./panel/Panel";
 
 /** 药丸到窗口边缘的留白（逻辑像素），必须与 `island.css` 里 `.island` 的 padding 一致。 */
-const ISLAND_PADDING = 4;
+const ISLAND_PADDING = 8;
 
 /** 5 秒一刷：界面只显示到分钟，1 秒一刷纯属浪费重渲染。 */
 const CLOCK_TICK_MS = 5_000;
@@ -52,17 +60,40 @@ export default function App() {
   const lyric = useLyrics(positionMs);
   const notification = useNotifications();
   const showPrivacyNotice = usePrivacyNotice(Boolean(settings?.notifications?.enabled));
-  useFitWindow("island", pillRef, ISLAND_PADDING);
+  const [hovered, setHovered] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  // 展开态：窗口 resize 到 PANEL_SIZE，暂停 fit_*（否则 ResizeObserver 会把面板缩回药丸）。
+  useFitWindow("island", pillRef, ISLAND_PADDING, {
+    fit: !expanded,
+    panelSize: expanded ? PANEL_SIZE : undefined,
+  });
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(new Date()), CLOCK_TICK_MS);
     return () => window.clearInterval(id);
   }, []);
 
+  useEffect(() => subscribe<boolean>(EVENTS.islandHover, setHovered), []);
+  useEffect(() => subscribe<boolean>(EVENTS.panelState, setExpanded), []);
+
+  const openPanel = () => {
+    expandPanel().catch(() => {
+      /* 非 Tauri 环境 */
+    });
+  };
+  const closePanel = () => {
+    collapsePanel().catch(() => {
+      /* 非 Tauri 环境 */
+    });
+  };
+
   const showWeather = Boolean(settings?.weather) && weather !== null;
 
   let content;
-  if (showPrivacyNotice) {
+  if (expanded) {
+    content = <Panel onClose={closePanel} media={media} control={control} />;
+  } else if (showPrivacyNotice) {
     content = <PrivacyNotice />;
   } else if (notification) {
     content = <SummaryBar item={notification} />;
@@ -128,15 +159,30 @@ export default function App() {
     );
   }
 
-  const isMedia = !showPrivacyNotice && !notification && Boolean(media);
+  const isMedia = !expanded && !showPrivacyNotice && !notification && Boolean(media);
+  const pillClass = [
+    "island-pill",
+    isMedia ? "island-pill--media" : "",
+    hovered && !expanded ? "is-hovered" : "",
+    expanded ? "island-pill--expanded" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
-    <div className="island">
+    <div className={`island${expanded ? " island--expanded" : ""}`}>
       <GlassSurface
-        className={`island-pill${isMedia ? " island-pill--media" : ""}`}
-        radius={22}
-        padding={isMedia ? "8px 12px" : "6px 16px"}
+        className={pillClass}
+        radius={expanded ? 18 : 22}
+        padding={expanded ? "0" : isMedia ? "8px 12px" : "6px 16px"}
         ref={pillRef}
+        onClick={(e) => {
+          if (expanded) return;
+          // 控制按钮与进度条有自己的行为，点它们不应触发展开。
+          const target = e.target as Element;
+          if (target.closest("button, [role='slider']")) return;
+          openPanel();
+        }}
       >
         {content}
       </GlassSurface>

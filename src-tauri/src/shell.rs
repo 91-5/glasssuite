@@ -3,11 +3,16 @@
 //! 窗口自己不做几何计算：前端只上报内容尺寸，位置/尺寸由这里用 `winplat` 算，
 //! 且**先定位再改尺寸**（`set_size` 保持左上角不动，反过来会看到内容先挪再缩）。
 
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
 use tauri::{
     AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
 };
 use winplat::Rect;
+
+use crate::state::{Hotzone, SharedState};
 
 /// dock 与任务栏上沿的间距（物理像素）。
 const DOCK_MARGIN: i32 = 6;
@@ -15,8 +20,8 @@ const DOCK_MARGIN: i32 = 6;
 const ISLAND_MARGIN: i32 = 4;
 
 /// 首帧尺寸（逻辑像素）。前端加载完会通过 `fit_*` 上报真实内容尺寸并收缩窗口。
-const STARTUP_DOCK: (f64, f64) = (800.0, 76.0);
-const STARTUP_ISLAND: (f64, f64) = (360.0, 44.0);
+pub const STARTUP_DOCK: (f64, f64) = (800.0, 76.0);
+pub const STARTUP_ISLAND: (f64, f64) = (360.0, 44.0);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Anchor {
@@ -168,16 +173,58 @@ pub fn place(
     Ok(())
 }
 
+/// 记录内容尺寸、缩放与热区。
+///
+/// 热区直接覆盖整个窗口客户区：窗口尺寸 = 内容尺寸，前端传来的 `w/h` 已含留白，
+/// 所以不存在「透明宽窗吃掉桌面点击」的问题。resize 与热区更新在同一次调用里完成，
+/// 避免前端 ResizeObserver 未触发时热区滞后。
+fn remember(window: &WebviewWindow, state: &SharedState, label: &str, w: f64, h: f64) {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let hz = Hotzone {
+        x: 0.0,
+        y: 0.0,
+        w,
+        h,
+    };
+    if label == "dock" {
+        *state.dock_hotzone.lock().unwrap() = hz;
+        *state.dock_scale.lock().unwrap() = scale;
+        *state.dock_size.lock().unwrap() = (w, h);
+    } else {
+        *state.island_hotzone.lock().unwrap() = hz;
+        *state.island_scale.lock().unwrap() = scale;
+        *state.island_collapsed_size.lock().unwrap() = (w, h);
+    }
+}
+
 /// 前端上报 dock 内容尺寸（逻辑像素）后收缩窗口并对齐任务栏。
 #[tauri::command]
-pub fn fit_dock(window: WebviewWindow, w: f64, h: f64) -> Result<(), String> {
+pub fn fit_dock(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<SharedState>>,
+    w: f64,
+    h: f64,
+) -> Result<(), String> {
     winplat::log::log(&format!("fit_dock w={w} h={h}"));
+    remember(&window, state.inner().as_ref(), "dock", w, h);
     place(&window, Anchor::Dock, w, h)
 }
 
 /// 前端上报岛内容尺寸（逻辑像素）后收缩窗口并对齐屏幕上沿。
+///
+/// 展开态忽略尺寸上报：面板是固定尺寸，ResizeObserver 会把药丸尺寸报回来把它缩掉。
+/// 但仍记录折叠尺寸，收起时用它复位。
 #[tauri::command]
-pub fn fit_island(window: WebviewWindow, w: f64, h: f64) -> Result<(), String> {
+pub fn fit_island(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<SharedState>>,
+    w: f64,
+    h: f64,
+) -> Result<(), String> {
     winplat::log::log(&format!("fit_island w={w} h={h}"));
+    remember(&window, state.inner().as_ref(), "island", w, h);
+    if state.island_expanded.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     place(&window, Anchor::Island, w, h)
 }

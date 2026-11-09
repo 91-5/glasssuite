@@ -16,6 +16,7 @@ pub mod island;
 pub mod settings;
 pub mod shell;
 pub mod state;
+pub mod window;
 
 use std::sync::Arc;
 
@@ -60,6 +61,9 @@ pub fn run() {
             island::media::media_control,
             island::media::media_state,
             island::lyrics::lyrics_state,
+            window::set_hotzone,
+            window::panel::expand_panel,
+            window::panel::collapse_panel,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -73,6 +77,23 @@ pub fn run() {
 
             let st = app.state::<Arc<state::SharedState>>().inner().clone();
             cache_hwnds(&handle, &st);
+
+            // 单一光标观测源：LL 钩子在主线程 setup 内安装（独立线程消息泵会静默停摆）。
+            window::cursor::install(handle.clone(), Arc::clone(&st));
+
+            // 初始穿透只给 island：dock 窗口贴合内容、没有透明宽区，必须保持可点击。
+            // 钩子安装失败时降级为「两窗都可交互」，绝不留下收不到任何输入的幽灵窗。
+            let passthrough = window::cursor::is_installed();
+            if let Some(island_win) = handle.get_webview_window("island") {
+                let _ = island_win.set_ignore_cursor_events(passthrough);
+            }
+            st.island_transparent
+                .store(passthrough, std::sync::atomic::Ordering::SeqCst);
+            st.dock_transparent
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            winplat::log::log(&format!("cursor: island initial passthrough={passthrough}"));
+
+            window::panel::spawn_fullscreen_watch(handle.clone(), Arc::clone(&st));
 
             // 功能域线程（各自内部按配置决定是否真的联网/读取）。
             let s = app.state::<settings::Settings>().inner().clone();
@@ -98,15 +119,37 @@ pub fn run() {
 #[cfg(windows)]
 fn cache_hwnds(app: &tauri::AppHandle, state: &Arc<state::SharedState>) {
     use std::sync::atomic::Ordering;
-    for (label, hwnd_slot, visible_slot) in [
-        ("island", &state.island_hwnd, &state.island_visible),
-        ("dock", &state.dock_hwnd, &state.dock_visible),
+    for (label, hwnd_slot, visible_slot, hz_slot, scale_slot, startup) in [
+        (
+            "island",
+            &state.island_hwnd,
+            &state.island_visible,
+            &state.island_hotzone,
+            &state.island_scale,
+            shell::STARTUP_ISLAND,
+        ),
+        (
+            "dock",
+            &state.dock_hwnd,
+            &state.dock_visible,
+            &state.dock_hotzone,
+            &state.dock_scale,
+            shell::STARTUP_DOCK,
+        ),
     ] {
         if let Some(win) = app.get_webview_window(label) {
             if let Ok(h) = win.hwnd() {
                 hwnd_slot.store(h.0 as isize, Ordering::SeqCst);
             }
             visible_slot.store(true, Ordering::SeqCst);
+            // 首帧就用启动尺寸铺满热区：前端上报之前也必须能命中，否则窗口永远穿透。
+            *scale_slot.lock().unwrap() = win.scale_factor().unwrap_or(1.0);
+            *hz_slot.lock().unwrap() = state::Hotzone {
+                x: 0.0,
+                y: 0.0,
+                w: startup.0,
+                h: startup.1,
+            };
         }
     }
 }

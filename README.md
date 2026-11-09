@@ -40,6 +40,22 @@ cargo test --workspace
 The Tauri shell crate is added in a later milestone; until then `pnpm -r build` and `cargo test` are
 the two gates.
 
+## Mouse hook (click-through)
+
+GlassSuite installs **one** low-level mouse hook (`WH_MOUSE_LL`) on its own main thread. It is
+used **only to read the cursor position**: the position is compared with the hot zones reported
+by the island and the dock, in order to toggle mouse pass-through and to reveal the dock at the
+screen edge (4 px / 800 ms).
+
+- It does not read key strokes, window titles, clipboard, or notification contents, and stores
+  nothing.
+- Nothing is uploaded; nothing is injected into any other process.
+- If the hook cannot be installed, both windows stay interactive (degraded mode) rather than
+  becoming unclickable ghost windows.
+
+The dock's legacy 200 ms `GetCursorPos` polling is deliberately **not** carried over — one
+process, one cursor observer, one meaning of "revealed".
+
 ## Privacy
 
 GlassSuite is **local-only**:

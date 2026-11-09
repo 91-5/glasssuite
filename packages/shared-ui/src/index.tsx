@@ -5,7 +5,7 @@
  * 图层绘制（半透明填充 + 内高光 + 外阴影）或 Win32 侧 `DwmEnableBlurBehindWindow`。
  * 这里只做「画出来的玻璃」这一层；需要真模糊时由 Rust 侧叠加，不改本组件。
  */
-import type { CSSProperties, ReactNode, Ref } from "react";
+import type { CSSProperties, MouseEventHandler, ReactNode, Ref } from "react";
 
 export { useFitWindow } from "./useFitWindow";
 export type { FitTarget } from "./useFitWindow";
@@ -18,6 +18,8 @@ export interface GlassSurfaceProps {
   padding?: string;
   className?: string;
   style?: CSSProperties;
+  /** 点击表面空白处（例如展开面板）。内部按钮自行 stopPropagation 或由调用方过滤。 */
+  onClick?: MouseEventHandler<HTMLDivElement>;
   /**
    * 指向玻璃元素本身。`useFitWindow` 必须测它——测内部内容会少算内边距，
    * 窗口就会比药丸窄，右侧被裁掉。
@@ -31,6 +33,7 @@ export function GlassSurface({
   padding = "5px 12px",
   className,
   style,
+  onClick,
   ref,
 }: GlassSurfaceProps) {
   return (
@@ -38,6 +41,7 @@ export function GlassSurface({
       ref={ref}
       className={["gs-glass", className].filter(Boolean).join(" ")}
       style={{ borderRadius: radius, padding, ...style }}
+      onClick={onClick}
     >
       {children}
     </div>

@@ -57,6 +57,14 @@ export const EVENTS = {
   lyrics: "lyrics",
   /** AI / 本地规则产生的一行洞察（默认 AI 关闭时永不触发）。 */
   aiInsight: "ai-insight",
+  /** 光标进入/离开岛热区（Rust 侧 LL 钩子判定，非 DOM 事件）。 */
+  islandHover: "island-hover",
+  /** dock 贴底唤出 / 收起（与岛共用同一个 LL 钩子）。 */
+  dockReveal: "dock-reveal",
+  /** 展开面板开/关（后端 resize 完成后才下发）。 */
+  panelState: "panel-state",
+  /** 全屏让位状态变化（两窗同时显隐）。 */
+  fullscreenYield: "fullscreen-yield",
 } as const;
 
 /** `fit_dock` / `fit_island` 入参（CSS 逻辑像素）。 */
@@ -188,6 +196,9 @@ export interface MediaState {
 }
 
 export type MediaAction = "play" | "pause" | "play_pause" | "next" | "prev" | "seek";
+
+/** 展开面板尺寸（逻辑像素）。必须与 Rust `window::panel` 的 PANEL_W/PANEL_H 一致。 */
+export const PANEL_SIZE = { w: 320, h: 268 } as const;
 
 /**
  * 系统通知**摘要条**。
