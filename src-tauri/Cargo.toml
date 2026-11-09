@@ -19,6 +19,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# 公钥在 tauri.conf.json；私钥只从 TAURI_SIGNING_PRIVATE_KEY（CI secrets）读，绝不入库。
+tauri-plugin-updater = "2"
 winplat = { path = "../crates/winplat" }
 serde = { workspace = true }
 serde_json = { workspace = true }

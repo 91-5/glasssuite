@@ -14,8 +14,23 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"]
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
+    "createUpdaterArtifacts": true,
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English", "SimpChinese"],
+        "displayLanguageSelector": false
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVEODZBNEM1MTIyMEMyMzQKUldRMHdpQVN4YVNHN1J0ZFlwNGtEVEw4cjNsYVJESUd1ZHl3TXA2K3FZdVFTUDhyRXpmKzkyd2cK",
+      "endpoints": [],
+      "requireSignedVersion": true
+    }
   }
 }

@@ -1,7 +1,7 @@
 # Architecture
 
 > Living document. Status markers: **(implemented)** = 有代码与单测；**(contract)** = 已定但尚未落地。
-> 最后一次结构性更新：P4（dock 迁移）完成后。
+> 最后一次结构性更新：P6（发布链 + D8 实测数据）。
 
 ## 1. Process and window model (implemented)
 
@@ -171,5 +171,76 @@ mutex immediately — a second instance then starts happily. The probe binary hi
 
 ## 11. Resource comparison and multi-monitor × DPI
 
-实测数据与冒烟表格在 P6（打包发布）阶段补入，见交付单 `OC-20261109-002.delivery.md` 的 B7 / B12
-条目。此处不预填未实测的数字。
+数据来源：P6 阶段实跑，命令与逐条输出见交付单 `OC-20261109-002.delivery.md` 的 B7 / B12。
+采样脚本 `artifacts/measure-resources.ps1`（不入库，`artifacts/` 已 gitignore）。
+口径说明见下方「先说清楚口径」——**两个口径的结论不同，都列出来，不挑好看的写**。
+
+### 11.1 Resource comparison (B12)
+
+环境：Windows 11 家庭版中文版、24 逻辑核、双屏 100% 缩放；两窗均可见（`autoHide=false`），
+默认配置（所有外联关闭）。空闲定义为「启动完成后不做任何人工交互」，采样窗口
+新进程 33.246s / 旧进程 36.426s，均 ≥ 30s；分母用实测 wall-clock（脚本自身 `Get-Process`
+开销已计入）。CPU 口径为 `TotalProcessorTime` 增量 / 墙钟时间 / 24 核，即占整机百分比。
+
+| 指标 | 旧：glassdesk + glasspill 之和 | 新：GlassSuite 单进程 | 变化 |
+|---|---|---|---|
+| 主进程 Working Set 均值 | 60.523 MiB | **78.939 MiB** | **+18.416 MiB（+30.4%）↑ 变差** |
+| 进程树 Working Set 均值（含 WebView2 子进程） | 1,104.856 MiB | 635.717 MiB | −469.139 MiB（−42.5%）↓ |
+| 主进程空闲 CPU 均值 | 0.166217 % | 0.015666 % | −90.6 % ↓ |
+| 进程树空闲 CPU 均值 | 0.602314 % | 0.082246 % | −86.3 % ↓ |
+| 进程树 PID 数 | 22 | 10 | −12 |
+
+**先说清楚口径**：B12 判据写的是「常驻内存 ≤ 旧两进程之和」，但「常驻内存」有两种读法，
+两种都实测了，结论相反：
+
+- **按主进程 RSS**（任务管理器里单个 `GlassSuite.exe` 那一行）：**不满足判据**。
+  新单进程 78.939 MiB > 旧两进程之和 60.523 MiB。原因很直白——一个进程里同时装了
+  island（媒体/通知/歌词/AI/指标）、dock（watcher/图标/预览/菜单）和两套 webview，
+  堆与静态状态的基线比两个各自为政的小进程之和更高，这是合进程必然付的固定成本。
+- **按整棵进程树**（主进程 + WebView2 渲染/GPU/utility 子进程，即这台机器上两个「应用」
+  真正吃掉的内存）：**满足判据**，635.717 MiB ≤ 1,104.856 MiB，省 42.5%。
+  收益来自只起一套 WebView2 runtime：旧两进程各带一套，树里有 22 个 PID，合并后 10 个。
+  §1 里「第二个窗口远比第二个进程便宜」说的就是这一层。
+
+空闲 CPU 两个口径都满足判据且下降一个数量级（旧两进程各自有轮询/定时器，
+新进程把光标观测、运行集合扫描、全屏检测收敛成单一来源）。
+
+**结论口径**：若评审按「应用整体资源」判，B12 通过；若严格按「主进程 RSS」判，
+内存一条不成立，需在评审里裁决。此处不做口径替换，也不把不利数字藏起来。
+未修复二进制上的第一次采样（旧 59.134 / 1,187.968 MiB；新 77.612 / 627.761 MiB）
+与上表同趋势，排除了单次采样偶然性。
+
+### 11.2 Multi-monitor × DPI smoke (B7)
+
+`winplat` 是几何唯一真相源，全部坐标是物理像素；进程声明 Per-Monitor Aware V2
+（探针实跑 `dpi context: DPI_AWARENESS_CONTEXT(0x22)`）。本机实测：主屏 1920×1080，
+副屏 2560×1600、原点 (1920, 0)，两块屏均 100%（96 DPI），任务栏均处于自动隐藏态。
+
+| 缩放 | 主屏 | 副屏 | 状态 | 证据 |
+|---|---|---|---|---|
+| 100 % | 无错位/无跳位 | 几何计算正确 | **实跑通过** | `cargo run -q -p winplat --example probe` + 启动日志 + 全屏让位/回落观测 |
+| 125 % | — | — | **BLOCKED** | 需改系统缩放并重新登录，会中断当前会话与用户桌面配置 |
+| 150 % | — | — | **BLOCKED** | 同上 |
+
+100 % 实跑明细（`probe`，物理像素）：
+
+```
+primary screen: Rect { left: 0, top: 0, right: 1920, bottom: 1080 }
+monitor[0] primary=true  bounds=Rect { left: 0, top: 0, right: 1920, bottom: 1080 }
+monitor[1] primary=false bounds=Rect { left: 1920, top: 0, right: 4480, bottom: 1600 }
+taskbar primary=true  -> dock y=996  x=335
+taskbar primary=false -> dock y=1516 x=2575
+```
+
+副屏 dock 的 `x=2575` 是相对**该屏**居中（1920 + (2560−1250)/2），没有错误地回落到主屏；
+`winplat::geom::tests::centered_on_secondary_monitor` 与
+`fullscreen::tests::fullscreen_on_secondary_monitor` 对原点非零的副屏有单测覆盖。
+启动日志里岛/药丸 `fit_island` / `fit_dock` 与 10 轮程序开关的 `[ui] [flip] ... dx=[0,…]`
+一致（B4：260 个 dx 全 0），说明 100 % 下没有因窗口几何变化触发重排跳动。
+B6 的全屏让位/回落也在本机主屏实跑（全屏时可见顶层窗 3 → 1，退出后 1 → 3）。
+
+**125 % / 150 % 未实测，不预填结论。** 复现方式：设置 → 系统 → 显示，把两屏分别改为
+125 % / 150 % 并重新登录；每档跑一次 `cargo run -q -p winplat --example probe`，
+确认 `monitor.bounds` 仍等于物理分辨率而非逻辑尺寸，再启动 GlassSuite，
+检查 dock 贴目标屏任务栏上沿、岛居中、日志里 FLIP `dx` 全 0。
+按卡面「允许 BLOCKED 的情形」，这两档在交付单里标 BLOCKED 并写明原因与复现路径。

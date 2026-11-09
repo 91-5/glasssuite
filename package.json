@@ -13,5 +13,8 @@
     "dev:dock": "pnpm --filter @glasssuite/dock dev",
     "dev:island": "pnpm --filter @glasssuite/island dev",
     "check": "pnpm -r --if-present run typecheck"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4"
   }
 }

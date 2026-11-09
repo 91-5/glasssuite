@@ -53,6 +53,9 @@ pub fn run() {
     let shared = Arc::new(state::SharedState::default());
 
     tauri::Builder::default()
+        // updater 只注册能力：`plugins.updater.endpoints` 为空且前端不主动 check()，
+        // 因此默认零外联；签名公钥在 tauri.conf.json，私钥只在 CI secrets 里。
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Arc::clone(&shared))
         .invoke_handler(tauri::generate_handler![
             shell::fit_dock,
