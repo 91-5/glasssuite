@@ -166,7 +166,8 @@ mod tests {
             normalize_path(r"\\?\C:\Program Files\App\App.EXE"),
             r"c:\program files\app\app.exe"
         );
-        assert_eq!(normalize_path("C:/Users/x/app.exe"), r"c:\users\x\app.exe");
+        // 用通用盘符而非本机用户目录：保持 A5 宽松 grep 只有 log.rs 那一处夹具命中。
+        assert_eq!(normalize_path("D:/Apps/App.EXE"), r"d:\apps\app.exe");
     }
 
     #[test]

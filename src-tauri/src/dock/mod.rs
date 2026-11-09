@@ -71,16 +71,45 @@ pub struct DockSnapshot {
     pub transients: Vec<DockEntry>,
     pub free: Vec<DockEntry>,
     pub auto_hide: bool,
-    /// 内容指纹：排序后的 key 列表。前端据此决定要不要 setState。
+    /// 内容指纹 = 实际渲染顺序的 key 列表（固定项 + 临时项）。前端据此决定要不要 setState。
     pub fingerprint: String,
 }
 
 /// 内容指纹：key 的**顺序**本身就是内容的一部分（拖拽排序必须能被看见），
 /// 但不取 hwnd / 图标 / 窗口位置——那些字段变化不该触发重排（v0.8.1 修复 #1）。
 ///
-/// 调用方保证顺序稳定：固定项按配置顺序，临时项按 key 升序（见 `running::scan_apps`）。
+/// 调用方保证顺序稳定：固定项按配置顺序，临时项按「首次出现顺序」（见 `merge_transient_order`）。
+/// 指纹必须和渲染顺序用同一份列表，否则 `EnumWindows` 的 z-order 抖动会被误判成内容变化。
 pub fn fingerprint(keys: &[String]) -> String {
     keys.join("|")
+}
+
+/// 稳定临时项显示顺序：保留仍在集合中的旧 key 的相对顺序，**新 key 只追加到末尾**。
+///
+/// 为什么不能按 key 排序：`EnumWindows` 的返回顺序随 z-order 变化，排序虽确定，但新开一个
+/// 程序时它的 key 可能插进中间，把后面所有既有图标整体推走一枚图标宽度 —— 这正是
+/// v0.8.1 要消灭的「图标一连串跳」（B4 实测曾打出 `dx=[0×5, -50×8]`）。
+/// 只追加末尾时，既有图标的自然布局位不变，FLIP 的 dx 自然全 0。
+fn merge_transient_order(order: &mut Vec<String>, keys: &[String]) {
+    order.retain(|k| keys.iter().any(|n| n == k));
+    for k in keys {
+        if !order.iter().any(|o| o == k) {
+            order.push(k.clone());
+        }
+    }
+}
+
+fn transient_entry(a: &running::RunningApp, icons: &HashMap<String, String>) -> DockEntry {
+    DockEntry {
+        key: a.key.clone(),
+        id: a.key.clone(),
+        name: name_from_path(&a.path),
+        path: a.path.clone(),
+        icon: icons.get(&a.key).cloned(),
+        running: true,
+        pinned: false,
+        free_rect: None,
+    }
 }
 
 fn name_from_path(path: &str) -> String {
@@ -97,6 +126,8 @@ pub struct DockState {
     pub config: Mutex<DockConfig>,
     pub menu_config: Mutex<MenuConfig>,
     pub running: Mutex<Vec<running::RunningApp>>,
+    /// 临时项显示顺序（key），与 `running` 分开存，避免 z-order 抖动影响渲染顺序。
+    pub transient_order: Mutex<Vec<String>>,
     pub icons: Mutex<HashMap<String, String>>,
     pub last_fingerprint: Mutex<String>,
     pub preview: preview::PreviewController,
@@ -110,6 +141,7 @@ impl DockState {
             config: Mutex::new(cfg),
             menu_config: Mutex::new(menu_cfg),
             running: Mutex::new(Vec::new()),
+            transient_order: Mutex::new(Vec::new()),
             icons: Mutex::new(HashMap::new()),
             last_fingerprint: Mutex::new(String::new()),
             preview: preview::PreviewController::default(),
@@ -117,9 +149,21 @@ impl DockState {
         }
     }
 
+    /// watcher 每次扫完调用：先稳定顺序，再换运行集合。
+    /// 两把锁**不重叠持有**，`snapshot()` 的加锁顺序不会与它构成环。
+    pub fn set_running(&self, apps: Vec<running::RunningApp>) {
+        let keys: Vec<String> = apps.iter().map(|a| a.key.clone()).collect();
+        {
+            let mut order = self.transient_order.lock().unwrap();
+            merge_transient_order(&mut order, &keys);
+        }
+        *self.running.lock().unwrap() = apps;
+    }
+
     pub fn snapshot(&self) -> DockSnapshot {
         let cfg = self.config.lock().unwrap();
         let apps = self.running.lock().unwrap();
+        let order = self.transient_order.lock().unwrap();
         let icons = self.icons.lock().unwrap();
         let running_keys: std::collections::HashSet<&str> =
             apps.iter().map(|a| a.key.as_str()).collect();
@@ -149,25 +193,27 @@ impl DockState {
             ));
         }
 
+        // 渲染顺序 = 稳定顺序，且指纹用的就是这份 all_keys（修复 #1 的服务端一半）。
         let mut transients = Vec::new();
         let mut all_keys = pinned_keys.clone();
+        for key in order.iter() {
+            if pinned_keys.contains(key) {
+                continue;
+            }
+            if let Some(a) = apps.iter().find(|a| &a.key == key) {
+                all_keys.push(key.clone());
+                transients.push(transient_entry(a, &icons));
+            }
+        }
+        // 兜底：首帧在 watcher 同步顺序之前就有人调 dock_state 时，按扫描顺序补齐，
+        // 不让图标凭空消失。正常运行下这个循环不会命中。
         for a in apps.iter() {
-            if pinned_keys.contains(&a.key) {
+            if all_keys.contains(&a.key) {
                 continue;
             }
             all_keys.push(a.key.clone());
-            transients.push(DockEntry {
-                key: a.key.clone(),
-                id: a.key.clone(),
-                name: name_from_path(&a.path),
-                path: a.path.clone(),
-                icon: icons.get(&a.key).cloned(),
-                running: true,
-                pinned: false,
-                free_rect: None,
-            });
+            transients.push(transient_entry(a, &icons));
         }
-        transients.sort_by(|a, b| a.key.cmp(&b.key));
 
         DockSnapshot {
             pinned,
@@ -231,17 +277,18 @@ pub fn spawn(app: AppHandle, dock: Arc<DockState>) {
             let Some(apps) = running::scan_apps_bounded() else {
                 continue;
             };
-            let keys: Vec<String> = apps.iter().map(|a| a.key.clone()).collect();
-            let fp = fingerprint(&keys);
+            dock.set_running(apps);
+            // 指纹取自快照本身：与前端拿到的渲染顺序逐字一致，
+            // 不再拿未排序的枚举顺序另算一份（那样 z-order 一抖就误判成内容变化）。
+            let snap = dock.snapshot();
             {
                 let mut last = dock.last_fingerprint.lock().unwrap();
-                if *last == fp {
+                if *last == snap.fingerprint {
                     continue;
                 }
-                *last = fp.clone();
+                *last = snap.fingerprint.clone();
             }
-            *dock.running.lock().unwrap() = apps;
-            let _ = app.emit(RUNNING_EVENT, dock.snapshot());
+            let _ = app.emit(RUNNING_EVENT, snap);
             winplat::log::log("dock: running changed count=1");
         })
         .ok();
@@ -571,6 +618,39 @@ mod tests {
         assert_ne!(fingerprint(&a), fingerprint(&b), "拖拽排序必须改变指纹");
         assert_eq!(fingerprint(&a), "exe:b|exe:a");
         assert_ne!(fingerprint(&a), fingerprint(&a[..1]));
+    }
+
+    /// B4 回归：新开程序不能把已有临时图标往后推，否则 FLIP 会量出 -50 的 dx 并播跳动动画。
+    #[test]
+    fn transient_order_appends_new_keys_without_moving_existing() {
+        let mut order = vec!["exe:b".to_string(), "exe:c".to_string()];
+        let after_open = vec![
+            "exe:a".to_string(),
+            "exe:c".to_string(),
+            "exe:b".to_string(),
+        ];
+        merge_transient_order(&mut order, &after_open);
+        assert_eq!(
+            order,
+            vec![
+                "exe:b".to_string(),
+                "exe:c".to_string(),
+                "exe:a".to_string()
+            ],
+            "新 key 只能追加到末尾，且枚举顺序抖动不得改变既有顺序"
+        );
+    }
+
+    #[test]
+    fn transient_order_drops_closed_apps_and_keeps_the_rest() {
+        let mut order = vec![
+            "exe:a".to_string(),
+            "exe:b".to_string(),
+            "exe:c".to_string(),
+        ];
+        merge_transient_order(&mut order, &["exe:c".to_string(), "exe:a".to_string()]);
+        assert_eq!(order, vec!["exe:a".to_string(), "exe:c".to_string()]);
+        assert_eq!(fingerprint(&order), "exe:a|exe:c");
     }
 
     #[test]
