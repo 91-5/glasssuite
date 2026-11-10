@@ -78,12 +78,16 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build NSIS + updater artifacts
+        uses: tauri-apps/tauri-action@action-v0.6.2
+        with:
+          args: --bundles nsis
+          updaterJsonPreferNsis: true
         env:
           # Private key lives only in GitHub Actions secrets; the public key
           # is in tauri.conf.json and is committed to the repo.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: pnpm tauri build
 
       - name: Portable zip + SHA256SUMS
         shell: pwsh
