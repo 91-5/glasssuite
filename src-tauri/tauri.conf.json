@@ -29,7 +29,7 @@
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVEODZBNEM1MTIyMEMyMzQKUldRMHdpQVN4YVNHN1J0ZFlwNGtEVEw4cjNsYVJESUd1ZHl3TXA2K3FZdVFTUDhyRXpmKzkyd2cK",
-      "endpoints": [],
+      "endpoints": ["https://github.com/91-5/glasssuite/releases/latest/download/latest.json"],
       "requireSignedVersion": true
     }
   }
