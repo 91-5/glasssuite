@@ -51,7 +51,7 @@ jobs:
 
   build:
     needs: check
-    # PR 只跑 check；main 与 v* tag 才出包，避免把未验收功能打进发布物。
+    # Package builds only on main pushes and v* tags; PRs run check only.
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: windows-latest
     permissions:
@@ -79,7 +79,8 @@ jobs:
 
       - name: Build NSIS + updater artifacts
         env:
-          # 私钥只在 GitHub Actions secrets；公钥在 tauri.conf.json，仓库里没有私钥。
+          # Private key lives only in GitHub Actions secrets; the public key
+          # is in tauri.conf.json and is committed to the repo.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build
@@ -89,12 +90,14 @@ jobs:
         run: |
           $cfg = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
           $v = $cfg.version
-          # cargo workspace 根在仓库根，target/ 也在根；不要写成 src-tauri/target/release。
+          # The cargo workspace root is the repo root, so target/ is at the root.
+          # Do NOT write src-tauri/target/release.
           $release = "target/release"
           $out = "bundle-out"
           New-Item -ItemType Directory -Force $out | Out-Null
 
-          # Tauri 的 Windows 产物是单文件 exe（WebView2 用系统运行时），便携包只需它 + 说明。
+          # The Tauri Windows build is a single-file exe (WebView2 comes from the
+          # system runtime), so the portable package is just exe + readme.
           Copy-Item "$release/GlassSuite.exe" "$out/GlassSuite.exe" -Force
           Copy-Item README.md "$out/README.txt" -Force
           $zip = Join-Path $out "GlassSuite_${v}_x64-portable.zip"
@@ -109,8 +112,9 @@ jobs:
             $hash = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()
             "$hash  $($f.Name)"
           }
-          # 显式写无 BOM 的 UTF-8：Windows PowerShell 5.1 的 -Encoding utf8 会带 BOM，
-          # 校验工具会把 BOM 当成第一个文件名的前导字符，导致首行校验失败。
+          # Write UTF-8 without BOM explicitly: Windows PowerShell 5.1's
+          # -Encoding utf8 adds a BOM, and verifiers treat the BOM as leading
+          # characters of the first filename, which breaks the first line.
           $sumPath = Join-Path $out "SHA256SUMS"
           [System.IO.File]::WriteAllText(
             $sumPath,
