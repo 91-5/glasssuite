@@ -51,7 +51,8 @@ jobs:
 
   build:
     needs: check
-    # PR 只跑 check；main �?v* tag 才出包，避免把未验收功能打进发布物�?    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # PR 只跑 check；main 与 v* tag 才出包，避免把未验收功能打进发布物。
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: windows-latest
     permissions:
       contents: write
@@ -78,7 +79,8 @@ jobs:
 
       - name: Build NSIS + updater artifacts
         env:
-          # 私钥只在 GitHub Actions secrets；公钥在 tauri.conf.json，仓库里没有私钥�?          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # 私钥只在 GitHub Actions secrets；公钥在 tauri.conf.json，仓库里没有私钥。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build
 
@@ -87,11 +89,13 @@ jobs:
         run: |
           $cfg = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
           $v = $cfg.version
-          # cargo workspace 根在仓库根，target/ 也在根；不要写成 src-tauri/target/release�?          $release = "target/release"
+          # cargo workspace 根在仓库根，target/ 也在根；不要写成 src-tauri/target/release。
+          $release = "target/release"
           $out = "bundle-out"
           New-Item -ItemType Directory -Force $out | Out-Null
 
-          # Tauri �?Windows 产物是单文件 exe（WebView2 用系统运行时），便携包只需�?+ 说明�?          Copy-Item "$release/GlassSuite.exe" "$out/GlassSuite.exe" -Force
+          # Tauri 的 Windows 产物是单文件 exe（WebView2 用系统运行时），便携包只需它 + 说明。
+          Copy-Item "$release/GlassSuite.exe" "$out/GlassSuite.exe" -Force
           Copy-Item README.md "$out/README.txt" -Force
           $zip = Join-Path $out "GlassSuite_${v}_x64-portable.zip"
           Compress-Archive -Path "$out/GlassSuite.exe", "$out/README.txt" -DestinationPath $zip -Force
@@ -105,7 +109,9 @@ jobs:
             $hash = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()
             "$hash  $($f.Name)"
           }
-          # 显式写无 BOM �?UTF-8：Windows PowerShell 5.1 �?-Encoding utf8 会带 BOM�?          # 校验工具会把 BOM 当成第一个文件名的前导字符，导致首行校验失败�?          $sumPath = Join-Path $out "SHA256SUMS"
+          # 显式写无 BOM 的 UTF-8：Windows PowerShell 5.1 的 -Encoding utf8 会带 BOM，
+          # 校验工具会把 BOM 当成第一个文件名的前导字符，导致首行校验失败。
+          $sumPath = Join-Path $out "SHA256SUMS"
           [System.IO.File]::WriteAllText(
             $sumPath,
             ($lines -join "`n") + "`n",
