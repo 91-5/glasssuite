@@ -1,8 +1,7 @@
 //! 展开面板与全屏让位。
 //!
-//! 展开态是**唯一**允许固定窗口尺寸的场景（卡面 §1.4 红线 4）：用 `fit_window` 同一套
-//! `place()` 做 resize，不引入 720×480 固定窗 + 常驻热区那套旧模型。收起时按缓存的
-//! 折叠尺寸复位，热区也一并更新，避免出现「看不见的窗口吃掉鼠标」。
+//! 岛采用**固定窗口 + 热区上报**模型（移植自 glasspill）：折叠窗 420×210、展开窗 720×480，
+//! 窗口本身不随内容伸缩，透明区靠 `cursor` 的热区判定穿透。收起时按 `ISLAND_SIZE` 复位。
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -13,9 +12,9 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::shell::{self, Anchor};
 use crate::state::{Hotzone, SharedState};
 
-/// 展开面板尺寸（逻辑像素）。只有展开态使用。
-pub const PANEL_W: f64 = 320.0;
-pub const PANEL_H: f64 = 268.0;
+/// 展开面板尺寸（逻辑像素）。必须与 `packages/ipc-types` 的 `PANEL_SIZE` 一致。
+pub const PANEL_W: f64 = 720.0;
+pub const PANEL_H: f64 = 480.0;
 
 /// 与 `packages/ipc-types` 的 `EVENTS.panelState` 一致。
 pub const PANEL_EVENT: &str = "panel-state";
@@ -60,24 +59,17 @@ pub fn collapse_panel(
     }
     state.island_expanded.store(false, Ordering::Relaxed);
 
-    let (w, h) = *state.island_collapsed_size.lock().unwrap();
-    let (w, h) = if w > 0.0 && h > 0.0 {
-        (w, h)
-    } else {
-        shell::STARTUP_ISLAND
-    };
+    let (w, h) = shell::STARTUP_ISLAND;
 
     let win = app
         .get_webview_window("island")
         .ok_or_else(|| "island 窗口不存在".to_string())?;
     shell::place(&win, Anchor::Island, w, h)?;
 
-    *state.island_hotzone.lock().unwrap() = Hotzone {
-        x: 0.0,
-        y: 0.0,
-        w,
-        h,
-    };
+    // 热区清零：前端收到 `panel-state=false` 后会按当前模式重报（药丸或球）。
+    // 清零而不是沿用旧矩形——否则面板收起那一刻，透明区里还留着能吃掉桌面点击的旧热区。
+    *state.island_hotzone.lock().unwrap() = Hotzone::default();
+    *state.ball_hotzone.lock().unwrap() = Hotzone::default();
     // 恢复穿透。若光标仍在药丸上，钩子会在 80ms 防抖后重新置为可交互。
     state.island_transparent.store(true, Ordering::Relaxed);
     let _ = win.set_ignore_cursor_events(true);

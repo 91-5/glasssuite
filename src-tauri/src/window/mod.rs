@@ -35,3 +35,40 @@ pub fn set_hotzone(
         *state.island_scale.lock().unwrap() = scale;
     }
 }
+
+/// 折叠球热区上报（收起态）。与药丸热区取并集命中，球心用于算 `ball-look` 朝向。
+///
+/// 为什么球要单独一份而不是并进 `set_hotzone`：收起时药丸层是 `display:none`，
+/// 若沿用同一个矩形，展开判定会在球外的空白处误触发 hover。
+#[tauri::command]
+pub fn set_ball_hotzone(
+    window: WebviewWindow,
+    state: tauri::State<'_, Arc<SharedState>>,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) {
+    *state.ball_hotzone.lock().unwrap() = Hotzone { x, y, w, h };
+    *state.ball_center.lock().unwrap() = (x + w / 2.0, y + h / 2.0);
+    *state.island_scale.lock().unwrap() = window.scale_factor().unwrap_or(1.0);
+}
+
+/// AI 洞察静音开关（收起球右键 / 设置面板均可用）。静音期间后端不 emit。
+#[tauri::command]
+pub fn set_muted(state: tauri::State<'_, Arc<SharedState>>, muted: bool) {
+    state
+        .muted
+        .store(muted, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 当前是否「没有 AI 可看」：未配置端点/密钥，或用户静音。
+///
+/// 前端用它决定收起态是否画洞察条（未配置时整条隐藏，不留空壳）。
+#[tauri::command]
+pub fn ai_disabled(
+    state: tauri::State<'_, Arc<SharedState>>,
+    ai: tauri::State<'_, Arc<crate::island::ai::AiState>>,
+) -> bool {
+    state.muted.load(std::sync::atomic::Ordering::Relaxed) || !ai.current().is_configured()
+}

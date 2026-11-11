@@ -438,3 +438,122 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ===== GlassSuite 增量：展开态设置视图（AI 与网络） =====
+ * 外观与 glass.css 的 .pill 同一套玻璃语言：同一填充色、同一模糊半径、同一圆角谱系。
+ * 只此一处增量，其余视觉全部沿用 glasspill 原件。
+ */
+
+.island-gear {
+  position: absolute;
+  top: 18px;
+  right: 22px;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.72);
+  background: rgba(24, 24, 31, 0.56);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  backdrop-filter: blur(28px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 50%;
+  cursor: pointer;
+  z-index: 6;
+  transition: color 0.18s ease, background 0.18s ease;
+}
+
+.island-gear:hover {
+  color: #fff;
+  background: rgba(40, 42, 52, 0.72);
+}
+
+.island-settings {
+  position: absolute;
+  top: 22px;
+  right: 80px;
+  bottom: 22px;
+  left: 80px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 20px 14px;
+  background: rgba(24, 24, 31, 0.72);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  backdrop-filter: blur(28px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 28px;
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  overflow-y: auto;
+  pointer-events: auto;
+  z-index: 5;
+  animation: settings-in 0.26s cubic-bezier(0.32, 0.72, 0.24, 1);
+}
+
+@keyframes settings-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.island-settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.island-settings-title {
+  font-size: 14px;
+  letter-spacing: 0.4px;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.island-settings-close {
+  padding: 3px 12px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.8);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.island-settings-close:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.island-settings-note {
+  margin: 6px 0 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.island-privacy-note {
+  position: absolute;
+  top: 78px;
+  left: 50%;
+  padding: 5px 12px;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  color: rgba(255, 255, 255, 0.66);
+  background: rgba(24, 24, 31, 0.62);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  backdrop-filter: blur(28px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  transform: translateX(-50%);
+  pointer-events: none;
+  animation: settings-in 0.26s cubic-bezier(0.32, 0.72, 0.24, 1);
+}

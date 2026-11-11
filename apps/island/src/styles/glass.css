@@ -1,0 +1,1091 @@
+/*
+ * GlassPill 玻璃质感 —— v0.x 取舍：CSS 半透明 + backdrop-filter（"画出来的玻璃"）。
+ * DWM Acrylic 路线由 dwm_poc 验证后于 v1.0 决策。
+ *
+ * 字体：霞鹜文楷（LXGW WenKai），OFL 开源授权，手写楷体风格（sir 2026-10-27 选定）。
+ *
+ * 红线约束：除 Eyes 眨眼/辉光脉冲、Clock 音乐脉冲外，无 @keyframes infinite。
+ * 过渡只发生在形态切换瞬间，属性限 transform/opacity/width/height/border-radius，
+ * 稳态零合成开销。
+ */
+
+/* 霞鹜文楷 —— 手写楷体（OFL 授权，本地打包） */
+@font-face {
+  font-family: "LXGW WenKai";
+  src: url("../assets/fonts/LXGWWenKai-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "LXGW WenKai";
+  src: url("../assets/fonts/LXGWWenKai-Medium.ttf") format("truetype");
+  font-weight: 600 700;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: dark;
+  --tint: 116, 142, 255;
+}
+
+* {
+  box-sizing: border-box;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+}
+
+body {
+  font-family: "LXGW WenKai", "KaiTi", "楷体", "Microsoft YaHei", sans-serif;
+  color: #fff;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 窗口整体不接收多余命中；命中交给 .pill / .collapse-ball / .notif-island */
+.island-root {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* 收起小球 —— 左侧，跟随岛的左边缘移动 */
+.collapse-ball-container {
+  position: absolute;
+  top: 10px;
+  padding-top: 4px;
+  transition: left 0.25s ease-out;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  pointer-events: auto;
+  z-index: 20;
+}
+
+/* 岛收起时，球在左侧原位 */
+.island-root.is-collapsed .collapse-ball-container {
+  left: 20px;
+}
+
+/* 岛可见时，球跟随岛的左边缘（固定 8px 间距） */
+.island-root:not(.is-collapsed).collapsed .collapse-ball-container {
+  left: calc(50% - 169px);
+}
+
+.island-root:not(.is-collapsed).hover .collapse-ball-container {
+  left: calc(50% - 209px);
+}
+
+.island-root:not(.is-collapsed).expanded .collapse-ball-container {
+  left: calc(50% - 324px);
+}
+
+.collapse-ball {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: rgba(24, 24, 31, 0.58);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  backdrop-filter: blur(28px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+  pointer-events: auto;
+  z-index: 20;
+  transition: transform 0.15s ease, box-shadow 0.3s ease, border-color 0.3s ease;
+}
+
+.collapse-ball:hover {
+  transform: scale(1.05);
+}
+
+/* ---------- 状态灯（OC-20261030-001）----------
+   data-state 由 useBallHealth() 仲裁，优先级 battery > perf > offline > normal。
+   offline 故意不改色（卡面：正常色 + XX 眼），只换眼睛，见 [data-eyes="xx"] 段。 */
+
+/* perf：高负载橙红，静止 */
+.collapse-ball[data-state="perf"] {
+  border-color: rgba(255, 150, 80, 0.35);
+}
+
+.collapse-ball[data-state="perf"] .ball-body {
+  background: radial-gradient(circle at 38% 38%, #ffffff 0%, #ffa060 40%, #a04010 85%);
+  box-shadow: 0 0 6px rgba(255, 150, 70, 0.75), 0 0 14px rgba(255, 120, 40, 0.45);
+}
+
+.collapse-ball[data-state="perf"] .ball-glow {
+  background: radial-gradient(circle, rgba(255, 150, 70, 0.3) 0%, transparent 65%);
+}
+
+/* battery：电量低，红色 + 呼吸闪烁（4s 级周期，走合成层 opacity） */
+.collapse-ball[data-state="battery"] {
+  border-color: rgba(255, 90, 90, 0.4);
+}
+
+.collapse-ball[data-state="battery"] .ball-body {
+  background: radial-gradient(circle at 38% 38%, #ffffff 0%, #ff6060 40%, #8a0000 85%);
+  box-shadow: 0 0 6px rgba(255, 70, 70, 0.8), 0 0 16px rgba(255, 40, 40, 0.5);
+  animation: ball-breathe 4s ease-in-out infinite;
+}
+
+.collapse-ball[data-state="battery"] .ball-glow {
+  background: radial-gradient(circle, rgba(255, 80, 80, 0.32) 0%, transparent 65%);
+  animation: ball-breathe 4s ease-in-out infinite;
+}
+
+/* 收起态待机脉冲（ball-pulse）与电量呼吸并存时呼吸优先 —— 同元素 animation 只取其一 */
+.collapse-ball.is-collapsed[data-state="battery"] .ball-body {
+  animation: ball-breathe 4s ease-in-out infinite;
+}
+
+@keyframes ball-breathe {
+  0%, 100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.collapse-ball.is-collapsed .ball-body {
+  animation: ball-pulse 2s ease-in-out infinite;
+}
+
+.ball-glow {
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(140, 140, 255, 0.2) 0%, transparent 65%);
+}
+
+.ball-body {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 38% 38%, #ffffff 0%, #9090ff 40%, #3030a0 85%);
+  box-shadow: 0 0 4px rgba(140, 140, 255, 0.6), 0 0 10px rgba(140, 140, 255, 0.35);
+  position: relative;
+  transition: transform 120ms ease-out;
+}
+
+.ball-eye {
+  position: absolute;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #ffffff;
+  top: 5px;
+  /* 位移小才显得是「在看」而不是「在抖」 */
+  transition: transform 90ms ease-out;
+}
+
+/* 断网：两眼各画一个 ×（两条旋转细线，无额外 DOM）；体色保持正常（卡面：正常色 + XX 眼） */
+.collapse-ball[data-eyes="xx"] .ball-eye {
+  width: 7px;
+  height: 7px;
+  top: 4px;
+  background: transparent;
+  border-radius: 0;
+}
+
+.collapse-ball[data-eyes="xx"] .ball-eye::before,
+.collapse-ball[data-eyes="xx"] .ball-eye::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 0;
+  width: 1.4px;
+  height: 100%;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.collapse-ball[data-eyes="xx"] .ball-eye::before {
+  transform: translateX(-50%) rotate(45deg);
+}
+
+.collapse-ball[data-eyes="xx"] .ball-eye::after {
+  transform: translateX(-50%) rotate(-45deg);
+}
+
+.ball-eye-left {
+  left: 4px;
+}
+
+.ball-eye-right {
+  right: 4px;
+}
+
+/* ---------- 眼神跟随（OC-20261030-001 方案 A：纯 CSS 四象限 hover）----------
+   .ball-look 是盖在球面上的四个透明象限热区，光标落在哪个象限，
+   球体就朝哪边微倾、眼球就看向哪边。零 JS、零监听、零重渲染。
+   变换只作用于 .ball-body / .ball-eye（热区宿主 .collapse-ball 不动），
+   避免球体移出光标导致 hover 反复丢失的抖振。 */
+
+.ball-look {
+  position: absolute;
+  width: 50%;
+  height: 50%;
+  z-index: 2;
+}
+
+.ball-look.q-tl { top: 0; left: 0; }
+.ball-look.q-tr { top: 0; right: 0; }
+.ball-look.q-bl { bottom: 0; left: 0; }
+.ball-look.q-br { bottom: 0; right: 0; }
+
+.collapse-ball .q-tl:hover ~ .ball-body { transform: translate(-1.2px, -1.2px) rotate(-2.5deg); }
+.collapse-ball .q-tr:hover ~ .ball-body { transform: translate(1.2px, -1.2px) rotate(2.5deg); }
+.collapse-ball .q-bl:hover ~ .ball-body { transform: translate(-1.2px, 1.2px) rotate(-2.5deg); }
+.collapse-ball .q-br:hover ~ .ball-body { transform: translate(1.2px, 1.2px) rotate(2.5deg); }
+
+.collapse-ball .q-tl:hover ~ .ball-body .ball-eye { transform: translate(-1.8px, -1.8px); }
+.collapse-ball .q-tr:hover ~ .ball-body .ball-eye { transform: translate(1.8px, -1.8px); }
+.collapse-ball .q-bl:hover ~ .ball-body .ball-eye { transform: translate(-1.8px, 1.8px); }
+.collapse-ball .q-br:hover ~ .ball-body .ball-eye { transform: translate(1.8px, 1.8px); }
+
+/* 全屏视线（OC-20261030-002 任务 B）：Rust 钩子把球心→光标量化为 8 方向，
+   ref 直写 data-look（零 setState）。球上四象限 hover 特异性更高，自动优先。 */
+.collapse-ball[data-look="n"]  .ball-body { transform: translate(0, -1.2px); }
+.collapse-ball[data-look="ne"] .ball-body { transform: translate(1px, -1px) rotate(2.5deg); }
+.collapse-ball[data-look="e"]  .ball-body { transform: translate(1.2px, 0); }
+.collapse-ball[data-look="se"] .ball-body { transform: translate(1px, 1px) rotate(2.5deg); }
+.collapse-ball[data-look="s"]  .ball-body { transform: translate(0, 1.2px); }
+.collapse-ball[data-look="sw"] .ball-body { transform: translate(-1px, 1px) rotate(-2.5deg); }
+.collapse-ball[data-look="w"]  .ball-body { transform: translate(-1.2px, 0); }
+.collapse-ball[data-look="nw"] .ball-body { transform: translate(-1px, -1px) rotate(-2.5deg); }
+
+.collapse-ball[data-look="n"]  .ball-body .ball-eye { transform: translate(0, -2px); }
+.collapse-ball[data-look="ne"] .ball-body .ball-eye { transform: translate(1.8px, -1.8px); }
+.collapse-ball[data-look="e"]  .ball-body .ball-eye { transform: translate(2px, 0); }
+.collapse-ball[data-look="se"] .ball-body .ball-eye { transform: translate(1.8px, 1.8px); }
+.collapse-ball[data-look="s"]  .ball-body .ball-eye { transform: translate(0, 2px); }
+.collapse-ball[data-look="sw"] .ball-body .ball-eye { transform: translate(-1.8px, 1.8px); }
+.collapse-ball[data-look="w"]  .ball-body .ball-eye { transform: translate(-2px, 0); }
+.collapse-ball[data-look="nw"] .ball-body .ball-eye { transform: translate(-1.8px, -1.8px); }
+
+/* ---------- 充电闪电标（OC-20261030-002 任务 A）----------
+   sir：插电不闪红，改在球的下半部分给个闪电。低调青白，不参与状态色
+   （充电是常态信息不是告警），data-state 照常按 offline/perf/normal 判定。 */
+.ball-bolt {
+  position: absolute;
+  left: 50%;
+  bottom: 3px;
+  width: 9px;
+  height: 13px;
+  transform: translateX(-50%);
+  background: linear-gradient(180deg, #eaffff 0%, #a8e0ff 55%, #62bce8 100%);
+  clip-path: polygon(45% 0%, 10% 55%, 38% 55%, 30% 100%, 90% 40%, 55% 40%, 70% 0%);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 1;
+  transition: opacity 0.3s ease, filter 0.3s ease;
+}
+
+.collapse-ball[data-charging="true"] .ball-bolt {
+  opacity: 0.92;
+  filter: drop-shadow(0 0 3px rgba(150, 220, 255, 0.6));
+}
+
+@keyframes ball-pulse {
+  0%, 100% {
+    opacity: 0.8;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* 免打扰按钮 —— 小球下方 */
+.mute-btn {
+  font-size: 17px;
+  line-height: 1;
+  padding: 3px;
+  min-width: 28px;
+  text-align: center;
+  cursor: pointer;
+  opacity: 0.5;
+  pointer-events: auto;
+  transition: opacity 0.15s ease;
+  user-select: none;
+}
+
+.mute-btn:hover {
+  opacity: 0.8;
+}
+
+.mute-btn.on {
+  opacity: 0.9;
+}
+
+/* 主岛容器 —— 收起时向左滑动 */
+.island-main {
+  position: absolute;
+  left: 50%;
+  top: 10px;
+  transform: translateX(-50%);
+  transition: transform 0.25s ease-out, opacity 0.25s ease-out;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.island-main:not(.collapsed) {
+  pointer-events: auto;
+}
+
+.island-main.collapsed {
+  transform: translateX(-50%) translateX(-200px);
+  opacity: 0;
+}
+
+/* 通知灵动岛 —— 主岛下方，不受收起影响 */
+/* ---------- AI 洞察条（主岛下方，顶替通知卡）---------- */
+.insight-island {
+  position: absolute;
+  left: 50%;
+  top: 65px;
+  transform: translateX(-50%);
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 460px;
+  background: rgba(24, 24, 31, 0.62);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  backdrop-filter: blur(28px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 14px;
+  padding: 8px 16px;
+  animation: insight-in 0.24s ease-out;
+}
+
+/* AI 重写：轻微青色描边，与本地兜底区分 */
+.insight-island.ai {
+  border-color: rgba(110, 220, 220, 0.35);
+}
+
+.insight-badge {
+  font-size: 12px;
+  opacity: 0.75;
+  flex: none;
+}
+
+.insight-island.ai .insight-badge {
+  color: rgba(130, 235, 230, 0.95);
+}
+
+/* 本地兜底：中性提示，不冒充 AI */
+.insight-island.local .insight-badge {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+/* 主动建议：琥珀色，与 AI 摘要区分 */
+.insight-island.rule {
+  border-color: rgba(255, 190, 110, 0.35);
+}
+
+.insight-island.rule .insight-badge {
+  color: rgba(255, 200, 120, 0.95);
+  font-weight: 700;
+}
+
+/* AI 关闭态（ADV-1）：暗灰描边 + 灰 ×，明确「被关了」而非「坏了」 */
+.insight-island.off {
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.insight-island.off .insight-badge {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.insight-text {
+  font-size: 12.5px;
+  line-height: 1.3;
+  opacity: 0.92;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@keyframes insight-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+.notif-island {
+  position: absolute;
+  left: 50%;
+  top: 65px;
+  transform: translateX(-50%);
+  pointer-events: auto;
+  background: rgba(24, 24, 31, 0.58);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  backdrop-filter: blur(28px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+  padding: 10px 16px;
+  min-width: 200px;
+  max-width: 400px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  animation: notif-slide-in 0.3s ease-out;
+}
+
+@keyframes notif-slide-in {
+  from {
+    transform: translateX(-50%) translateY(-10px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(-50%) translateY(0);
+    opacity: 1;
+  }
+}
+
+.notif-island-app {
+  font-size: 10px;
+  opacity: 0.5;
+  margin-bottom: 2px;
+}
+
+.notif-island-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
+.notif-island-count {
+  font-size: 9px;
+  opacity: 0.45;
+  flex: none;
+}
+
+.notif-island-title {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.notif-island-body {
+  font-size: 11px;
+  opacity: 0.7;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+
+.pill {
+  pointer-events: auto;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(24, 24, 31, 0.58);
+  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  backdrop-filter: blur(28px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  border-radius: 999px;
+  overflow: hidden;
+  cursor: default;
+  transition:
+    width 0.34s cubic-bezier(0.32, 0.72, 0.24, 1),
+    height 0.34s cubic-bezier(0.32, 0.72, 0.24, 1),
+    border-radius 0.34s cubic-bezier(0.32, 0.72, 0.24, 1);
+}
+
+.pill.collapsed {
+  width: 250px;
+  height: 44px;
+  padding: 0 12px 0 6px;
+}
+.pill.hover {
+  width: 330px;
+  height: 52px;
+  padding: 0 16px 0 6px;
+}
+.pill.expanded {
+  width: 560px;
+  height: 480px;
+  border-radius: 24px;
+  padding: 12px 16px 10px;
+  align-items: stretch;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* ---------- 收拢/悬停层 ---------- */
+.layer-compact {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  opacity: 1;
+  transition: opacity 0.18s ease;
+}
+.pill.expanded .layer-compact {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.meta {
+  flex: 1;
+  min-width: 0;
+}
+.title {
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.title.dim {
+  opacity: 0.6;
+  font-weight: 500;
+}
+.artist {
+  font-size: 11px;
+  line-height: 1.25;
+  opacity: 0.62;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 播放状态指示点：静态，不用呼吸动画 */
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.22);
+  flex: none;
+}
+.dot.on {
+  background: rgb(var(--tint));
+  box-shadow: 0 0 6px rgba(var(--tint), 0.8);
+}
+
+/* ---------- 封面 ---------- */
+.art {
+  display: block;
+  border-radius: 8px;
+  object-fit: cover;
+  background: linear-gradient(135deg, rgba(var(--tint), 0.85), rgba(48, 48, 64, 0.95));
+  flex: none;
+}
+.art.sm {
+  width: 30px;
+  height: 30px;
+}
+.art.lg {
+  width: 64px;
+  height: 64px;
+  border-radius: 12px;
+}
+.art.placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+/* ---------- 展开层 ---------- */
+.layer-expanded {
+  position: absolute;
+  inset: 0;
+  padding: 14px 18px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.22s ease 0.1s;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+.layer-expanded::-webkit-scrollbar {
+  width: 4px;
+}
+.layer-expanded::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 2px;
+}
+.pill.expanded .layer-expanded {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.exp-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 0;
+  margin-bottom: 4px;
+}
+.meta.wide {
+  min-width: 0;
+}
+.meta.wide .title {
+  font-size: 14px;
+}
+.meta.wide .album {
+  font-size: 10.5px;
+  opacity: 0.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- 进度条 ---------- */
+.progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.92;
+}
+.time {
+  flex: none;
+  opacity: 0.7;
+  min-width: 28px;
+}
+.track {
+  position: relative;
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.14);
+  overflow: hidden;
+}
+.fill {
+  position: absolute;
+  inset: 0;
+  background: rgb(var(--tint));
+  transform-origin: left center;
+  will-change: transform;
+}
+.track input[type="range"] {
+  position: absolute;
+  inset: -8px 0;
+  width: 100%;
+  height: 20px;
+  margin: 0;
+  opacity: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+}
+
+/* ---------- 控制按钮 ---------- */
+.controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+.ctl {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.09);
+  color: #fff;
+  cursor: pointer;
+  transition: background-color 0.15s ease, opacity 0.15s ease;
+}
+.ctl:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.16);
+}
+.ctl:active:not(:disabled) {
+  background: rgba(255, 255, 255, 0.22);
+}
+.ctl:disabled {
+  opacity: 0.32;
+  cursor: default;
+}
+.ctl.play {
+  width: 40px;
+  height: 40px;
+  background: rgb(var(--tint));
+  color: #101014;
+}
+.ctl.play:hover:not(:disabled) {
+  background: rgba(var(--tint), 0.85);
+}
+
+/* ---------- v0.2: 时钟 + 轮换信息 ---------- */
+.layer-compact.idle {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  justify-content: center;
+  padding: 8px 0;
+}
+
+/* 时钟（OC-20261104-001：收拢态两行，日期在时间上方） */
+.clock {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  opacity: 0.85;
+  white-space: nowrap;
+  line-height: 1.05;
+}
+
+/* 日期行（卡片 OC-20261104-001） */
+.clock-date {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.5px;
+  opacity: 0.75;
+  line-height: 1.1;
+}
+
+/* 音乐播放时时钟微脉冲 */
+.clock.music-active {
+  animation: clock-pulse 1s ease-in-out infinite;
+}
+
+@keyframes clock-pulse {
+  0%, 100% { opacity: 0.7; }
+  50% { opacity: 1; }
+}
+
+/* 轮换信息：固定宽度防拉伸 + 滚动入场 */
+.collapsed-rotate {
+  font-size: 12px;
+  opacity: 0.8;
+  white-space: nowrap;
+  line-height: 1.2;
+  min-width: 50px;
+  text-align: center;
+  animation: slide-in 0.3s ease-out;
+}
+
+.collapsed-rotate-left {
+  text-align: right;
+}
+
+.collapsed-rotate-right {
+  text-align: left;
+}
+
+@keyframes slide-in {
+  from {
+    transform: translateX(-8px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 0.5;
+  }
+}
+
+/* 音乐歌名 */
+/* 播放态歌词行 —— 占满封面右侧剩余宽度 */
+.collapsed-lyric {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.2;
+  opacity: 0.92;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  animation: lyric-in 0.24s ease-out;
+}
+
+@keyframes lyric-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 0.92;
+    transform: translateY(0);
+  }
+}
+
+/* 歌词行（展开态，meta 内） */
+.exp-lyric {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.3;
+  opacity: 0.8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 播放歌词时右侧歌名收窄，把宽度让给歌词 */
+/* ---------- v0.2: 网络延迟 ---------- */
+.fps-net {
+  width: 100%;
+  font-size: 11px;
+  padding: 2px 4px;
+}
+.net-val {
+  opacity: 0.9;
+}
+
+/* ---------- v0.2: 通知摘要 ---------- */
+.notif-card {
+  width: 100%;
+  min-width: 0;
+}
+.notif-summary {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  color: #fff;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.notif-badge {
+  min-width: 22px;
+  height: 22px;
+  padding: 0 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  color: #101014;
+  background: rgb(var(--tint));
+  font-size: 10px;
+  font-weight: 700;
+}
+.notif-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.notif-app,
+.notif-title {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.notif-app {
+  font-size: 10px;
+  opacity: 0.55;
+}
+.notif-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+.notif-chevron {
+  width: 18px;
+  color: rgba(255, 255, 255, 0.6);
+  text-align: center;
+}
+.notif-detail {
+  margin-top: 8px;
+  padding: 8px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.2);
+}
+.notif-detail-body {
+  max-height: 48px;
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+}
+.notif-history {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 7px;
+}
+.notif-history-row {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  color: rgba(255, 255, 255, 0.48);
+  font-size: 9px;
+}
+.notif-history-row strong {
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(255, 255, 255, 0.68);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.notif-clear {
+  margin-top: 8px;
+  padding: 3px 7px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  color: rgba(255, 255, 255, 0.65);
+  background: transparent;
+  font-size: 9px;
+  cursor: pointer;
+}
+
+/* ---------- v0.2: 展开面板小组件区域 ---------- */
+.panel-widgets {
+  padding: 8px;
+  border-radius: 12px;
+  background: rgba(20, 22, 30, 0.35);
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  align-content: flex-start;
+}
+
+.widget-placeholder {
+  color: rgba(255, 255, 255, 0.3);
+  font-size: 12px;
+  padding: 24px;
+  width: 100%;
+  text-align: center;
+}
+
+/* ---------- v0.2: Canvas 图表 ---------- */
+.chart-widget {
+  width: 150px;
+  padding: 3px 0;
+}
+
+.chart-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 2px;
+}
+
+.chart-label {
+  font-size: 10px;
+  opacity: 0.85;
+  letter-spacing: 0.5px;
+}
+
+.chart-value {
+  font-size: 11px;
+  font-weight: 600;
+  color: rgb(var(--tint));
+  opacity: 0.9;
+}
+
+/* ---------- v0.2: 天气小组件 ---------- */
+.weather-widget {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+}
+.weather-widget.dim {
+  opacity: 0.4;
+  font-size: 11px;
+  justify-content: center;
+}
+.weather-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.weather-temp {
+  font-size: 16px;
+  font-weight: 700;
+}
+.weather-label {
+  font-size: 14px;
+  opacity: 0.85;
+}
+.weather-wind {
+  font-size: 10px;
+  opacity: 0.4;
+}
+
+/* ---------- v0.2: AI 聊天 ---------- */
+.ai-chat {
+  width: 100%;
+  padding: 4px 0;
+}
+.ai-input-row {
+  display: flex;
+  gap: 6px;
+}
+.ai-chat input {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 4px 8px;
+  color: #fff;
+  font-size: 12px;
+  outline: none;
+}
+.ai-chat input:focus {
+  border-color: rgba(var(--tint), 0.5);
+}
+.ai-chat button {
+  background: rgb(var(--tint));
+  color: #101014;
+  border: none;
+  border-radius: 8px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ai-chat button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.ai-response {
+  margin-top: 4px;
+  font-size: 11px;
+  opacity: 0.7;
+  white-space: pre-wrap;
+}

@@ -1,0 +1,132 @@
+/*
+ * GlassPill 机器人眼睛 v5 —— 荧光小球（无瞳孔）。
+ *
+ * sir 2026-10-26 反馈：
+ * - 去掉黑色瞳孔 → 纯荧光小球
+ * - 科技感 → 青色辉光（#40c0ff）
+ * - 眼睛移动受限 → 增大移动范围（±3px）
+ *
+ * 设计参考：@librarian 调研 JARVIS 青色全息眼方向，简化为无瞳孔纯发光球
+ *
+ * 纯 CSS 动画（无 rAF）：眨眼 opacity + 音乐辉光脉冲
+ */
+
+.eyes {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 眼窝：透明，无边框无阴影 */
+.eye-socket {
+  position: relative;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 辉光层：独立元素，音乐时脉冲 */
+.glow-effect {
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(64, 192, 255, 0.3) 0%, transparent 65%);
+  pointer-events: none;
+}
+
+/* 荧光小球：无瞳孔，纯发光体 */
+.glow-orb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  /* 荧光渐变：白热中心 → 青色 → 深蓝边缘 */
+  background: radial-gradient(circle at 38% 38%,
+    #ffffff 0%,
+    #a0f0ff 12%,
+    #40c0ff 35%,
+    #2090d0 60%,
+    #1060a0 85%,
+    #084070 100%);
+  /* 多层青色辉光 */
+  box-shadow:
+    0 0 3px rgba(64, 192, 255, 0.8),
+    0 0 8px rgba(64, 192, 255, 0.45),
+    0 0 14px rgba(64, 192, 255, 0.2);
+  position: relative;
+  /* 跟随鼠标，增大范围 */
+  transform: translate(
+    calc(var(--eye-dx, 0) * 3px),
+    calc(var(--eye-dy, 0) * 2px)
+  );
+  transition: transform 200ms ease-out;
+  /* 眨眼：无瞳孔用 opacity（scaleY 会变形） */
+  animation: blink 4s ease-in-out infinite;
+}
+
+/* 错峰：右眼延迟 1.3s */
+.eye-socket:nth-child(2) .glow-orb {
+  animation-delay: 1.3s;
+}
+
+/* 高光：白色小点 */
+.glow-highlight {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #ffffff;
+  position: absolute;
+  top: 2px;
+  left: 2px;
+}
+
+/* 眨眼：透明度变化 */
+@keyframes blink {
+  0%,
+  4.6%,
+  5.6%,
+  100% {
+    opacity: 1;
+  }
+  5%,
+  5.3% {
+    opacity: 0.12;
+  }
+}
+
+/* 音乐律动：辉光脉冲（独立元素，不冲突） */
+.music-active .glow-effect {
+  animation: glow-pulse 0.5s ease-in-out infinite;
+}
+
+.music-active .eye-socket:nth-child(2) .glow-effect {
+  animation-delay: 0.15s;
+}
+
+@keyframes glow-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.5;
+  }
+  50% {
+    transform: scale(1.4);
+    opacity: 0.95;
+  }
+}
+
+/* 表情变体 */
+.eyes-happy .glow-orb {
+  width: 16px;
+  height: 12px;
+  border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+}
+
+.eyes-sleepy .glow-orb {
+  width: 14px;
+  height: 8px;
+  border-radius: 50%;
+  opacity: 0.7;
+}

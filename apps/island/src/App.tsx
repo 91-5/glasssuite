@@ -1,191 +1,227 @@
-import { useEffect, useRef, useState } from "react";
-import {
-  collapsePanel,
-  EVENTS,
-  expandPanel,
-  PANEL_SIZE,
-  subscribe,
-} from "@glasssuite/ipc-types";
-import { GlassSurface, useFitWindow } from "@glasssuite/shared-ui";
-import { useBattery, useSettings, useWeather } from "./hooks";
-import { useLyrics } from "./lyrics/useLyrics";
-import { Artwork, Controls, Progress, useMedia } from "./media";
-import { PrivacyNotice, SummaryBar } from "./notification/SummaryBar";
-import { useNotifications, usePrivacyNotice } from "./notification/useNotifications";
-import { Panel } from "./panel/Panel";
-
-/** 药丸到窗口边缘的留白（逻辑像素），必须与 `island.css` 里 `.island` 的 padding 一致。 */
-const ISLAND_PADDING = 8;
-
-/** 5 秒一刷：界面只显示到分钟，1 秒一刷纯属浪费重渲染。 */
-const CLOCK_TICK_MS = 5_000;
-
-const WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
-
-function formatTime(date: Date): string {
-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
-}
-
-function formatDate(date: Date): string {
-  return `${date.getMonth() + 1}月${date.getDate()}日 ${WEEKDAYS[date.getDay()]}`;
-}
-
-/** WMO 天气代码 → 图标。够用的粗分类，不做一码一图。 */
-function weatherGlyph(code: number, isDay: boolean): string {
-  if (code === 0) return isDay ? "☀" : "☾";
-  if (code <= 2) return isDay ? "⛅" : "☁";
-  if (code === 3) return "☁";
-  if (code <= 48) return "≋"; // 雾
-  if (code <= 57) return "☂"; // 毛毛雨
-  if (code <= 67) return "☂";
-  if (code <= 77) return "❄";
-  if (code <= 82) return "☂";
-  if (code <= 86) return "❄";
-  return "⚡";
-}
+import { useCallback, useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { Pill, type IslandMode } from "./components/island/Pill";
+import { CollapseBall } from "./components/island/CollapseBall";
+import { InsightBar } from "./components/island/InsightBar";
+import { useMedia, dominantTint } from "./hooks/media";
+import { useSystemMetrics } from "./hooks/useSystemMetrics";
+import { useWeather } from "./hooks/useWeather";
+import { useNetwork } from "./hooks/useNetwork";
+import { useLyrics } from "./hooks/useLyrics";
+import { useInsight } from "./hooks/useInsight";
+import { SettingsForm } from "./panel/Settings";
+import { useSettings } from "./hooks";
+import { usePrivacyNotice } from "./notification/useNotifications";
 
 /**
- * island 窗口根组件。
+ * 灵动岛主组件（形态与交互移植自 glasspill v0.2.x，视觉零改动）。
  *
- * 内容优先级：首启隐私提示（一次性） > 通知摘要条（6s） > 媒体 > 时钟。
- * 岛宽度/高度随内容变化，尺寸由 `useFitWindow` 报给后端 resize，位置由 Rust 侧统一算。
+ * 形态流转（事件驱动，无常驻动画）：
+ * - collapsed：默认收起态 —— 时钟或歌词 + 左右两条轮换信息（内存/CPU、电量/天气）
+ * - hover：Rust 钩子判定光标进入热区、移除点击穿透后推送 `island-hover=true`
+ * - expanded：点击药丸展开为面板（Rust resize 窗口 420×210 → 720×480）
+ * - 点击左侧小球：整岛向左滑出收起；小球下方铃铛切 AI 洞察静音
+ *
+ * 与 glasspill 的唯一增量：展开态右上角的齿轮打开「AI 与网络」设置面板
+ * （GlassSuite 的可配置 OpenAI 兼容端点，卡 OC-20261110-003 的 UI 入口）。
  */
+const WINDOW_W = 420; // 收起态窗口宽（须与 Rust ISLAND_W 一致）
+const WINDOW_W_EXPANDED = 720; // 展开态窗口宽（须与 Rust PANEL_W 一致）
+const PILL_TOP = 10; // 须与 .island-root padding-top / Rust ISLAND_MARGIN 一致
+const PILL_METRICS: Record<IslandMode, { w: number; h: number; winW: number }> = {
+  collapsed: { w: 250, h: 44, winW: WINDOW_W },
+  hover: { w: 330, h: 52, winW: WINDOW_W },
+  expanded: { w: 560, h: 480, winW: WINDOW_W_EXPANDED },
+};
+
 export default function App() {
-  const pillRef = useRef<HTMLDivElement>(null);
-  const [now, setNow] = useState(() => new Date());
-  const settings = useSettings();
+  const { media, positionMs } = useMedia();
+  const { metrics, history } = useSystemMetrics();
   const weather = useWeather();
-  const battery = useBattery();
-  const { media, positionMs, control } = useMedia();
-  const lyric = useLyrics(positionMs);
-  const notification = useNotifications();
-  const showPrivacyNotice = usePrivacyNotice(Boolean(settings?.notifications?.enabled));
-  const [hovered, setHovered] = useState(false);
-  const [expanded, setExpanded] = useState(false);
+  const { status: network, history: networkHistory } = useNetwork();
+  const lyrics = useLyrics();
+  const insight = useInsight();
+  const settings = useSettings();
+  // 首启一次性隐私提示：开启「系统通知摘要」时明示只本地读取、不上报
+  // （002 D2 的合规项；只在首次显示，之后 localStorage 记住）。
+  const showPrivacyNotice = usePrivacyNotice(settings?.notifications?.enabled ?? false);
+  const [mode, setMode] = useState<IslandMode>("collapsed");
+  const [tint, setTint] = useState("116,142,255");
 
-  // 展开态：窗口 resize 到 PANEL_SIZE，暂停 fit_*（否则 ResizeObserver 会把面板缩回药丸）。
-  useFitWindow("island", pillRef, ISLAND_PADDING, {
-    fit: !expanded,
-    panelSize: expanded ? PANEL_SIZE : undefined,
-  });
+  // 收起状态 + 免打扰
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const toggleCollapse = () => setIsCollapsed((v) => !v);
+  // 免打扰同步到 Rust：AI 侧据此既不弹也不调 API（省 token）
+  const toggleMute = () =>
+    setMuted((v) => {
+      const next = !v;
+      invoke("set_muted", { muted: next }).catch(() => {});
+      return next;
+    });
 
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(new Date()), CLOCK_TICK_MS);
-    return () => window.clearInterval(id);
+  // 设置面板（AI 与网络）
+  const [showSettings, setShowSettings] = useState(false);
+
+  const idle = !media;
+
+  /**
+   * 上报药丸热区。
+   *
+   * 岛被收起时（点小球滑出）**必须撤掉热区**：窗口物理上仍在原位（420×210），
+   * 只是内容用 CSS 移出视野。热区若留着，鼠标划过那片「看不见的岛」仍会
+   * 取消点击穿透，把下面窗口（浏览器标签栏等）的点击和拖拽全部吃掉。
+   */
+  const reportHotzone = useCallback((m: IslandMode, collapsed: boolean) => {
+    if (collapsed) {
+      invoke("set_hotzone", { x: 0, y: 0, w: 0, h: 0 }).catch(() => {});
+      return;
+    }
+    const { w, h } = PILL_METRICS[m];
+    invoke("set_hotzone", { x: (WINDOW_W - w) / 2, y: PILL_TOP, w, h }).catch(() => {});
   }, []);
 
-  useEffect(() => subscribe<boolean>(EVENTS.islandHover, setHovered), []);
-  useEffect(() => subscribe<boolean>(EVENTS.panelState, setExpanded), []);
+  // 形态变化 / 收起状态变化 / 窗口重摆（DPI 变更、全屏退出）后重报热区
+  useEffect(() => {
+    reportHotzone(mode, isCollapsed);
+  }, [reportHotzone, mode, isCollapsed]);
+  useEffect(() => {
+    const un = listen("island-placed", () => reportHotzone(mode, isCollapsed));
+    return () => {
+      un.then((f) => f());
+    };
+  }, [reportHotzone, mode, isCollapsed]);
 
-  const openPanel = () => {
-    expandPanel().catch(() => {
-      /* 非 Tauri 环境 */
+  // Rust 钩子：光标进入热区(true) / 离开热区(false)
+  useEffect(() => {
+    const un = listen<boolean>("island-hover", (e) => {
+      setMode((m) => (e.payload ? (m === "collapsed" ? "hover" : m) : "collapsed"));
     });
-  };
-  const closePanel = () => {
-    collapsePanel().catch(() => {
-      /* 非 Tauri 环境 */
-    });
-  };
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
 
-  const showWeather = Boolean(settings?.weather) && weather !== null;
+  // 展开/收起面板时 resize 窗口。
+  // 只在 expanded→其他 时调 collapse_panel：hover 态若也调，它内部延迟线程
+  // 会恢复穿透，与钩子的穿透管理冲突，导致鼠标离开后无法恢复。
+  const wasExpanded = useRef(false);
+  useEffect(() => {
+    if (mode === "expanded") {
+      invoke("expand_panel").catch(() => {});
+      wasExpanded.current = true;
+    } else if (wasExpanded.current) {
+      invoke("collapse_panel").catch(() => {});
+      wasExpanded.current = false;
+      setShowSettings(false);
+    }
+  }, [mode]);
 
-  let content;
-  if (expanded) {
-    content = <Panel onClose={closePanel} media={media} control={control} />;
-  } else if (showPrivacyNotice) {
-    content = <PrivacyNotice />;
-  } else if (notification) {
-    content = <SummaryBar item={notification} />;
-  } else if (media) {
-    content = (
-      <div className="island-media">
-        <div className="island-media-row">
-          <Artwork src={media.artwork} />
-          <span className="island-media-text">
-            <span className="island-media-title" title={media.title}>
-              {media.title || "未知曲目"}
-            </span>
-            <span className="island-media-artist">{media.artist || "未知艺人"}</span>
-          </span>
-          <Controls
-            playing={media.playing}
-            canPlay={media.canPlay}
-            canPause={media.canPause}
-            canNext={media.canNext}
-            canPrev={media.canPrev}
-            onAction={(action) => control(action)}
-          />
-        </div>
-        <Progress
-          positionMs={positionMs}
-          durationMs={media.durationMs}
-          onSeek={(ms) => control("seek", ms)}
-        />
-        {lyric ? <span className="island-lyric" title={lyric}>{lyric}</span> : null}
-      </div>
-    );
-  } else {
-    content = (
-      <>
-        <span className="island-clock">{formatTime(now)}</span>
-        <span className="island-divider" aria-hidden="true" />
-        <span className="island-date">{formatDate(now)}</span>
+  // 收起小球热区：让钩子在小球（及其下方免打扰铃铛）上也能取消穿透，
+  // 否则窗口默认穿透，点铃铛的点击会落到桌面。
+  // 高度取 70：容器 top 10 + padding 4 → 球 14..50 → gap 4 → 铃铛约 54..78。
+  // x 随形态变化，必须与 CSS 的 .collapse-ball-container left 保持一致：
+  //   收起 20px / 悬浮 1px / 常驻 41px / 展开 36px
+  useEffect(() => {
+    const ballX = isCollapsed
+      ? 20
+      : mode === "expanded"
+        ? 36
+        : mode === "hover"
+          ? 1
+          : 41;
+    invoke("set_ball_hotzone", { x: ballX, y: 10, w: 36, h: 70 }).catch(() => {});
+  }, [mode, isCollapsed]);
 
-        {showWeather && weather ? (
-          <>
-            <span className="island-divider" aria-hidden="true" />
-            <span className="island-weather" title={`WMO ${weather.code}`}>
-              <span className="island-weather-glyph" aria-hidden="true">
-                {weatherGlyph(weather.code, weather.isDay)}
-              </span>
-              {Math.round(weather.tempC)}°
-            </span>
-          </>
-        ) : null}
+  // 封面染色：主色提取一次，喂给 CSS 变量
+  useEffect(() => {
+    const art = media?.art;
+    if (art) {
+      dominantTint(art).then(setTint);
+    } else {
+      setTint("116,142,255");
+    }
+  }, [media?.art]);
 
-        {battery ? (
-          <span
-            className="island-battery"
-            title={battery.state === "charging" ? "充电中" : "使用电池"}
-          >
-            <span className="island-battery-glyph" aria-hidden="true">
-              {battery.state === "charging" ? "⚡" : ""}
-            </span>
-            {Math.round(battery.charge)}%
-          </span>
-        ) : null}
-      </>
-    );
-  }
-
-  const isMedia = !expanded && !showPrivacyNotice && !notification && Boolean(media);
-  const pillClass = [
-    "island-pill",
-    isMedia ? "island-pill--media" : "",
-    hovered && !expanded ? "is-hovered" : "",
-    expanded ? "island-pill--expanded" : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
+  const onControl = useCallback((action: string) => {
+    invoke("media_control", { action }).catch(() => {});
+  }, []);
+  const onSeek = useCallback((ms: number) => {
+    invoke("media_control", { action: "seek", positionMs: ms }).catch(() => {});
+  }, []);
 
   return (
-    <div className={`island${expanded ? " island--expanded" : ""}`}>
-      <GlassSurface
-        className={pillClass}
-        radius={expanded ? 18 : 22}
-        padding={expanded ? "0" : isMedia ? "8px 12px" : "6px 16px"}
-        ref={pillRef}
-        onClick={(e) => {
-          if (expanded) return;
-          // 控制按钮与进度条有自己的行为，点它们不应触发展开。
-          const target = e.target as Element;
-          if (target.closest("button, [role='slider']")) return;
-          openPanel();
-        }}
-      >
-        {content}
-      </GlassSurface>
+    <div className={`island-root ${mode} ${isCollapsed ? "is-collapsed" : ""}`}>
+      <CollapseBall
+        collapsed={isCollapsed}
+        onToggle={toggleCollapse}
+        muted={muted}
+        onToggleMute={toggleMute}
+      />
+      <div className={`island-main ${isCollapsed ? "collapsed" : ""}`}>
+        <Pill
+          media={media}
+          positionMs={positionMs}
+          mode={mode}
+          tint={tint}
+          idle={idle}
+          metrics={metrics}
+          history={history}
+          weather={weather}
+          musicActive={media?.playing ?? false}
+          battery={metrics?.battery ?? null}
+          network={network}
+          networkHistory={networkHistory}
+          lyrics={lyrics}
+          onExpand={() => setMode("expanded")}
+          onControl={onControl}
+          onSeek={onSeek}
+        />
+      </div>
+
+      {/* 展开态右上角：设置入口（GlassSuite 增量，AI 与网络可配置） */}
+      {mode === "expanded" && !showSettings && (
+        <button
+          type="button"
+          className="island-gear"
+          title="AI 与网络设置"
+          onClick={() => setShowSettings(true)}
+        >
+          ⚙
+        </button>
+      )}
+
+      {/* 设置视图覆盖面板内容；关闭回到药丸展开态 */}
+      {showSettings && (
+        <div className="island-settings">
+          <div className="island-settings-head">
+            <span className="island-settings-title">AI 与网络</span>
+            <button
+              type="button"
+              className="island-settings-close"
+              onClick={() => setShowSettings(false)}
+            >
+              返回
+            </button>
+          </div>
+          <SettingsForm settings={settings} />
+          <p className="island-settings-note">
+            本软件只在本地读取进程列表用于 Dock 图标，不上报任何数据；AI 仅在你自己配置端点与密钥后才会联网。
+          </p>
+        </div>
+      )}
+
+      {/* 岛只展示 AI 归纳结果（通知摘要 / 主动建议）。
+          原生通知不再上岛：Windows 自己的横幅负责原文。 */}
+      {insight && !muted && !showSettings && <InsightBar insight={insight} />}
+
+      {/* 首启一次的隐私提示（只在未展开时露出，不抢面板位置） */}
+      {showPrivacyNotice && mode !== "expanded" && (
+        <div className="island-privacy-note">
+          只在本机读取进程与通知（应用名/时间），不上报任何数据
+        </div>
+      )}
     </div>
   );
 }

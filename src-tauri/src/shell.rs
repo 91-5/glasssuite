@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tauri::{
-    AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
 };
 use winplat::Rect;
@@ -17,11 +17,14 @@ use crate::state::{Hotzone, SharedState};
 /// dock 与任务栏上沿的间距（物理像素）。
 const DOCK_MARGIN: i32 = 6;
 /// 岛与屏幕上沿的间距（物理像素）。
-const ISLAND_MARGIN: i32 = 4;
+const ISLAND_MARGIN: i32 = 10;
 
 /// 首帧尺寸（逻辑像素）。前端加载完会通过 `fit_*` 上报真实内容尺寸并收缩窗口。
 pub const STARTUP_DOCK: (f64, f64) = (800.0, 76.0);
-pub const STARTUP_ISLAND: (f64, f64) = (360.0, 44.0);
+/// 岛折叠窗固定尺寸（移植自 glasspill：内容在窗内自由布局，位移靠热区判定）。
+pub const ISLAND_W: f64 = 420.0;
+pub const ISLAND_H: f64 = 210.0;
+pub const STARTUP_ISLAND: (f64, f64) = (ISLAND_W, ISLAND_H);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Anchor {
@@ -164,7 +167,10 @@ fn compute_geometry(
                 .unwrap_or(screen.bottom);
             (screen.centered_x(pw), top - DOCK_MARGIN - ph)
         }
-        Anchor::Island => (screen.centered_x(pw), screen.top + ISLAND_MARGIN),
+        Anchor::Island => (
+            screen.centered_x(pw),
+            screen.top + (ISLAND_MARGIN as f64 * scale).round() as i32,
+        ),
     };
     Ok((
         PhysicalPosition::new(x, y),
@@ -183,6 +189,14 @@ pub fn place(
     // 先定位再改尺寸：set_size 保持左上角，顺序反过来会看到内容先挪再缩。
     window.set_position(position).map_err(|e| e.to_string())?;
     window.set_size(size).map_err(|e| e.to_string())?;
+    // 岛是固定窗 + 热区上报模型：窗口一挪/一缩放，前端必须重报热区（否则穿透区错位）。
+    if matches!(anchor, Anchor::Island) {
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let _ = window.emit(
+            "island-placed",
+            (position.x as f64 / scale, position.y as f64 / scale, scale),
+        );
+    }
     Ok(())
 }
 
@@ -315,10 +329,11 @@ pub fn fit_dock(
     place(&window, Anchor::Dock, w, h)
 }
 
-/// 前端上报岛内容尺寸（逻辑像素）后收缩窗口并对齐屏幕上沿。
+/// 前端上报岛内容尺寸（逻辑像素）。
 ///
-/// 展开态忽略尺寸上报：面板是固定尺寸，ResizeObserver 会把药丸尺寸报回来把它缩掉。
-/// 但仍记录折叠尺寸，收起时用它复位。
+/// 岛现在是**固定窗**（420×210）：内容在窗内自由布局，宽度不再驱动窗口尺寸，
+/// 热区由前端 `set_hotzone` / `set_ball_hotzone` 上报。这里保留成命令只为兼容旧调用，
+/// 实际只做一次固定尺寸对账（幂等），并把折叠尺寸记录给收起逻辑。
 #[tauri::command]
 pub fn fit_island(
     window: WebviewWindow,
@@ -326,10 +341,10 @@ pub fn fit_island(
     w: f64,
     h: f64,
 ) -> Result<(), String> {
-    winplat::log::log(&format!("fit_island w={w} h={h}"));
+    winplat::log::log(&format!("fit_island ignored w={w} h={h} (fixed window)"));
     remember(&window, state.inner().as_ref(), "island", w, h);
     if state.island_expanded.load(Ordering::Relaxed) {
         return Ok(());
     }
-    place(&window, Anchor::Island, w, h)
+    place(&window, Anchor::Island, ISLAND_W, ISLAND_H)
 }

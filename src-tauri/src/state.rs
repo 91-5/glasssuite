@@ -59,6 +59,15 @@ pub struct SharedState {
 
     pub island_hotzone: Mutex<Hotzone>,
     pub dock_hotzone: Mutex<Hotzone>,
+    /// 折叠球热区：收起时药丸缩成一颗球，球单独上报热区（移植自 glasspill）。
+    /// 与 `island_hotzone` 取并集做命中判定——球本身也要可点，否则点不回来。
+    pub ball_hotzone: Mutex<Hotzone>,
+
+    /// 球心（逻辑像素，相对窗口客户区）。`cursor` 用它算 `ball-look` 的朝向。
+    pub ball_center: Mutex<(f64, f64)>,
+
+    /// AI 洞察静音：true 时后端不再 emit `ai-insight`（移植自 glasspill 的 set_muted）。
+    pub muted: AtomicBool,
 
     /// 两个窗口各自是否处于点击穿透态（WS_EX_TRANSPARENT）。
     pub island_transparent: AtomicBool,

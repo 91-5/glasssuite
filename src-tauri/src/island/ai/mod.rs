@@ -96,6 +96,11 @@ fn run(handle: AppHandle, ai: Arc<AiState>, state: Arc<SharedState>) {
         if !cfg.is_configured() {
             continue; // 未配齐：零外联，也不产生任何提示。
         }
+        // 静音（收起球右键 / 设置面板）期间既不外联也不 emit —— 静音要连请求一起停，
+        // 否则「静音」只是看不见，仍然在偷偷联网。
+        if state.muted.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
         let snapshot = {
             let m = state.metrics.lock().unwrap();
             suggest::Snapshot {
