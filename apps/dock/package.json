@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "GlassSuite 底部 dock 窗口前端。",
+  "description": "GlassSuite 底部 dock 与开始菜单窗口前端（glassdesk v0.8.1 直移植）。",
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --noEmit",
@@ -11,8 +11,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@glasssuite/ipc-types": "workspace:*",
-    "@glasssuite/shared-ui": "workspace:*",
+    "@tauri-apps/api": "^2.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

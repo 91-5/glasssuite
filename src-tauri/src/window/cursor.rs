@@ -1,12 +1,12 @@
-//! **唯一光标观测源**：一个 `WH_MOUSE_LL` 低级鼠标钩子同时驱动 island 的点击穿透
-//! 与 dock 的贴底唤出。
+//! **唯一光标观测源**：一个 `WH_MOUSE_LL` 低级鼠标钩子驱动 island 的点击穿透。
 //!
 //! 为什么必须单一：旧两仓各有一套观测（岛用 LL 钩子、dock 用 200ms `GetCursorPos`
-//! 轮询），合并到同一进程后就是两套延迟、两套「已唤出」语义。本模块把轮询彻底删掉，
-//! 两个窗口共用同一次鼠标事件。
+//! 轮询），合并到同一进程后就是两套延迟、两套「已唤出」语义。本模块只保留岛侧
+//! 穿透；**dock 的唤出/隐藏改回 glassdesk 原生实现**（`dock::dock_logic`：光标
+//! 靠底 + 悬停判定 + 失焦收回，500ms 兜底轮询），hook 不再插手 dock。
 //!
-//! 用途声明（README 同步）：该钩子**只读取光标位置**，用于判断光标是否落在窗口热区，
-//! 从而开关鼠标穿透 / 触发 dock 唤出。它不记录按键、不记录窗口标题、不注入任何进程，
+//! 用途声明（README 同步）：该钩子**只读取光标位置**，用于判断光标是否落在岛热区，
+//! 从而开关鼠标穿透。它不记录按键、不记录窗口标题、不注入任何进程，
 //! 也不把任何内容发到网络。
 //!
 //! 三个实现红线（旧仓踩过）：
@@ -36,10 +36,6 @@ use crate::state::{Hotzone, SharedState};
 const ENTER_DEBOUNCE: Duration = Duration::from_millis(80);
 /// 离开热区滞回：防快速进出时样式高频切换。
 const LEAVE_HYSTERESIS: Duration = Duration::from_millis(250);
-/// dock 贴底触发带高度（物理像素），沿用旧 dock 的语义。
-const DOCK_EDGE_PX: i32 = 4;
-/// dock 离开后收起延迟。
-const DOCK_HIDE_DELAY: Duration = Duration::from_millis(800);
 /// 折叠球视线方向（移植自 glasspill：球心→光标量化为 8 方向）。
 const LOOK_DIRS: [&str; 8] = ["e", "se", "s", "sw", "w", "nw", "n", "ne"];
 /// 「尚未投递」哨兵。
@@ -64,8 +60,6 @@ struct HookCtx {
     state: Arc<SharedState>,
     island_last_in: Mutex<Option<Instant>>,
     island_last_toggle: Mutex<Instant>,
-    dock_last_active: Mutex<Option<Instant>>,
-    dock_revealed: AtomicBool,
     /// 最近投递的视线方向下标（LOOK_UNSET = 尚未投递）。
     look_dir: AtomicU8,
     look_last_emit: Mutex<Option<Instant>>,
@@ -82,8 +76,6 @@ pub fn install(app: AppHandle, state: Arc<SharedState>) {
         state,
         island_last_in: Mutex::new(None),
         island_last_toggle: Mutex::new(Instant::now() - Duration::from_secs(10)),
-        dock_last_active: Mutex::new(None),
-        dock_revealed: AtomicBool::new(false),
         look_dir: AtomicU8::new(LOOK_UNSET),
         look_last_emit: Mutex::new(None),
     }));
@@ -119,10 +111,7 @@ unsafe extern "system" fn ll_mouse_proc(code: i32, wparam: WPARAM, lparam: LPARA
 impl HookCtx {
     fn process(&self, pt: POINT) {
         let now = Instant::now();
-        let (in_island, in_dock) = self.hit_test(pt);
-        let near_edge = winplat::screen::monitor_from_point(pt.x, pt.y)
-            .map(|m| pt.y >= m.bounds.bottom - DOCK_EDGE_PX)
-            .unwrap_or(false);
+        let in_island = self.hit_test(pt);
 
         // ---- island：穿透切换 ----
         if self.state.island_visible.load(Ordering::Relaxed)
@@ -168,26 +157,6 @@ impl HookCtx {
                 }
             }
         }
-
-        // ---- dock：贴底唤出（P4 消费 dock-reveal 事件） ----
-        if near_edge || in_dock {
-            *self.dock_last_active.lock().unwrap() = Some(now);
-            if !self.dock_revealed.swap(true, Ordering::Relaxed) {
-                let _ = self.app.emit("dock-reveal", true);
-                winplat::log::log("cursor: dock reveal=true");
-            }
-        } else if self.dock_revealed.load(Ordering::Relaxed) {
-            let cooled = self
-                .dock_last_active
-                .lock()
-                .unwrap()
-                .map(|t| now.duration_since(t) >= DOCK_HIDE_DELAY)
-                .unwrap_or(true);
-            if cooled && self.dock_revealed.swap(false, Ordering::Relaxed) {
-                let _ = self.app.emit("dock-reveal", false);
-                winplat::log::log("cursor: dock reveal=false");
-            }
-        }
     }
 
     /// 热区是 CSS 逻辑像素；窗口原点现取（窗口移动/DPI 变化后自动跟随），
@@ -195,19 +164,12 @@ impl HookCtx {
     ///
     /// 岛的命中 = 药丸热区 ∪ 折叠球热区：收起时只有球可见，展开/悬停时只有药丸可见，
     /// 并集让两种形态共用同一条穿透逻辑（球点不到就展不开）。
-    fn hit_test(&self, pt: POINT) -> (bool, bool) {
+    fn hit_test(&self, pt: POINT) -> bool {
         let s = &self.state;
         let scale = *s.island_scale.lock().unwrap();
         let hwnd = s.island_hwnd.load(Ordering::Relaxed);
-        let island = hit_window(hwnd, &s.island_hotzone.lock().unwrap(), scale, pt)
-            || hit_window(hwnd, &s.ball_hotzone.lock().unwrap(), scale, pt);
-        let dock = hit_window(
-            s.dock_hwnd.load(Ordering::Relaxed),
-            &s.dock_hotzone.lock().unwrap(),
-            *s.dock_scale.lock().unwrap(),
-            pt,
-        );
-        (island, dock)
+        hit_window(hwnd, &s.island_hotzone.lock().unwrap(), scale, pt)
+            || hit_window(hwnd, &s.ball_hotzone.lock().unwrap(), scale, pt)
     }
 
     /// 球心换算到物理屏幕坐标（窗口原点现取，DPI/移动后自动跟随）。

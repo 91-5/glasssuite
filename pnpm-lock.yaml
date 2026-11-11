@@ -14,12 +14,9 @@ importers:
 
   apps/dock:
     dependencies:
-      '@glasssuite/ipc-types':
-        specifier: workspace:*
-        version: link:../../packages/ipc-types
-      '@glasssuite/shared-ui':
-        specifier: workspace:*
-        version: link:../../packages/shared-ui
+      '@tauri-apps/api':
+        specifier: ^2.0.0
+        version: 2.12.4
       react:
         specifier: ^19.0.0
         version: 19.3.1

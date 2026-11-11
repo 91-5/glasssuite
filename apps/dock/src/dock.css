@@ -1,208 +1,446 @@
-/* dock 窗口：整窗透明，只有药丸可见。
- * 窗口尺寸由 `fit_dock` 收缩到药丸大小，所以这里的留白既是视觉间距、也是鼠标安全区。 */
+/* GlassDesk dock —— 玻璃质感图标栏。
+   真实模糊来自窗口层的 DWM 玻璃（DwmEnableBlurBehindWindow），这里只负责
+   半透明底色、圆角、边框与排版。窗口外区域保持全透明。 */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+}
 
 .dock {
   width: 100%;
   height: 100%;
   display: flex;
-  align-items: flex-end;
-  justify-content: flex-start; /* 左锚定：窗口变宽时图标在视口内的位置不变 */
-  padding: 6px; /* 必须与 App.tsx 的 DOCK_PADDING 一致 */
-  box-sizing: border-box;
+  align-items: center;
+  /* v0.8.1（sir 2026-11-08 反馈「图标一连串跳动」）：药丸左锚定，不再水平居中。
+     窗口宽度始终 = 药丸 + 8px（fit_dock），药丸固定在 left:6px → 视口内药丸位置
+     与窗口宽度解耦。配合 fit_dock 的「resize + 同步重定位」：临时运行图标出现/
+     消失时药丸只向右对称伸缩，既有图标在视口内纹丝不动（旧的 ±Δ/2 行回到了
+     药丸重排 + 窗口 resize 两个时序错开的位移上，FLIP 测得到、观众看到跳）。 */
+  justify-content: flex-start;
+  padding: 6px;
 }
 
-.dock-pill {
-  gap: 4px;
-  height: 64px;
-  /* 药丸自身不能被压缩：窗口收缩时若允许收缩，图标会被挤扁 */
-  flex: 0 0 auto;
+/* 2026-11-08（sir 反馈「运行指示条超出玻璃背景」）：药丸此前 height:100% +
+   纵向零 padding，而 fit_dock 把窗口收缩到药丸+8px（=外层 .dock 上下 padding），
+   图标永远垂直撑满药丸 → RunDot 永远压在玻璃底边。改为药丸自带纵向 padding +
+   高度自适应，图标上下各留 5px 玻璃边，指示条收进玻璃内。 */
+.dock-icons {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.34);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.65);
 }
 
 .dock-icon {
   position: relative;
-  width: 46px;
-  height: 46px;
-  flex: 0 0 auto;
-}
-
-.dock-icon svg {
-  width: 23px;
-  height: 23px;
-}
-
-/* 运行指示：贴药丸底部的小圆点，固定高度不参与布局，避免出现/消失时推挤同行图标。 */
-.dock-running {
-  position: absolute;
-  left: 50%;
-  bottom: 1px;
-  width: 4px;
-  height: 4px;
-  margin-left: -2px;
-  border-radius: 50%;
-  background: var(--gs-accent);
-}
-
-.dock-sep {
-  width: 1px;
-  height: 26px;
-  margin: 0 4px;
-  flex: 0 0 auto;
-  background: rgba(255, 255, 255, 0.16);
-}
-
-/* --- 自动隐藏 -------------------------------------------------------------
- * 只做视觉位移；鼠标穿透由 Rust 侧 dock_set_revealed 同步打开，否则隐形药丸
- * 仍会吃掉桌面点击。transform 不进布局，useFitWindow 用 offsetWidth 测量，
- * 所以隐藏/唤出不会误报「内容变宽」触发 resize。 */
-.dock {
-  transition: transform 220ms cubic-bezier(.2, .8, .2, 1), opacity 180ms linear;
-}
-.dock--hidden {
-  transform: translateY(110%);
-  opacity: 0;
-  pointer-events: none;
-}
-
-.dock-icon-img {
-  width: 26px;
-  height: 26px;
-  object-fit: contain;
-  pointer-events: none;
-}
-.dock-start svg {
-  width: 22px;
-  height: 22px;
-}
-.dock-empty {
-  padding: 0 10px;
-  font-size: 12px;
-  color: var(--gs-text-dim);
-  white-space: nowrap;
-}
-
-/* --- 开始菜单面板 ---------------------------------------------------------
- * 窗口尺寸 = 面板尺寸，不留透明宽区。 */
-.menu-panel {
-  width: 100%;
-  height: 100%;
-  border-radius: 16px;
-  padding: 10px;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 8px;
-  background: var(--gs-glass-fill-strong);
-}
-.menu-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 14px;
-  font-weight: 600;
-  padding: 2px 4px;
-}
-.menu-close {
-  width: 26px;
-  height: 26px;
-  font-size: 18px;
-  line-height: 1;
-}
-.menu-section {
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-.menu-section--grow {
-  flex: 1 1 auto;
-}
-.menu-section h3 {
-  margin: 2px 4px 4px;
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--gs-text-dim);
-}
-.menu-list {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  overflow-y: auto;
-  max-height: 130px;
-}
-.menu-section--grow .menu-list {
-  max-height: none;
-  flex: 1 1 auto;
-}
-.menu-list button {
-  width: 100%;
-  text-align: left;
-  border: 0;
+  width: 52px;
+  height: 52px;
+  border: none;
+  border-radius: 12px;
   background: transparent;
-  color: var(--gs-text);
-  padding: 6px 8px;
-  border-radius: 7px;
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.menu-list button:hover {
-  background: var(--gs-hover);
-}
-.menu-empty {
-  padding: 8px;
-  font-size: 12px;
-  color: var(--gs-text-dim);
-}
-.menu-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 4px 2px;
-  border-top: 1px solid var(--gs-glass-border);
-  font-size: 11px;
-  color: var(--gs-text-dim);
-}
-.menu-foot label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  cursor: pointer;
-}
-
-/* --- 游离图标 ------------------------------------------------------------
- * 每个窗口恰好等于图标大小，没有透明宽区，不需要点击穿透热区。 */
-.free-window {
-  width: 100%;
-  height: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
-}
-.free-window .dock-icon {
-  width: 46px;
-  height: 46px;
-  border-radius: 14px;
-  background: var(--gs-glass-fill);
-  border: 1px solid var(--gs-glass-border);
-  box-shadow: var(--gs-glass-shadow);
-  cursor: grab;
-  touch-action: none;
-}
-.free-window .dock-icon:active {
-  cursor: grabbing;
+  cursor: pointer;
+  transition: background 120ms ease, transform 120ms ease;
 }
 
-/* --- DWM 预览承载层 ------------------------------------------------------ */
-.preview-surface {
+.dock-icon:hover {
+  background: rgba(255, 255, 255, 0.45);
+  transform: translateY(-2px);
+}
+
+.dock-icon:active {
+  transform: translateY(0) scale(0.94);
+}
+
+.dock-icon-img {
+  width: 38px;
+  height: 38px;
+  image-rendering: auto;
+}
+
+.dock-add {
+  color: rgba(40, 40, 40, 0.75);
+}
+
+.dock-add-plus {
+  font-size: 28px;
+  line-height: 1;
+  font-family: "Segoe UI Symbol", sans-serif;
+}
+
+/* 「运行中」指示条（任务 A）：图标底部的圆角短横条，宽度略窄于图标，
+   绝对定位不参与布局（不影响 fit_dock 的尺寸上报）。 */
+.run-dot {
+  position: absolute;
+  bottom: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 20px;
+  height: 3px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #5ac8fa, #0078d4);
+  box-shadow: 0 0 6px rgba(0, 120, 212, 0.75);
+  pointer-events: none;
+}
+
+
+/* ⊞ 开始按钮（任务 C）：与图标同槽位，字形居中 */
+.dock-start-glyph {
+  font-size: 24px;
+  line-height: 1;
+  color: rgba(40, 40, 40, 0.8);
+  font-family: "Segoe UI Symbol", sans-serif;
+}
+
+/* 玻璃开始菜单面板（任务 C，startmenu 窗口）：dock 药丸同材质语言——
+   真模糊来自窗口层 DWM 玻璃，这里只铺半透明白底、圆角、边框。 */
+.menu-root {
   width: 100%;
   height: 100%;
-  background: transparent;
-  border-radius: 12px;
-  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  padding: 10px;
+  border-radius: 14px;
+  background: rgba(250, 250, 252, 0.42);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.65);
+  user-select: none;
 }
-.preview-surface--fallback {
-  background: var(--gs-glass-fill-strong);
-  border: 1px solid var(--gs-glass-border);
-  box-shadow: var(--gs-glass-shadow);
+
+.menu-search-row {
+  padding-bottom: 8px;
+}
+
+.menu-search {
+  width: 100%;
+  height: 32px;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 8px;
+  padding: 0 10px;
+  font-size: 13px;
+  color: rgba(25, 25, 25, 0.9);
+  background: rgba(255, 255, 255, 0.55);
+  outline: none;
+}
+
+.menu-search::placeholder {
+  color: rgba(40, 40, 40, 0.45);
+}
+
+.menu-grid {
+  flex: 1;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  align-content: start;
+  padding: 2px;
+}
+
+.menu-hint {
+  grid-column: 1 / -1;
+  text-align: center;
+  padding: 24px 8px;
+  font-size: 13px;
+  color: rgba(40, 40, 40, 0.55);
+}
+
+.menu-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 2px 6px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.menu-item:hover {
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.menu-item:active {
+  background: rgba(255, 255, 255, 0.7);
+}
+
+.menu-icon {
+  width: 36px;
+  height: 36px;
+  image-rendering: auto;
+}
+
+.menu-icon-ph {
+  display: inline-block;
+  border-radius: 8px;
+  background: rgba(120, 120, 120, 0.28);
+}
+
+.menu-name {
+  max-width: 78px;
+  font-size: 11px;
+  line-height: 1.25;
+  color: rgba(25, 25, 25, 0.85);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 面板滚动条：细、半透明，不抢玻璃质感 */
+.menu-grid::-webkit-scrollbar {
+  width: 8px;
+}
+
+.menu-grid::-webkit-scrollbar-thumb {
+  background: rgba(60, 60, 60, 0.25);
+  border-radius: 4px;
+}
+
+/* 添加模式（sir 反馈迭代）：⊕ 按钮与已收藏标记 */
+.menu-search-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.menu-add-btn {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.5);
+  color: rgba(25, 25, 25, 0.8);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.menu-add-btn:hover {
+  background: rgba(255, 255, 255, 0.75);
+}
+
+.menu-item-in {
+  opacity: 0.55;
+}
+
+.menu-in-badge {
+  font-size: 9px;
+  line-height: 1;
+  color: rgba(0, 120, 212, 0.9);
+}
+
+.menu-notice {
+  margin: 0 0 6px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgba(0, 120, 212, 0.18);
+  color: rgba(25, 25, 25, 0.85);
+  font-size: 11px;
+  text-align: center;
+}
+
+/* 电源菜单（v0.5）：锁定/睡眠/关机/重启；关机重启带 3s 倒计时二次确认 */
+.menu-power {
+  margin: 0 0 8px;
+}
+
+.menu-power-row {
+  display: flex;
+  gap: 4px;
+}
+
+.menu-power-opt {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 10px 0 8px;
+  border: none;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.4);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.menu-power-opt:hover {
+  background: rgba(255, 255, 255, 0.65);
+}
+
+.menu-power-opt span {
+  font-size: 11px;
+  color: rgba(25, 25, 25, 0.85);
+}
+
+.menu-power-danger span {
+  color: rgba(160, 30, 30, 0.9);
+}
+
+.menu-power-confirm {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(200, 40, 40, 0.16);
+  border: 1px solid rgba(200, 40, 40, 0.35);
+}
+
+.menu-power-confirm-text {
+  flex: 1;
+  font-size: 11px;
+  color: rgba(25, 25, 25, 0.9);
+}
+
+.menu-power-cf {
+  border: none;
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.6);
+  color: rgba(25, 25, 25, 0.9);
+}
+
+.menu-power-cf-go {
+  background: rgba(200, 40, 40, 0.85);
+  color: #fff;
+}
+
+/* 拖动排序（v0.5.1）：拖动中的图标半透明 */
+.dock-icon-drag {
+  opacity: 0.35;
+}
+
+/* 拖拽态调试浮层 + 幽灵样式（v0.5.1） */
+.drag-debug {
+  position: absolute;
+  top: 0;
+  left: 2px;
+  font-size: 9px;
+  line-height: 1.2;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 0 4px;
+  border-radius: 3px;
+  pointer-events: none;
+  z-index: 20;
+}
+
+.dock-icon-drag {
+  opacity: 0.5;
+  z-index: 10;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
+}
+
+/* 被拖图标禁用 transform 过渡（120ms 过渡会让幽灵滞后/弹跳——v0.5.1 实测） */
+.dock-icon-drag {
+  transition: none;
+}
+
+/* 提起-跟随-放下（v0.5.1 终版）：原位隐藏留空槽 + 浮动幽灵跟光标 */
+.dock-icon-lift {
+  visibility: hidden;
+}
+
+.drag-ghost {
+  position: fixed;
+  z-index: 50;
+  width: 52px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 0 3px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.65);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  opacity: 0.85;
+}
+
+.drag-ghost-name {
+  max-width: 78px;
+  font-size: 10px;
+  line-height: 1.2;
+  color: rgba(25, 25, 25, 0.85);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.drag-ghost canvas {
+  width: 38px;
+  height: 38px;
+}
+
+/* v0.7 Phase 1：提示条（游离图标达上限被拒等——不许静默失败）。
+   absolute 定位在药丸上方，不参与 flex 布局（不影响 fit_dock 的尺寸上报）。 */
+.dock-notice {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 320px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: rgba(200, 40, 40, 0.16);
+  border: 1px solid rgba(200, 40, 40, 0.35);
+  color: rgba(25, 25, 25, 0.9);
+  font-size: 11px;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  z-index: 60;
+}
+
+/* v0.8：临时运行图标（未固定的运行中应用）——同视觉规格，仅加虚线底衬区分 */
+.dock-transient-ph {
+  display: inline-block;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  background: rgba(120, 120, 120, 0.28);
+}
+
+.dock-transient {
+  outline: 1px dashed rgba(0, 120, 212, 0.35);
+  outline-offset: -3px;
+}
+
+/* v0.7 Phase 1：补位动画（FLIP）。
+   过渡由 JS 逐帧写入 inline style（150ms），这里只保证 hover 位移不打架。 */
+.dock-icons [data-drag] {
+  will-change: transform;
 }

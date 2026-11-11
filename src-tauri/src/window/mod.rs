@@ -25,15 +25,11 @@ pub fn set_hotzone(
     target: Option<String>,
 ) {
     let label = target.unwrap_or_else(|| window.label().to_string());
+    let _ = label; // dock 窗口不再走热区上报模型：它贴合内容、无需穿透，只有 island 上报。
     let scale = window.scale_factor().unwrap_or(1.0);
     let hz = Hotzone { x, y, w, h };
-    if label == "dock" {
-        *state.dock_hotzone.lock().unwrap() = hz;
-        *state.dock_scale.lock().unwrap() = scale;
-    } else {
-        *state.island_hotzone.lock().unwrap() = hz;
-        *state.island_scale.lock().unwrap() = scale;
-    }
+    *state.island_hotzone.lock().unwrap() = hz;
+    *state.island_scale.lock().unwrap() = scale;
 }
 
 /// 折叠球热区上报（收起态）。与药丸热区取并集命中，球心用于算 `ball-look` 朝向。

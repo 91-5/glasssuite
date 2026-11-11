@@ -34,26 +34,85 @@ pub enum Anchor {
     Island,
 }
 
-/// 建 island 与 dock 两个窗口。先 island 后 dock：dock 依赖任务栏几何，晚一步更稳。
+/// 建一个无边框窗口的规格（参数收进结构体，避免长参数列）。
+struct WindowSpec<'a> {
+    label: &'a str,
+    url: &'a str,
+    anchor: Anchor,
+    startup: (f64, f64),
+    always_on_top: bool,
+    no_activate: bool,
+    // dock / startmenu 走 glassdesk 的「隐藏→就绪→显示」模型，
+    // 由 dock_logic / menu::toggle 决定何时显示，故建窗时传 false。
+    show: bool,
+}
+
+/// 建 island 窗口。dock / startmenu 由 [`create_dock_windows`] 独立建：
+/// 它们沿用 glassdesk 的「隐藏 → 就绪 → 显示」模型（dock_logic 自动隐藏逻辑管显示），
+/// 且**不能**设 NOACTIVATE——dock 要能拿到焦点，否则「添加程序」的文件对话框
+/// 会弹在当前前台应用后面（glassdesk v0.7.1 修复过这个坑）。
 pub fn create_windows(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     build_window(
         app,
-        "island",
-        "island/index.html",
-        Anchor::Island,
-        STARTUP_ISLAND,
+        WindowSpec {
+            label: "island",
+            url: "island/index.html",
+            anchor: Anchor::Island,
+            startup: STARTUP_ISLAND,
+            always_on_top: true,
+            no_activate: true,
+            show: true,
+        },
     )?;
-    build_window(app, "dock", "dock/index.html", Anchor::Dock, STARTUP_DOCK)?;
+    Ok(())
+}
+
+/// 建 dock 与开始菜单窗口（均先隐藏，由各自逻辑决定何时显示）。
+///
+/// - dock：桌面层（D7 语义）——是否置顶由 dock.json 的 `dock_top_layer` 决定，
+///   因此这里建为**非置顶**，`lib.rs` setup 再按配置 `set_always_on_top`。
+/// - startmenu：置顶面板，失焦收回，由 `menu::toggle` 摆位与显隐。
+pub fn create_dock_windows(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    build_window(
+        app,
+        WindowSpec {
+            label: "dock",
+            url: "dock/index.html",
+            anchor: Anchor::Dock,
+            startup: STARTUP_DOCK,
+            always_on_top: false,
+            no_activate: false,
+            show: false,
+        },
+    )?;
+    build_window(
+        app,
+        WindowSpec {
+            label: "startmenu",
+            url: "dock/index.html",
+            anchor: Anchor::Dock,
+            startup: (crate::dock::menu::PANEL_W, crate::dock::menu::PANEL_H),
+            always_on_top: true,
+            no_activate: false,
+            show: false,
+        },
+    )?;
     Ok(())
 }
 
 fn build_window(
     app: &AppHandle,
-    label: &str,
-    url: &str,
-    anchor: Anchor,
-    startup: (f64, f64),
+    spec: WindowSpec,
 ) -> Result<WebviewWindow, Box<dyn std::error::Error>> {
+    let WindowSpec {
+        label,
+        url,
+        anchor,
+        startup,
+        always_on_top,
+        no_activate,
+        show,
+    } = spec;
     let win = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
         .title("GlassSuite")
         .inner_size(startup.0, startup.1)
@@ -64,7 +123,7 @@ fn build_window(
         .minimizable(false)
         .closable(false)
         .skip_taskbar(true)
-        .always_on_top(true)
+        .always_on_top(always_on_top)
         .focused(false)
         .shadow(false)
         // 先不显示：摆好位置再 show，否则会先在系统默认位置闪一下。
@@ -79,18 +138,28 @@ fn build_window(
             "{label}: exstyle before = {:#x}",
             winplat::style::ex_style(raw)
         ));
-        apply_styles(raw)?;
+        if no_activate {
+            apply_styles_noactivate(raw)?;
+        } else {
+            apply_styles(raw)?;
+        }
         winplat::log::log(&format!(
             "{label}: exstyle after  = {:#x}",
             winplat::style::ex_style(raw)
         ));
 
         place(&win, anchor, startup.0, startup.1)?;
-        win.show()?;
+        if show {
+            win.show()?;
+        }
 
         // show() 之后 tao 可能重设窗口属性（实测出现过 NOACTIVATE/TOOLWINDOW 位丢失），
         // 因此再套一次并核对；幂等位操作，重复调用无副作用。
-        apply_styles(raw)?;
+        if no_activate {
+            let _ = apply_styles_noactivate(raw);
+        } else {
+            let _ = apply_styles(raw);
+        }
         winplat::log::log(&format!(
             "{label}: exstyle final  = {:#x}",
             winplat::style::ex_style(raw)
@@ -114,13 +183,22 @@ fn build_window(
     }
 
     place(&win, anchor, startup.0, startup.1)?;
-    win.show()?;
+    if show {
+        win.show()?;
+    }
     Ok(win)
 }
 
 /// 工具窗口 + 不抢焦点。两窗都必须有，否则点一下 dock 就把前台窗口抢走了。
 #[cfg(windows)]
 fn apply_styles(raw_hwnd: isize) -> Result<(), Box<dyn std::error::Error>> {
+    winplat::style::hide_from_alt_tab(raw_hwnd)?;
+    Ok(())
+}
+
+/// 工具窗口 + 不抢焦点（island 专用：岛是常显装饰窗，不需要拿焦点）。
+#[cfg(windows)]
+fn apply_styles_noactivate(raw_hwnd: isize) -> Result<(), Box<dyn std::error::Error>> {
     winplat::style::hide_from_alt_tab(raw_hwnd)?;
     winplat::style::set_no_activate(raw_hwnd, true)?;
     Ok(())
@@ -284,12 +362,9 @@ pub fn ensure_window(
     Ok(win)
 }
 
-/// 记录内容尺寸、缩放与热区。
-///
-/// 热区直接覆盖整个窗口客户区：窗口尺寸 = 内容尺寸，前端传来的 `w/h` 已含留白，
-/// 所以不存在「透明宽窗吃掉桌面点击」的问题。resize 与热区更新在同一次调用里完成，
-/// 避免前端 ResizeObserver 未触发时热区滞后。
-fn remember(window: &WebviewWindow, state: &SharedState, label: &str, w: f64, h: f64) {
+/// 记录内容尺寸、缩放与热区（island 专用：dock 窗口由 glassdesk 移植逻辑 wholly 接管，
+/// 不再走 fit_* 上报模型）。
+fn remember(window: &WebviewWindow, state: &SharedState, w: f64, h: f64) {
     let scale = window.scale_factor().unwrap_or(1.0);
     let hz = Hotzone {
         x: 0.0,
@@ -297,36 +372,9 @@ fn remember(window: &WebviewWindow, state: &SharedState, label: &str, w: f64, h:
         w,
         h,
     };
-    if label == "dock" {
-        *state.dock_hotzone.lock().unwrap() = hz;
-        *state.dock_scale.lock().unwrap() = scale;
-        *state.dock_size.lock().unwrap() = (w, h);
-    } else {
-        *state.island_hotzone.lock().unwrap() = hz;
-        *state.island_scale.lock().unwrap() = scale;
-        *state.island_collapsed_size.lock().unwrap() = (w, h);
-    }
-}
-
-/// 前端上报 dock 内容尺寸（逻辑像素）后收缩窗口并对齐任务栏。
-#[tauri::command]
-pub fn fit_dock(
-    window: WebviewWindow,
-    state: tauri::State<'_, Arc<SharedState>>,
-    w: f64,
-    h: f64,
-) -> Result<(), String> {
-    winplat::log::log(&format!("fit_dock w={w} h={h}"));
-    remember(&window, state.inner().as_ref(), "dock", w, h);
-
-    // v0.8.1 防跳修复 #4：在**缩放之前**先按「新窗口中心 = 屏幕中心」同步 set_position。
-    // 若只调 place()，虽然 place 内部也是先定位后改尺寸，但那一步与 set_size 之间存在
-    // 一次 IPC/合成器往返；旧仓在图标连续增减时正是这一帧被 FLIP 读成整排位移。
-    // 这里先单独把原点摆到新尺寸的居中位置，place() 再幂等确认一次并改尺寸。
-    let (position, _) = compute_geometry(&window, Anchor::Dock, w, h)?;
-    window.set_position(position).map_err(|e| e.to_string())?;
-
-    place(&window, Anchor::Dock, w, h)
+    *state.island_hotzone.lock().unwrap() = hz;
+    *state.island_scale.lock().unwrap() = scale;
+    *state.island_collapsed_size.lock().unwrap() = (w, h);
 }
 
 /// 前端上报岛内容尺寸（逻辑像素）。
@@ -342,7 +390,7 @@ pub fn fit_island(
     h: f64,
 ) -> Result<(), String> {
     winplat::log::log(&format!("fit_island ignored w={w} h={h} (fixed window)"));
-    remember(&window, state.inner().as_ref(), "island", w, h);
+    remember(&window, state.inner().as_ref(), w, h);
     if state.island_expanded.load(Ordering::Relaxed) {
         return Ok(());
     }

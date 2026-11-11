@@ -1,661 +1,1282 @@
-//! dock 功能域：固定 / 临时图标、拖拽排序、游离图标、开始菜单、悬停预览、自动隐藏。
+//! 底部玻璃图标栏 —— 配置、快捷方式管理、图标提取、启动、自动隐藏策略。
 //!
-//! 线程模型（卡面 D6 会把它写进 `docs/architecture.md`）：
-//! - Tauri 主线程：建窗、resize、DWM 属性、事件分发；**不做任何可能卡住的系统调用**。
-//! - `glasssuite-running-scan`（1.5s 周期，短命）：枚举可见窗口，2s 硬截止。
-//! - `glasssuite-icon` / `glasssuite-dwm-preview` / `glasssuite-menu-scan` /
-//!   `glasssuite-launch`：按需短命线程，各自带 800ms / 400ms / 2s / 1s 硬截止。
-//! - 集合同步用**内容指纹**：Rust watcher 比对一次，前端再比对一次（v0.8.1 修复 #1），
-//!   指纹不变就不 emit、不 setState，避免 transient 图标增减时整排重排。
-//!
-//! 隐私：日志只写事件类型 + 数量，进程名 / 路径 / 应用名一律不进日志（硬约束 13）。
+//! 快捷方式管理选型（卡面 Review Q3）：**配置文件 + UI 增删**——固定快捷方式扩展性差，
+//! 拖拽添加实现复杂且与玻璃覆盖窗冲突；JSON 配置 + 文件对话框添加 + 右键移除，
+//! 实现简单、行为可预期。
+//! 自动隐藏策略（Review Q4）：光标靠近屏幕底边或悬停图标栏时显示，离开 800ms 后隐藏；
+//! 前台应用全屏时立即隐藏（不挡游戏/视频）。
 
-pub mod config;
+use std::collections::hash_map::DefaultHasher;
+use std::ffi::c_void;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use windows::core::{w, Interface, PCWSTR};
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+};
+use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    STGM,
+};
+use windows::Win32::UI::Shell::{IShellLinkW, ShellExecuteW, ShellLink};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DestroyIcon, GetCursorPos, GetIconInfo, PrivateExtractIconsW, HICON, ICONINFO, SW_SHOWNORMAL,
+};
+
+pub mod desktop;
 pub mod free;
-pub mod icons;
 pub mod menu;
 pub mod preview;
 pub mod running;
+pub mod taskbar;
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+pub mod api;
 
-use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
+// Tauri 用于窗口显示/隐藏与定位
+use tauri::{Manager, PhysicalPosition};
 
-use crate::state::SharedState;
-use config::{DockConfig, IconMode, MenuConfig, Shortcut};
+const ICON_SIZE: i32 = 32;
+const DOCK_MARGIN: i32 = 6; // dock 与任务栏的间距（物理像素）
+const REVEAL_EDGE_PX: i64 = 4; // 底边触发带高度
+const DOCK_HOVER_MARGIN: f64 = 24.0; // dock 周边容差
+const HIDE_DELAY_MS: u64 = 800;
+const POLL_MS: u64 = 200;
+/// 首次显示前的额外等待（≈一帧）：WebView2 报就绪后再等一拍，避免刚就绪就抢在合成前显示。
+const FIRST_SHOW_DELAY_MS: u64 = 50;
+/// 兜底：前端一直没报就绪（JS 异常等）时，最多等这么久就强制放行。
+const FORCE_READY_AFTER_MS: u64 = 5000;
 
-/// 运行中集合发生**实质**变化时才下发（前端仍会再比一次指纹）。
-pub const RUNNING_EVENT: &str = "dock-running";
-/// DWM 预览超时/不可用：前端收到后显示纯色块，不等待、不重试。
-pub const PREVIEW_FALLBACK_EVENT: &str = "dock-preview-fallback";
-/// 开始菜单开合。
-pub const MENU_EVENT: &str = "dock-menu-state";
+/// dock WebView2 首帧是否已就绪（前端 `dock_ready` 上报）。
+static DOCK_READY: AtomicBool = AtomicBool::new(false);
 
-const POLL_INTERVAL: Duration = Duration::from_millis(1500);
-pub const MENU_W: f64 = 320.0;
-pub const MENU_H: f64 = 420.0;
-/// 悬停预览承载窗尺寸（逻辑像素）。DWM 缩略图只能画进目标窗的客户区，
-/// 而 dock 窗口高度只有一枚药丸，所以必须有一个与预览等大的独立窗口。
-pub const PREVIEW_W: f64 = 220.0;
-pub const PREVIEW_H: f64 = 140.0;
-
-// ---------------------------------------------------------------------------
-// 快照与状态
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct DockEntry {
-    /// `exe:<规范化路径>`，dock / 运行集合 / 预览三处共用的稳定标识。
-    pub key: String,
-    /// 配置里的稳定 id（仅固定项有；临时项等于 key）。
-    pub id: String,
-    pub name: String,
-    pub path: String,
-    /// 本机运行时提取的图标 data URL；`null` 时前端用自绘 SVG 占位。
-    pub icon: Option<String>,
-    pub running: bool,
-    pub pinned: bool,
-    #[serde(rename = "freeRect")]
-    pub free_rect: Option<config::FreeRect>,
+/// 前端上报首帧已绘制。
+pub fn mark_ready() {
+    DOCK_READY.store(true, Ordering::SeqCst);
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct DockSnapshot {
-    pub pinned: Vec<DockEntry>,
-    pub transients: Vec<DockEntry>,
-    pub free: Vec<DockEntry>,
-    pub auto_hide: bool,
-    /// 内容指纹 = 实际渲染顺序的 key 列表（固定项 + 临时项）。前端据此决定要不要 setState。
-    pub fingerprint: String,
+/// 首帧是否就绪。
+pub fn is_ready() -> bool {
+    DOCK_READY.load(Ordering::SeqCst)
 }
 
-/// 内容指纹：key 的**顺序**本身就是内容的一部分（拖拽排序必须能被看见），
-/// 但不取 hwnd / 图标 / 窗口位置——那些字段变化不该触发重排（v0.8.1 修复 #1）。
+#[derive(Serialize, Deserialize, Clone)]
+pub struct IconData {
+    pub w: u32,
+    pub h: u32,
+    /// RGBA，base64
+    pub rgba: String,
+}
+
+/// 图标所在层（v0.7 Phase 1，OC-20261102-002）。
 ///
-/// 调用方保证顺序稳定：固定项按配置顺序，临时项按「首次出现顺序」（见 `merge_transient_order`）。
-/// 指纹必须和渲染顺序用同一份列表，否则 `EnumWindows` 的 z-order 抖动会被误判成内容变化。
-pub fn fingerprint(keys: &[String]) -> String {
-    keys.join("|")
+/// - `Dock` = 在 dock 行里（v0.6 及之前只有这一种）
+/// - `Free` = 游离图标（独立顶层透明窗口，位置记在 `free_rect`）
+///
+/// 老配置（v0.6 及之前）没有这个字段，`serde(default)` → `Dock`。
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IconMode {
+    #[default]
+    Dock,
+    Free,
 }
 
-/// 稳定临时项显示顺序：保留仍在集合中的旧 key 的相对顺序，**新 key 只追加到末尾**。
-///
-/// 为什么不能按 key 排序：`EnumWindows` 的返回顺序随 z-order 变化，排序虽确定，但新开一个
-/// 程序时它的 key 可能插进中间，把后面所有既有图标整体推走一枚图标宽度 —— 这正是
-/// v0.8.1 要消灭的「图标一连串跳」（B4 实测曾打出 `dx=[0×5, -50×8]`）。
-/// 只追加末尾时，既有图标的自然布局位不变，FLIP 的 dx 自然全 0。
-fn merge_transient_order(order: &mut Vec<String>, keys: &[String]) {
-    order.retain(|k| keys.iter().any(|n| n == k));
-    for k in keys {
-        if !order.iter().any(|o| o == k) {
-            order.push(k.clone());
+impl IconMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IconMode::Dock => "dock",
+            IconMode::Free => "free",
         }
     }
 }
 
-fn transient_entry(a: &running::RunningApp, icons: &HashMap<String, String>) -> DockEntry {
-    DockEntry {
-        key: a.key.clone(),
-        id: a.key.clone(),
-        name: name_from_path(&a.path),
-        path: a.path.clone(),
-        icon: icons.get(&a.key).cloned(),
-        running: true,
-        pinned: false,
+/// 游离图标的位置矩形（**物理像素**、**虚拟桌面坐标**——副屏在左/上时坐标为负）。
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FreeRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl FreeRect {
+    pub fn center_x(&self) -> i32 {
+        self.x + (self.w as i32) / 2
+    }
+    pub fn center_y(&self) -> i32 {
+        self.y + (self.h as i32) / 2
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Shortcut {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub icon: IconData,
+    /// UWP/打包应用的 AUMID（任务 A：运行指示匹配用）。
+    /// Win32 快捷方式为 None；`shell:AppsFolder\<AUMID>` 形式的路径在建条时自动提取。
+    /// serde(default)：v0.3 之前的 dock.json 老数据无此字段，加载为 None。
+    #[serde(default)]
+    pub aumid: Option<String>,
+    /// 图标所在层（v0.7 Phase 1）。serde(default) → Dock，老配置零改动可加载。
+    #[serde(default)]
+    pub mode: IconMode,
+    /// 游离模式下的窗口矩形（物理像素虚拟桌面坐标）；dock 模式为 None。
+    #[serde(default)]
+    pub free_rect: Option<FreeRect>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct DockConfig {
+    pub auto_hide: bool,
+    #[serde(default)]
+    pub shortcuts: Vec<Shortcut>,
+    /// true = dock 常驻最顶层（旧 D5 行为）；false = 桌面层（默认，全屏/最大化窗口会盖住它）。
+    /// sir 2026-10-31 裁定：走桌面层——置顶会干扰全屏/最大化操作。
+    #[serde(default)]
+    pub dock_top_layer: bool,
+}
+
+impl Default for DockConfig {
+    fn default() -> Self {
+        // v0.2.y（sir 2026-10-30 反馈「dock 一直显示挡住视野」）：默认改回自动隐藏。
+        // 全屏让位逻辑不受此值影响（is_foreground_fullscreen 命中时一律隐藏）。
+        DockConfig {
+            auto_hide: true,
+            shortcuts: Vec::new(),
+            dock_top_layer: false,
+        }
+    }
+}
+
+pub fn config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let dir = app.path().app_data_dir().ok()?;
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("dock.json"))
+}
+
+pub fn load_config(path: &Path) -> DockConfig {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_config(path: &Path, cfg: &DockConfig) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(cfg).map_err(|e| e.to_string())?;
+    atomic_write(path, &json)?;
+    bump_config_version();
+    Ok(())
+}
+
+/// 配置版本号（v0.7 Phase 1）：每次写盘 +1。
+///
+/// 前端用它判断「dock.json 被改过」→ 重新拉列表（拖出后图标离开 dock 行、
+/// 拖回后图标回到 dock 行，都靠这个版本号驱动列表刷新）。
+static CONFIG_VERSION: AtomicU64 = AtomicU64::new(0);
+
+pub fn config_version() -> u64 {
+    CONFIG_VERSION.load(Ordering::SeqCst)
+}
+
+pub fn bump_config_version() {
+    CONFIG_VERSION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// 路径归一化（v0.6 反查兜底，v0.4-a verdict advisory）：小写 + `/`→`\`。
+/// 前端传回的 path 若与 dock.json 存的大小写/分隔符不同，逐字节比较会把 UWP
+/// 应用当 Win32 启动（AUMID 反查失败 → activate_or_launch 找不到窗口）。
+pub fn normalize_path_key(p: &str) -> String {
+    p.trim().to_lowercase().replace('/', "\\")
+}
+
+/// 按 path 反查快捷方式（归一化后比较）。launch_shortcut 与探针共用。
+pub fn find_shortcut_by_path<'a>(cfg: &'a DockConfig, path: &str) -> Option<&'a Shortcut> {
+    let key = normalize_path_key(path);
+    cfg.shortcuts
+        .iter()
+        .find(|s| normalize_path_key(&s.path) == key)
+}
+
+/// 原子写（v0.6，verdict C-ADV-2）：**tmp 同目录 + rename**。
+/// 直接 `fs::write` 覆写是非原子的——写盘瞬间断电/杀进程 = 配置截断、快捷方式全丢。
+/// tmp 与目标**同目录**（同卷 rename 才原子；跨卷 rename 会失败，卡面硬约束 4）。
+/// Windows 上 std rename = MoveFileEx(MOVEFILE_REPLACE_EXISTING)，可覆盖已存在目标。
+/// rename 失败时清掉 tmp 残档，主配置保持上一个完整版本。
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| "配置路径无父目录".to_string())?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| "配置路径无文件名".to_string())?;
+    let tmp = dir.join(format!("{name}.tmp"));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("tmp 写入失败: {e}"))?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("rename 失败（主配置未动）: {e}"))
+        }
+    }
+}
+
+fn to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn b64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// b64 编码（menu 图标磁盘缓存共用）。
+pub(crate) fn b64_encode(data: &[u8]) -> String {
+    b64(data)
+}
+
+/// base64 解码（标准字母表，容忍缺 padding）。preview/menu 共用。
+pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' => {
+                T.iter().position(|&t| t == c).map(|i| i as u32)
+            }
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b" \n\r\t=".contains(b)).collect();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for ch in bytes.chunks(4) {
+        if ch.len() < 2 {
+            break;
+        }
+        let n = (val(ch[0])? << 18)
+            | (val(ch[1])? << 12)
+            | (val(*ch.get(2).unwrap_or(&b'A'))? << 6)
+            | val(*ch.get(3).unwrap_or(&b'A'))?;
+        out.push((n >> 16) as u8);
+        if ch.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if ch.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+fn id_for(path: &str) -> String {
+    let mut h = DefaultHasher::new();
+    path.hash(&mut h);
+    format!("sc{:016x}", h.finish())
+}
+
+/// 生成一个快捷方式条目（图标提取失败时给占位灰色块，仍可用）。
+///
+/// 支持两种路径形态：
+/// - 普通文件路径（.exe / .lnk）—— Win32 应用，`aumid = None`
+/// - `shell:AppsFolder\<AUMID>` —— UWP/Store 应用（系统开始菜单同源解析名；
+///   ShellExecuteW 可直接启动）。friendly name 与图标走 AppsFolder 的
+///   IShellItem（COM 在独立 STA 线程执行，3s 超时）。
+pub fn build_shortcut(path: &str) -> Shortcut {
+    if is_apps_folder_path(path) {
+        let aumid = apps_folder_aumid(path);
+        let (name, icon) =
+            apps_folder_info(&aumid).unwrap_or_else(|| (fallback_name(&aumid), placeholder_icon()));
+        return Shortcut {
+            id: id_for(path),
+            name,
+            path: path.to_string(),
+            icon,
+            aumid: Some(aumid),
+            mode: IconMode::Dock,
+            free_rect: None,
+        };
+    }
+    // 应用执行别名（如 system32\notepad.exe，0 字节 reparse point）：stub 文件没有
+    // 图标，按解析出的 AUMID 走 AppsFolder 拿 friendly name + 图标，匹配也靠 AUMID。
+    if let Some(aumid) = crate::dock::running::alias_aumid(path) {
+        let (name, icon) =
+            apps_folder_info(&aumid).unwrap_or_else(|| (fallback_name(&aumid), placeholder_icon()));
+        return Shortcut {
+            id: id_for(path),
+            name,
+            path: path.to_string(),
+            icon,
+            aumid: Some(aumid),
+            mode: IconMode::Dock,
+            free_rect: None,
+        };
+    }
+    let name = Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    let icon = extract_icon_rgba(path).unwrap_or_else(placeholder_icon);
+    Shortcut {
+        id: id_for(path),
+        name,
+        path: path.to_string(),
+        icon,
+        aumid: None,
+        mode: IconMode::Dock,
         free_rect: None,
     }
 }
 
-fn name_from_path(path: &str) -> String {
-    PathBuf::from(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("应用")
-        .to_string()
+fn is_apps_folder_path(path: &str) -> bool {
+    path.to_ascii_lowercase().starts_with("shell:appsfolder\\")
 }
 
-pub struct DockState {
-    pub data_dir: PathBuf,
-    pub config: Mutex<DockConfig>,
-    pub menu_config: Mutex<MenuConfig>,
-    pub running: Mutex<Vec<running::RunningApp>>,
-    /// 临时项显示顺序（key），与 `running` 分开存，避免 z-order 抖动影响渲染顺序。
-    pub transient_order: Mutex<Vec<String>>,
-    pub icons: Mutex<HashMap<String, String>>,
-    pub last_fingerprint: Mutex<String>,
-    pub preview: preview::PreviewController,
+fn apps_folder_aumid(path: &str) -> String {
+    path[("shell:AppsFolder\\").len()..].trim().to_string()
 }
 
-impl DockState {
-    pub fn new(data_dir: PathBuf) -> Self {
-        let cfg = config::load_dock(&data_dir);
-        let menu_cfg = config::load_menu(&data_dir);
-        Self {
-            config: Mutex::new(cfg),
-            menu_config: Mutex::new(menu_cfg),
-            running: Mutex::new(Vec::new()),
-            transient_order: Mutex::new(Vec::new()),
-            icons: Mutex::new(HashMap::new()),
-            last_fingerprint: Mutex::new(String::new()),
-            preview: preview::PreviewController::default(),
-            data_dir,
-        }
-    }
+fn fallback_name(aumid: &str) -> String {
+    aumid.split('!').next_back().unwrap_or(aumid).to_string()
+}
 
-    /// watcher 每次扫完调用：先稳定顺序，再换运行集合。
-    /// 两把锁**不重叠持有**，`snapshot()` 的加锁顺序不会与它构成环。
-    pub fn set_running(&self, apps: Vec<running::RunningApp>) {
-        let keys: Vec<String> = apps.iter().map(|a| a.key.clone()).collect();
-        {
-            let mut order = self.transient_order.lock().unwrap();
-            merge_transient_order(&mut order, &keys);
-        }
-        *self.running.lock().unwrap() = apps;
-    }
-
-    pub fn snapshot(&self) -> DockSnapshot {
-        let cfg = self.config.lock().unwrap();
-        let apps = self.running.lock().unwrap();
-        let order = self.transient_order.lock().unwrap();
-        let icons = self.icons.lock().unwrap();
-        let running_keys: std::collections::HashSet<&str> =
-            apps.iter().map(|a| a.key.as_str()).collect();
-
-        let mut pinned = Vec::new();
-        let mut free = Vec::new();
-        let mut pinned_keys = Vec::new();
-        for s in &cfg.shortcuts {
-            let key = running::key_for_path(&s.path);
-            if s.mode == IconMode::Free {
-                free.push(entry(
-                    s,
-                    key.clone(),
-                    &icons,
-                    running_keys.contains(key.as_str()),
-                    true,
-                ));
-                continue;
-            }
-            pinned_keys.push(key.clone());
-            pinned.push(entry(
-                s,
-                key.clone(),
-                &icons,
-                running_keys.contains(key.as_str()),
-                true,
-            ));
-        }
-
-        // 渲染顺序 = 稳定顺序，且指纹用的就是这份 all_keys（修复 #1 的服务端一半）。
-        let mut transients = Vec::new();
-        let mut all_keys = pinned_keys.clone();
-        for key in order.iter() {
-            if pinned_keys.contains(key) {
-                continue;
-            }
-            if let Some(a) = apps.iter().find(|a| &a.key == key) {
-                all_keys.push(key.clone());
-                transients.push(transient_entry(a, &icons));
-            }
-        }
-        // 兜底：首帧在 watcher 同步顺序之前就有人调 dock_state 时，按扫描顺序补齐，
-        // 不让图标凭空消失。正常运行下这个循环不会命中。
-        for a in apps.iter() {
-            if all_keys.contains(&a.key) {
-                continue;
-            }
-            all_keys.push(a.key.clone());
-            transients.push(transient_entry(a, &icons));
-        }
-
-        DockSnapshot {
-            pinned,
-            transients,
-            free,
-            auto_hide: cfg.auto_hide,
-            fingerprint: fingerprint(&all_keys),
-        }
-    }
-
-    /// 按 key 找可启动路径：先查固定项，再查当前运行集合。
-    fn path_for_key(&self, key: &str) -> Option<String> {
-        if let Some(s) = self
-            .config
-            .lock()
-            .unwrap()
-            .shortcuts
-            .iter()
-            .find(|s| running::key_for_path(&s.path) == key)
-        {
-            return Some(s.path.clone());
-        }
-        self.running
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|a| a.key == key)
-            .map(|a| a.path.clone())
+fn placeholder_icon() -> IconData {
+    IconData {
+        w: 32,
+        h: 32,
+        rgba: b64(&vec![0x88u8; 32 * 32 * 4]),
     }
 }
 
-fn entry(
-    s: &Shortcut,
-    key: String,
-    icons: &HashMap<String, String>,
-    running: bool,
-    pinned: bool,
-) -> DockEntry {
-    DockEntry {
-        id: s.id.clone(),
-        icon: icons
-            .get(&key)
-            .cloned()
-            .or_else(|| s.icon.as_ref().map(|i| i.data_url.clone())),
-        key,
-        name: s.name.clone(),
-        path: s.path.clone(),
-        running,
-        pinned,
-        free_rect: s.free_rect.clone(),
-    }
+/// AppsFolder 条目的 friendly name + 48px 图标。
+fn apps_folder_info(aumid: &str) -> Option<(String, IconData)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let aumid = aumid.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(unsafe { com_apps_folder_info(&aumid) });
+    });
+    rx.recv_timeout(Duration::from_secs(3)).ok().flatten()
 }
 
-/// 启动 watcher。集合没变就完全不 emit（修复 #1 的服务端一半）。
-pub fn spawn(app: AppHandle, dock: Arc<DockState>) {
-    std::thread::Builder::new()
-        .name("glasssuite-dock-watch".into())
-        .spawn(move || loop {
-            std::thread::sleep(POLL_INTERVAL);
-            // None = 扫描超时，保持上一帧，绝不把图标清空。
-            let Some(apps) = running::scan_apps_bounded() else {
-                continue;
-            };
-            dock.set_running(apps);
-            // 指纹取自快照本身：与前端拿到的渲染顺序逐字一致，
-            // 不再拿未排序的枚举顺序另算一份（那样 z-order 一抖就误判成内容变化）。
-            let snap = dock.snapshot();
-            {
-                let mut last = dock.last_fingerprint.lock().unwrap();
-                if *last == snap.fingerprint {
-                    continue;
-                }
-                *last = snap.fingerprint.clone();
-            }
-            let _ = app.emit(RUNNING_EVENT, snap);
-            winplat::log::log("dock: running changed count=1");
+unsafe fn com_apps_folder_info(aumid: &str) -> Option<(String, IconData)> {
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{
+        IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIGDN_NORMALDISPLAY,
+        SIIGBF_BIGGERSIZEOK,
+    };
+
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    let parsing = format!("shell:AppsFolder\\{aumid}");
+    let wide = to_wide(&parsing);
+    let item: IShellItem =
+        SHCreateItemFromParsingName(PCWSTR::from_raw(wide.as_ptr()), None).ok()?;
+
+    let name = item
+        .GetDisplayName(SIGDN_NORMALDISPLAY)
+        .ok()
+        .and_then(|pw| {
+            let s = pw.to_string().ok().filter(|s| !s.is_empty());
+            windows::Win32::System::Com::CoTaskMemFree(Some(pw.0 as *const c_void));
+            s
         })
-        .ok();
-}
+        .unwrap_or_else(|| fallback_name(aumid));
 
-// ---------------------------------------------------------------------------
-// 命令
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub fn dock_state(dock: State<'_, Arc<DockState>>) -> DockSnapshot {
-    dock.snapshot()
-}
-
-/// 异步取图标。前端对每个 key 调一次，失败返回 null，UI 用占位图标顶上。
-#[tauri::command]
-pub fn dock_icon(key: String, dock: State<'_, Arc<DockState>>) -> Option<String> {
-    if let Some(cached) = dock.icons.lock().unwrap().get(&key).cloned() {
-        return Some(cached);
-    }
-    let path = dock.path_for_key(&key)?;
-    let icon = icons::extract_bounded(&path)?;
-    dock.icons
-        .lock()
-        .unwrap()
-        .insert(key, icon.data_url.clone());
-    Some(icon.data_url)
-}
-
-#[tauri::command]
-pub fn dock_launch(key: String, dock: State<'_, Arc<DockState>>) -> bool {
-    let Some(path) = dock.path_for_key(&key) else {
-        return false;
-    };
-    let ok = menu::launch_bounded(&path);
-    winplat::log::log(&format!("dock: launch result={} count=1", u8::from(ok)));
-    ok
-}
-
-#[tauri::command]
-pub fn dock_launch_path(path: String) -> bool {
-    menu::launch_bounded(&path)
-}
-
-/// 拖拽排序后持久化顺序（B5：重启后顺序保持）。
-#[tauri::command]
-pub fn dock_reorder(
-    app: AppHandle,
-    paths: Vec<String>,
-    dock: State<'_, Arc<DockState>>,
-) -> Result<(), String> {
-    {
-        let mut cfg = dock.config.lock().unwrap();
-        config::reorder(&mut cfg, &paths);
-        config::save_dock(&dock.data_dir, &cfg)?;
-    }
-    // 顺序变了指纹就变，前端会重排；不 emit 的话要等下一次运行集合变化才生效。
-    let _ = app.emit(RUNNING_EVENT, dock.snapshot());
-    Ok(())
-}
-
-#[tauri::command]
-pub fn dock_auto_hide(
-    app: AppHandle,
-    enabled: bool,
-    dock: State<'_, Arc<DockState>>,
-) -> Result<(), String> {
-    {
-        let mut cfg = dock.config.lock().unwrap();
-        cfg.auto_hide = enabled;
-        config::save_dock(&dock.data_dir, &cfg)?;
-    }
-    // 指纹不变但 autoHide 变了：前端 install 会比对 autoHide，照样更新。
-    let _ = app.emit(RUNNING_EVENT, dock.snapshot());
-    Ok(())
-}
-
-/// 贴底唤出 / 收起：由前端监听 `dock-reveal` 后调用。
-/// 收起时必须同时开穿透，否则隐藏的药丸仍会吃掉桌面点击。
-#[tauri::command]
-pub fn dock_set_revealed(
-    window: WebviewWindow,
-    shared: State<'_, Arc<SharedState>>,
-    revealed: bool,
-) {
-    let _ = window.set_ignore_cursor_events(!revealed);
-    shared
-        .dock_transparent
-        .store(!revealed, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// 把固定项拖成游离图标（屏幕 CSS 坐标）。
-#[tauri::command]
-pub fn dock_set_free(
-    app: AppHandle,
-    dock: State<'_, Arc<DockState>>,
-    id: String,
-    x: i32,
-    y: i32,
-) -> Result<(), String> {
-    {
-        let mut cfg = dock.config.lock().unwrap();
-        let Some(s) = cfg.shortcuts.iter_mut().find(|s| s.id == id) else {
-            return Err("找不到该快捷方式".to_string());
-        };
-        s.mode = IconMode::Free;
-        s.free_rect = Some(config::FreeRect {
-            x,
-            y,
-            w: free::FREE_W as u32,
-            h: free::FREE_H as u32,
+    let icon = item
+        .cast::<IShellItemImageFactory>()
+        .ok()
+        .and_then(|factory| {
+            factory
+                .GetImage(SIZE { cx: 48, cy: 48 }, SIIGBF_BIGGERSIZEOK)
+                .ok()
+        })
+        .and_then(|hbmp| {
+            let d = bitmap_to_rgba(hbmp);
+            let _ = DeleteObject(hbmp.into());
+            d
         });
-        config::save_dock(&dock.data_dir, &cfg)?;
-    }
-    let cfg = dock.config.lock().unwrap().clone();
-    free::sync_windows(&app, &cfg)?;
-    let _ = app.emit(RUNNING_EVENT, dock.snapshot());
-    Ok(())
+
+    Some((name, icon.unwrap_or_else(placeholder_icon)))
 }
 
-/// 拖回 dock（取消游离）。
-#[tauri::command]
-pub fn dock_undock_free(
-    app: AppHandle,
-    dock: State<'_, Arc<DockState>>,
-    id: String,
-) -> Result<(), String> {
-    {
-        let mut cfg = dock.config.lock().unwrap();
-        let Some(s) = cfg.shortcuts.iter_mut().find(|s| s.id == id) else {
-            return Err("找不到该快捷方式".to_string());
-        };
-        s.mode = IconMode::Dock;
-        s.free_rect = None;
-        config::save_dock(&dock.data_dir, &cfg)?;
-    }
-    let cfg = dock.config.lock().unwrap().clone();
-    free::sync_windows(&app, &cfg)?;
-    let _ = app.emit(RUNNING_EVENT, dock.snapshot());
-    Ok(())
-}
-
-#[tauri::command]
-pub fn dock_move_free(
-    app: AppHandle,
-    dock: State<'_, Arc<DockState>>,
-    id: String,
-    x: i32,
-    y: i32,
-) -> Result<(), String> {
-    let cfg = {
-        let mut cfg = dock.config.lock().unwrap();
-        let Some(s) = cfg.shortcuts.iter_mut().find(|s| s.id == id) else {
-            return Err("找不到该快捷方式".to_string());
-        };
-        if let Some(r) = s.free_rect.as_mut() {
-            r.x = x;
-            r.y = y;
-        }
-        config::save_dock(&dock.data_dir, &cfg)?;
-        cfg.clone()
-    };
-    free::sync_windows(&app, &cfg)
-}
-
-// ---------------------------------------------------------------------------
-// 开始菜单面板
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-pub fn dock_menu_apps() -> Vec<menu::MenuApp> {
-    menu::list_apps_bounded()
-}
-
-#[tauri::command]
-pub fn dock_menu_favourites(dock: State<'_, Arc<DockState>>) -> Vec<config::MenuEntry> {
-    dock.menu_config.lock().unwrap().apps.clone()
-}
-
-#[tauri::command]
-pub fn dock_menu_toggle(app: AppHandle, open: Option<bool>) -> Result<bool, String> {
-    let win = app
-        .get_webview_window("startmenu")
-        .ok_or_else(|| "startmenu 窗口不存在".to_string())?;
-    let currently = win.is_visible().unwrap_or(false);
-    let next = open.unwrap_or(!currently);
-    if next == currently {
-        return Ok(next);
-    }
-    if next {
-        win.show().map_err(|e| e.to_string())?;
-        #[cfg(windows)]
-        if let Ok(h) = win.hwnd() {
-            let raw = h.0 as isize;
-            let _ = winplat::style::hide_from_alt_tab(raw);
-            let _ = winplat::style::set_no_activate(raw, true);
-        }
-    } else {
-        win.hide().map_err(|e| e.to_string())?;
-    }
-    let _ = app.emit(MENU_EVENT, next);
-    winplat::log::log(&format!("dock: menu open={next} count=1"));
-    Ok(next)
-}
-
-// ---------------------------------------------------------------------------
-// DWM 预览
-// ---------------------------------------------------------------------------
-
-/// `x`/`y` 是前端 `MouseEvent.screenX/screenY`（屏幕 CSS 像素），`w`/`h` 是期望预览尺寸。
-#[tauri::command]
-pub fn dock_preview_show(
-    app: AppHandle,
-    dock: State<'_, Arc<DockState>>,
-    key: String,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-) -> bool {
-    let source = dock
-        .running
-        .lock()
-        .unwrap()
+/// 出厂默认快捷方式：系统里真实存在的常见程序。
+pub fn default_shortcuts() -> Vec<Shortcut> {
+    let candidates: [(&str, &str); 4] = [
+        ("文件资源管理器", r"C:\Windows\explorer.exe"),
+        ("记事本", r"C:\Windows\System32\notepad.exe"),
+        ("命令提示符", r"C:\Windows\System32\cmd.exe"),
+        (
+            "Edge",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ),
+    ];
+    candidates
         .iter()
-        .find(|a| a.key == key)
-        .map(|a| a.hwnd)
-        .unwrap_or(0);
-    let win = match app.get_webview_window("preview") {
-        Some(w) => w,
-        None => return false,
-    };
-    let pw = w.clamp(1.0, PREVIEW_W);
-    let ph = h.clamp(1.0, PREVIEW_H);
-    let px = x - pw / 2.0;
-    let py = y - ph - 8.0;
-    if let Err(e) = crate::shell::place_at(&win, px, py, pw, ph) {
-        winplat::log::log(&format!(
-            "dock: preview place failed, degraded count=1: {e}"
-        ));
-        return false;
-    }
-    let _ = win.show();
-    #[cfg(windows)]
-    let dest = win.hwnd().map(|h| h.0 as isize).unwrap_or(0);
-    #[cfg(not(windows))]
-    let dest = 0;
-    let scale = win.scale_factor().unwrap_or(1.0);
-    let rect = preview::PreviewRect {
-        x: 0.0,
-        y: 0.0,
-        w: pw,
-        h: ph,
-    };
-    let ok = dock.preview.show(dest, source, rect, scale);
-    let _ = app.emit(PREVIEW_FALLBACK_EVENT, if ok { "" } else { key.as_str() });
-    ok
+        .filter(|(_, p)| Path::new(p).exists())
+        .map(|(_, p)| build_shortcut(p))
+        .collect()
 }
 
-#[tauri::command]
-pub fn dock_preview_hide(app: AppHandle, dock: State<'_, Arc<DockState>>) {
-    dock.preview.hide();
-    if let Some(win) = app.get_webview_window("preview") {
-        let _ = win.hide();
-    }
-    let _ = app.emit(PREVIEW_FALLBACK_EVENT, "");
-}
-
-// ---------------------------------------------------------------------------
-// 启动编排
-// ---------------------------------------------------------------------------
-
-/// setup 内调用：同步游离窗口 → 起 watcher。
-///
-/// **调用顺序是硬约束**：`config::migrate_legacy` 必须在 `DockState::new` 之前跑完。
-/// `load_dock` 发现目标文件不存在时会立刻写一份种子 `dock.json`，占住迁移目标；
-/// 那样旧配置会被 `migrate_file` 的「不覆盖新配置」规则跳过，B8 的顺序/收藏就丢了。
-/// 见 `lib.rs` setup 里的显式前置调用。
-pub fn init(app: &AppHandle, dock: &Arc<DockState>) {
-    // 开始菜单是第三个窗口，但**首屏隐藏**：只有用户点 dock 上的按钮才 show，
-    // 不让一个空面板常驻。窗口尺寸 = 面板尺寸，不是全屏透明层 + 热区。
-    match crate::shell::ensure_window(
-        app,
-        "startmenu",
-        "dock/index.html#startmenu",
-        MENU_W,
-        MENU_H,
-    ) {
-        Ok(win) => {
-            if let Err(e) =
-                crate::shell::place_above_dock(&win, MENU_W, MENU_H, crate::shell::STARTUP_DOCK.1)
-            {
-                winplat::log::log(&format!("dock: menu place failed, degraded count=1: {e}"));
+/// 提取图标 → RGBA（32x32）。.lnk 直接抽图标，失败再解析目标；
+/// 再失败走 **shell 命名空间兜底**（v0.5.1，sir 反馈：此电脑/控制面板快捷方式
+/// 加进来后无图标——它们的 lnk 目标是 CLSID（`::{…}`），PrivateExtractIconsW
+/// 对非文件目标拿不到图标，Shell 的 IShellItemImageFactory 才认）。
+pub fn extract_icon_rgba(path: &str) -> Option<IconData> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".lnk") {
+        if let Some(d) = private_extract(path, 0) {
+            return Some(d);
+        }
+        if let Some(target) = resolve_lnk_target(path) {
+            if let Some(d) = private_extract(&target, 0) {
+                return Some(d);
             }
         }
-        Err(e) => winplat::log::log(&format!("dock: menu window failed, degraded count=1: {e}")),
+    } else if let Some(d) = private_extract(path, 0) {
+        return Some(d);
     }
+    shell_item_icon(path)
+}
 
-    // DWM 缩略图承载窗：与预览等大、首屏隐藏，只在悬停时 show。
-    if let Err(e) = crate::shell::ensure_window(
-        app,
-        "preview",
-        "dock/index.html#preview",
-        PREVIEW_W,
-        PREVIEW_H,
-    ) {
-        winplat::log::log(&format!(
-            "dock: preview window failed, degraded count=1: {e}"
-        ));
-    }
+/// Shell 命名空间条目图标兜底：SHCreateItemFromParsingName + GetImage(ICONONLY)。
+/// 对 lnk（shell 会解析到目标）与 `::{CLSID}` 直写路径都有效。COM 独立线程 + 3s 超时。
+fn shell_item_icon(path: &str) -> Option<IconData> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = path.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(unsafe { com_shell_item_icon(&path) });
+    });
+    rx.recv_timeout(Duration::from_secs(3)).ok().flatten()
+}
 
-    let cfg = dock.config.lock().unwrap().clone();
-    if let Err(e) = free::sync_windows(app, &cfg) {
-        winplat::log::log(&format!("dock: free sync failed, degraded count=1: {e}"));
+unsafe fn com_shell_item_icon(path: &str) -> Option<IconData> {
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::System::Com::CoInitializeEx;
+    use windows::Win32::UI::Shell::{
+        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    };
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    let wide = to_wide(path);
+    let item: windows::Win32::UI::Shell::IShellItem =
+        SHCreateItemFromParsingName(PCWSTR::from_raw(wide.as_ptr()), None).ok()?;
+    let factory = item.cast::<IShellItemImageFactory>().ok()?;
+    let hbmp = factory
+        .GetImage(
+            SIZE { cx: 48, cy: 48 },
+            SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+        )
+        .ok()?;
+    let d = bitmap_to_rgba(hbmp);
+    let _ = windows::Win32::Graphics::Gdi::DeleteObject(hbmp.into());
+    d
+}
+
+/// PrivateExtractIconsW + GetDIBits：HICON → 32bpp BGRA → RGBA。
+fn private_extract(file: &str, index: i32) -> Option<IconData> {
+    unsafe {
+        let mut wide = [0u16; 260];
+        for (i, u) in file.encode_utf16().take(259).enumerate() {
+            wide[i] = u;
+        }
+        let mut hicons: [HICON; 1] = [HICON::default()];
+        let got = PrivateExtractIconsW(
+            &wide,
+            index,
+            ICON_SIZE,
+            ICON_SIZE,
+            Some(&mut hicons),
+            None,
+            0,
+        );
+        if got == 0 {
+            return None;
+        }
+        let mut info = ICONINFO::default();
+        if GetIconInfo(hicons[0], &mut info).is_err() {
+            let _ = DestroyIcon(hicons[0]);
+            return None;
+        }
+        let out = bitmap_to_rgba(info.hbmColor);
+        let _ = DeleteObject(info.hbmColor.into());
+        let _ = DeleteObject(info.hbmMask.into());
+        let _ = DestroyIcon(hicons[0]);
+        out
     }
-    spawn(app.clone(), Arc::clone(dock));
+}
+
+pub(crate) unsafe fn bitmap_to_rgba(
+    hbm: windows::Win32::Graphics::Gdi::HBITMAP,
+) -> Option<IconData> {
+    let mut bm = BITMAP::default();
+    if GetObjectW(
+        hbm.into(),
+        std::mem::size_of::<BITMAP>() as i32,
+        Some(&mut bm as *mut _ as *mut _),
+    ) == 0
+    {
+        return None;
+    }
+    let (w, h) = (bm.bmWidth, bm.bmHeight);
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let hdc = CreateCompatibleDC(None);
+    let mut bi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h, // top-down
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    let ok = GetDIBits(
+        hdc,
+        hbm,
+        0,
+        h as u32,
+        Some(buf.as_mut_ptr() as *mut _),
+        &mut bi,
+        DIB_RGB_COLORS,
+    ) != 0;
+    let _ = DeleteDC(hdc);
+    if !ok {
+        return None;
+    }
+    // BGRA → RGBA
+    for px in buf.as_chunks_mut::<4>().0 {
+        px.swap(0, 2);
+    }
+    Some(IconData {
+        w: w as u32,
+        h: h as u32,
+        rgba: b64(&buf),
+    })
+}
+
+/// 解析 .lnk 目标路径（COM 在独立 STA 线程上执行，3s 超时）。
+pub(crate) fn resolve_lnk_target(lnk: &str) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = lnk.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(unsafe { com_resolve_target(&path) });
+    });
+    rx.recv_timeout(Duration::from_secs(3)).ok().flatten()
+}
+
+unsafe fn com_resolve_target(path: &str) -> Option<String> {
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    let link: IShellLinkW = match CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) {
+        Ok(l) => l,
+        Err(_) => return None,
+    };
+    let pf: IPersistFile = match link.cast() {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let wide = to_wide(path);
+    if pf.Load(PCWSTR::from_raw(wide.as_ptr()), STGM(0)).is_err() {
+        return None;
+    }
+    // IShellLinkW::GetPath(&mut buf, &mut find_data, flags)；0x0001 = SLGP_RAWPATH
+    let mut buf = [0u16; 260];
+    let mut fd = WIN32_FIND_DATAW::default();
+    if link.GetPath(&mut buf, &mut fd, 0x0001).is_err() {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(0);
+    let target = String::from_utf16_lossy(&buf[..end]);
+    if target.is_empty() {
+        None
+    } else {
+        Some(target)
+    }
+}
+
+/// 启动快捷方式（.exe / .lnk 通用）。
+pub fn launch(path: &str) -> Result<(), String> {
+    let wide = to_wide(path);
+    let hinst = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR::from_raw(wide.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    // 返回值 > 32 为成功
+    if hinst.0 as usize > 32 {
+        Ok(())
+    } else {
+        Err(format!("ShellExecuteW failed: {:?}", hinst.0 as usize))
+    }
+}
+
+/// 点击图标：已运行则直接激活窗口（快路径），否则启动。
+///
+/// 背景：旧实现无条件 `ShellExecuteW`——每次点击都重新起一次进程，靠应用自身的
+/// 单实例转发去恢复窗口，比系统任务栏（直接 `ShowWindow(SW_RESTORE)`）明显慢。
+/// 这里复用运行指示已有的 `running::find_window_for_key`（同一套 key 体系），
+/// 命中就直接还原并置前；未命中才回退 `launch`。
+pub fn activate_or_launch(aumid: &Option<String>, path: &str) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
+    };
+
+    let key = crate::dock::running::key_for_shortcut(aumid, path);
+    if let Some((src, minimized)) = crate::dock::running::find_window_for_key(&key) {
+        let hwnd = HWND(src as *mut c_void);
+        unsafe {
+            if minimized {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            // 前台锁：用户刚点了 dock（本进程即前台），一次 SetForegroundWindow 通常够；
+            // 被系统拒绝（返回 0）时退回 SwitchToThisWindow（无需 AttachThreadInput 的
+            // 额外 feature，也不改动目标线程输入队列）。
+            if !SetForegroundWindow(hwnd).as_bool() {
+                SwitchToThisWindow(hwnd, true);
+            }
+        }
+        return Ok(());
+    }
+    launch(path)
+}
+
+/// 文件对话框选程序。
+pub fn pick_program() -> Option<String> {
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+
+    let filter: Vec<u16> = "程序与快捷方式\0*.exe;*.lnk\0所有文件\0*.*\0"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let title: Vec<u16> = to_wide("选择要添加到图标栏的程序");
+    let mut file = [0u16; 1024];
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        lpstrFilter: PCWSTR::from_raw(filter.as_ptr()),
+        lpstrFile: windows::core::PWSTR(file.as_mut_ptr()),
+        nMaxFile: 1024,
+        lpstrTitle: PCWSTR::from_raw(title.as_ptr()),
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    unsafe {
+        if GetOpenFileNameW(&mut ofn).as_bool() {
+            let end = file.iter().position(|&c| c == 0).unwrap_or(0);
+            Some(String::from_utf16_lossy(&file[..end]))
+        } else {
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dock 窗口运行时逻辑：定位 + 自动隐藏
+// ---------------------------------------------------------------------------
+
+/// dock 窗口逻辑线程：跟随任务栏定位、自动隐藏、全屏让位。
+pub fn dock_logic(app: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
+    let Some(dock) = app.get_webview_window("dock") else {
+        eprintln!("dock window missing");
+        return;
+    };
+    // 原生句柄：显示用 SW_SHOWNA（不抢焦点——sir 打字时划到底边不应被 dock 吃掉键盘输入）
+    let hwnd = dock
+        .hwnd()
+        .ok()
+        .map(|h| windows::Win32::Foundation::HWND(h.0));
+    let cfg_path = config_path(&app);
+    let auto_hide = cfg_path
+        .as_deref()
+        .map(load_config)
+        .map(|c| c.auto_hide)
+        .unwrap_or(true); // v0.2.y：默认自动隐藏（与 DockConfig::default 对齐）
+
+    let mut visible = false;
+    let mut last_active = Instant::now();
+    let mut last_pos: Option<(i32, i32)> = None;
+    let boot_at = Instant::now();
+    // 首帧就绪时刻：None = 还没就绪（此时不显示 dock = 黑闪根因修复）
+    let mut ready_at: Option<Instant> = None;
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // 首帧就绪跟踪（前端上报 + 超时兜底）
+        let ready = is_ready() || boot_at.elapsed() >= Duration::from_millis(FORCE_READY_AFTER_MS);
+        if ready {
+            if ready_at.is_none() {
+                ready_at = Some(Instant::now());
+            }
+        } else {
+            ready_at = None;
+        }
+
+        // v0.5：逻辑态每轮用真实可见态校准。`visible` 是逻辑态，而 ShowWindow 有各种
+        // no-op/失败路径（SW_SHOWNA 对已可见窗口是 no-op，HIDE 失败不更新逻辑态）——
+        // 漂移后唤出分支 `want_visible && !visible` 永远不触发。IsWindowVisible 是
+        // 廉价查询，逐轮校准消灭这一整类漂移 bug 的根源（卡面 §1.1 修复方向 1）。
+        if let Some(h) = hwnd {
+            visible =
+                unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(h) }.as_bool();
+        }
+
+        let tray = crate::dock::desktop::primary_taskbar_rect();
+        let Some(tr) = tray else {
+            if visible {
+                let _ = dock.hide();
+                visible = false;
+            }
+            std::thread::sleep(Duration::from_millis(POLL_MS));
+            continue;
+        };
+
+        // 定位：主屏水平居中，任务栏上方留 DOCK_MARGIN
+        let size = dock
+            .outer_size()
+            .unwrap_or(tauri::PhysicalSize::new(780, 76));
+        let (sw, _sh) = crate::dock::desktop::primary_screen();
+        let x = (sw - size.width as i32) / 2;
+        let y = tr.top - size.height as i32 - DOCK_MARGIN;
+        if last_pos != Some((x, y)) {
+            let _ = dock.set_position(PhysicalPosition::new(x, y));
+            last_pos = Some((x, y));
+        }
+
+        let fullscreen = crate::dock::desktop::is_foreground_fullscreen();
+        let want_visible = if fullscreen {
+            false
+        } else if !auto_hide {
+            true
+        } else if crate::dock::menu::is_panel_visible(&app) {
+            // v0.5.1（sir 反馈）：开始菜单面板开着 → dock 一直显示；
+            // 面板关闭后走回下方光标逻辑 = 自动隐藏模式恢复（光标不在 dock 区
+            // 则按 hide 延迟收回）。
+            last_active = Instant::now();
+            true
+        } else {
+            let (cx, cy) = cursor_pos();
+            let near_edge = cy >= tr.bottom as i64 - REVEAL_EDGE_PX;
+            let in_dock = dock_rect_contains(x, y, size, cx, cy);
+            if near_edge || in_dock {
+                last_active = Instant::now();
+                true
+            } else {
+                visible && last_active.elapsed() < Duration::from_millis(HIDE_DELAY_MS)
+            }
+        };
+
+        // 首帧闸门：WebView2 报就绪 + 额外等一拍，才允许显示（首帧黑闪修复）
+        let show_ready = match ready_at {
+            Some(t) => t.elapsed() >= Duration::from_millis(FIRST_SHOW_DELAY_MS),
+            None => false,
+        };
+
+        if want_visible && !visible && show_ready {
+            if let Some(h) = hwnd {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                        h,
+                        windows::Win32::UI::WindowsAndMessaging::SW_SHOWNA,
+                    );
+                    // v0.7.2（sir 反馈「dock 一直在最上面」）：SW_SHOWNA 把 dock 提到
+                    // 同层窗口之上，观感=置顶。D7 语义是桌面层（可被窗口盖住），显示后
+                    // 立刻压回同层底部（HWND_BOTTOM）——已开窗口盖得住 dock。
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                        h,
+                        Some(windows::Win32::UI::WindowsAndMessaging::HWND_BOTTOM),
+                        0,
+                        0,
+                        0,
+                        0,
+                        windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                            | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                            | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+                    );
+                }
+            } else {
+                let _ = dock.show();
+            }
+            visible = true;
+        } else if !want_visible && visible {
+            if let Some(h) = hwnd {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                        h,
+                        windows::Win32::UI::WindowsAndMessaging::SW_HIDE,
+                    );
+                }
+            } else {
+                let _ = dock.hide();
+            }
+            // 任务 B：dock 隐藏（自动隐藏/全屏让位）时预览必须一起消失
+            crate::dock::preview::hide();
+            visible = false;
+        }
+
+        std::thread::sleep(Duration::from_millis(POLL_MS));
+    }
+}
+
+fn cursor_pos() -> (i64, i64) {
+    let mut pt = windows::Win32::Foundation::POINT::default();
+    if unsafe { GetCursorPos(&mut pt) }.is_ok() {
+        (pt.x as i64, pt.y as i64)
+    } else {
+        (-1, -1)
+    }
+}
+
+fn dock_rect_contains(x: i32, y: i32, size: tauri::PhysicalSize<u32>, cx: i64, cy: i64) -> bool {
+    let m = DOCK_HOVER_MARGIN;
+    let (w, h) = (size.width as f64, size.height as f64);
+    cx >= x as i64 - m as i64
+        && cx <= (x as f64 + w + m) as i64
+        && cy >= y as i64 - m as i64
+        && cy <= (y as f64 + h + m) as i64
+}
+
+// ---------------------------------------------------------------------------
+// v0.7 Phase 1（OC-20261102-002）：拖出成游离图标 / 拖回 dock
+// ---------------------------------------------------------------------------
+
+/// 拖出判定的位移阈值（CSS px，卡面 §1.3-4「24–32px」取上限 32）。
+/// 验收 3 要求「dock 内位移 <24px 松开仍是行内排序」，验收 2 要求「≥32px 拖出」——
+/// 32 同时满足两条，且离「误拖出」更远。
+pub const DRAG_OUT_MIN_PX: f64 = 32.0;
+/// 拖出判定的按住时长阈值（ms，卡面 §1.3-4「持续 ≥80ms」）。
+pub const DRAG_OUT_MIN_MS: u64 = 80;
+
+/// 拖出判定（纯函数——前端与探针共用同一套常量/口径）。
+///
+/// - `dx`/`dy`：相对按下点的位移（CSS px）
+/// - `elapsed_ms`：按住时长
+/// - `outside_row`：指针是否已越出 dock 行（药丸）矩形
+///
+/// 行内排序与拖出是**互斥**的：只要指针还在 dock 行内，就永远只是行内换位
+/// （卡面 §1.4「行内排序已实现，不许推倒重来，只加『拖出边界后转游离』这一段」）。
+pub fn drag_out_decision(dx: f64, dy: f64, elapsed_ms: u64, outside_row: bool) -> bool {
+    if !outside_row {
+        return false;
+    }
+    if elapsed_ms < DRAG_OUT_MIN_MS {
+        return false;
+    }
+    let dist = (dx * dx + dy * dy).sqrt();
+    dist >= DRAG_OUT_MIN_PX
+}
+
+/// 按 id 反查快捷方式（游离图标命令与探针共用）。
+pub fn find_shortcut_by_id<'a>(cfg: &'a DockConfig, id: &str) -> Option<&'a Shortcut> {
+    cfg.shortcuts.iter().find(|s| s.id == id)
+}
+
+/// 切成游离模式并记下矩形（物理像素虚拟桌面坐标）。
+pub fn set_free_mode(cfg: &mut DockConfig, id: &str, rect: FreeRect) -> bool {
+    match cfg.shortcuts.iter_mut().find(|s| s.id == id) {
+        Some(s) => {
+            s.mode = IconMode::Free;
+            s.free_rect = Some(rect);
+            true
+        }
+        None => false,
+    }
+}
+
+/// 收回 dock 行：`slot` = 行内可见条目的插入序号（None = 末尾）。
+///
+/// 游离条目在数组里占位但不占行内位置，所以插入点按**dock 模式条目的下标**算。
+pub fn set_dock_mode(cfg: &mut DockConfig, id: &str, slot: Option<usize>) -> bool {
+    let Some(idx) = cfg.shortcuts.iter().position(|s| s.id == id) else {
+        return false;
+    };
+    let mut sc = cfg.shortcuts.remove(idx);
+    sc.mode = IconMode::Dock;
+    sc.free_rect = None;
+    let dock_idxs: Vec<usize> = cfg
+        .shortcuts
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.mode == IconMode::Dock)
+        .map(|(i, _)| i)
+        .collect();
+    let insert = match slot {
+        Some(s) => dock_idxs.get(s).copied().unwrap_or(cfg.shortcuts.len()),
+        None => cfg.shortcuts.len(),
+    };
+    cfg.shortcuts.insert(insert.min(cfg.shortcuts.len()), sc);
+    true
+}
+
+/// dock 窗口客户区原点（物理像素）与缩放系数——CSS px ↔ 物理像素的唯一换算口径。
+pub fn dock_metrics(app: &tauri::AppHandle) -> Option<(i32, i32, f64)> {
+    let dock = app.get_webview_window("dock")?;
+    let pos = dock.inner_position().ok()?;
+    let scale = dock.scale_factor().unwrap_or(1.0);
+    Some((pos.x, pos.y, scale))
+}
+
+/// dock 客户区 CSS 坐标 → 虚拟桌面物理像素坐标（副屏在左/上时结果为负）。
+pub fn css_to_physical(app: &tauri::AppHandle, cx: f64, cy: f64) -> Option<(i32, i32)> {
+    let (ox, oy, scale) = dock_metrics(app)?;
+    Some((
+        ox + (cx * scale).round() as i32,
+        oy + (cy * scale).round() as i32,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// v0.8（OC-20261104-001）：dock 上的「未固定的运行中应用」临时图标。
+//
+// 数据流：running.rs 的 watcher 快照（复用，禁改 running.rs / 禁新轮询线程）−
+// dock.json keys − menu.json keys → 临时条目（key + 显示名 + 可启动路径 + 图标）。
+// 生命周期：应用退出 → 快照不再含 key → 图标消失；不持久化（重启后只恢复 dock.json）。
+// ---------------------------------------------------------------------------
+
+/// 临时图标上限（卡面 §1.3-7：防 WebView2/布局失控；超出的忽略并记日志）。
+pub const TRANSIENT_MAX: usize = 10;
+
+/// 临时运行条目（前端渲染 + 探针断言共用）。
+#[derive(Serialize, Clone)]
+pub struct TransientApp {
+    /// 运行 key（`exe:<路径>` / `aumid:<小写 AUMID>`），与 running.rs 同一体系
+    pub key: String,
+    pub name: String,
+    /// 可启动路径（pin 时写进 dock.json；单击激活时走 activate_or_launch）
+    pub path: String,
+    pub aumid: Option<String>,
+    /// None = 图标尚未就绪（前端画占位块，与开始菜单同语义）
+    pub icon: Option<IconData>,
+}
+
+/// 「已被固定语义占有」的 key 集合：dock.json 全部条目 + menu.json 收藏路径。
+/// dock 条目走 `running::key_for_shortcut`（显式 aumid 字段优先）；
+/// menu 收藏路径是 `shell:AppsFolder\<AUMID>` / .lnk / 真实路径——前缀形态
+/// key_for_shortcut 会落成 `exe:shell:...`，与运行快照的 `aumid:` key 失配
+/// （已收藏的 UWP 应用会错误地重复出现在临时图标里），这里按形态先解析。
+pub fn owned_keys(dock_cfg: &DockConfig, menu_paths: &[String]) -> HashSet<String> {
+    let mut set: HashSet<String> = dock_cfg
+        .shortcuts
+        .iter()
+        .map(|s| crate::dock::running::key_for_shortcut(&s.aumid, &s.path))
+        .collect();
+    for p in menu_paths {
+        let lower = p.trim().to_lowercase();
+        if let Some(a) = lower.strip_prefix("shell:appsfolder\\") {
+            set.insert(format!("aumid:{}", a));
+        } else {
+            set.insert(crate::dock::running::key_for_shortcut(&None, p));
+        }
+    }
+    set
+}
+
+/// 纯函数：快照 − 占有集合 → 临时 key 列表（稳定顺序，单测/探针共用）。
+pub fn transient_filter(snap: &HashSet<String>, owned: &HashSet<String>) -> Vec<String> {
+    let mut keys: Vec<String> = snap.difference(owned).cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// 纯函数：上限截断。返回 (保留的 key, 被丢弃的个数)。
+pub fn cap_transients(keys: Vec<String>) -> (Vec<String>, usize) {
+    if keys.len() <= TRANSIENT_MAX {
+        return (keys, 0);
+    }
+    let dropped = keys.len() - TRANSIENT_MAX;
+    (keys.into_iter().take(TRANSIENT_MAX).collect(), dropped)
+}
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
+
+/// 临时图标内存缓存（图标提取最贵 3s COM 超时；key 命中不重复提取）。
+static TRANSIENT_ICONS: LazyLock<Mutex<HashMap<String, Option<IconData>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// exe 条目图标：dock.rs 三路提取（IShellItem GetImage → shell 命名空间 →
+/// PrivateExtractIconsW）+ 内存缓存。禁止另写第四条提取路径（卡面硬约束 4）。
+fn transient_icon_exe(path: &str) -> Option<IconData> {
+    let key = format!("exe:{}", crate::dock::running::normalize_path(path));
+    if let Ok(g) = TRANSIENT_ICONS.lock() {
+        if let Some(hit) = g.get(&key) {
+            return hit.clone();
+        }
+    }
+    let icon = extract_icon_rgba(path);
+    if let Ok(mut g) = TRANSIENT_ICONS.lock() {
+        g.insert(key, icon.clone());
+    }
+    icon
+}
+
+/// AUMID 条目图标：先反查开始菜单目录缓存（menu.rs 提取管线，零重复提取），
+/// 未命中走 dock.rs 的 AppsFolder IShellItem 提取（同三路口径），再入内存缓存。
+fn transient_icon_aumid(aumid: &str) -> Option<IconData> {
+    let key = format!("aumid:{}", aumid.to_lowercase());
+    if let Ok(g) = TRANSIENT_ICONS.lock() {
+        if let Some(hit) = g.get(&key) {
+            return hit.clone();
+        }
+    }
+    let icon = crate::dock::menu::catalog_lookup_aumid(aumid)
+        .and_then(|h| h.icon)
+        .or_else(|| aumid_fallback_icon(aumid));
+    if let Ok(mut g) = TRANSIENT_ICONS.lock() {
+        g.insert(key, icon.clone());
+    }
+    icon
+}
+
+/// AUMID 兜底提取：`shell:AppsFolder\<AUMID>` 的 IShellItemImageFactory
+/// （apps_folder_info 的图标半边，独立 STA 线程 + 3s 超时）。
+fn aumid_fallback_icon(aumid: &str) -> Option<IconData> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let aumid = aumid.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(unsafe { com_aumid_icon(&aumid) });
+    });
+    rx.recv_timeout(Duration::from_secs(3)).ok().flatten()
+}
+
+unsafe fn com_aumid_icon(aumid: &str) -> Option<IconData> {
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::System::Com::CoInitializeEx;
+    use windows::Win32::UI::Shell::{
+        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    };
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    let parsing = format!("shell:AppsFolder\\{aumid}");
+    let wide = to_wide(&parsing);
+    let item: windows::Win32::UI::Shell::IShellItem =
+        SHCreateItemFromParsingName(PCWSTR::from_raw(wide.as_ptr()), None).ok()?;
+    let factory = item.cast::<IShellItemImageFactory>().ok()?;
+    let hbmp = factory
+        .GetImage(
+            SIZE { cx: 48, cy: 48 },
+            SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+        )
+        .ok()?;
+    let d = bitmap_to_rgba(hbmp);
+    let _ = windows::Win32::Graphics::Gdi::DeleteObject(hbmp.into());
+    d
+}
+
+/// 单个运行 key → 临时条目（显示名 / 可启动路径 / 图标）。
+///
+/// - `aumid:` 优先反查开始菜单目录（friendly name + 现成图标 + 解析路径）；
+/// - `exe:` 用 exe 路径本身（三路提取图标）。
+fn transient_entry(key: &str) -> TransientApp {
+    if let Some(aumid) = key.strip_prefix("aumid:") {
+        let hit = crate::dock::menu::catalog_lookup_aumid(aumid);
+        let name = hit
+            .as_ref()
+            .map(|h| h.name.clone())
+            .unwrap_or_else(|| fallback_name(aumid));
+        // 目录里的解析路径保留原始大小写（启动/固定用它）；目录未命中才退小写 key
+        let path = hit
+            .as_ref()
+            .map(|h| h.path.clone())
+            .unwrap_or_else(|| format!("shell:AppsFolder\\{aumid}"));
+        let icon = hit
+            .as_ref()
+            .and_then(|h| h.icon.clone())
+            .or_else(|| transient_icon_aumid(aumid));
+        return TransientApp {
+            key: key.to_string(),
+            name,
+            path,
+            aumid: Some(aumid.to_string()),
+            icon,
+        };
+    }
+    if let Some(path) = key.strip_prefix("exe:") {
+        let name = Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+        let icon = crate::dock::menu::catalog_lookup_path(path)
+            .and_then(|h| h.icon)
+            .or_else(|| transient_icon_exe(path));
+        return TransientApp {
+            key: key.to_string(),
+            name,
+            path: path.to_string(),
+            aumid: None,
+            icon,
+        };
+    }
+    TransientApp {
+        key: key.to_string(),
+        name: key.to_string(),
+        path: String::new(),
+        aumid: None,
+        icon: None,
+    }
+}
+
+/// 临时条目全集（命令与探针共用）：快照 − dock.json − menu.json，截断到上限。
+/// `menu_paths` 由调用方给（app 进程走 menu::all_pinned_paths；探针直接读 menu.json）。
+pub fn transient_apps(
+    snap: &HashSet<String>,
+    dock_cfg: &DockConfig,
+    menu_paths: &[String],
+) -> Vec<TransientApp> {
+    // 目录懒启动：让 friendly name / 图标在首次查询后陆续可用（幂等，同面板线程）
+    crate::dock::menu::ensure_catalog_started();
+    let owned = owned_keys(dock_cfg, menu_paths);
+    let (keys, dropped) = cap_transients(transient_filter(snap, &owned));
+    if dropped > 0 {
+        eprintln!("transient icons over cap: {dropped} hidden (max {TRANSIENT_MAX})");
+    }
+    keys.iter().map(|k| transient_entry(k)).collect()
+}
+
+/// 把临时条目固定进 dock.json（卡面 §1.3-3：atomic_write + bump 版本）。
+/// 用 `dock::build_shortcut` 走完整解析（AppsFolder/别名/图标全复用），mode=Dock。
+/// 返回新条目；key 已被占有（重复 pin / 非 transient key）返回 Err。
+pub fn pin_transient_key(cfg_path: &Path, key: &str) -> Result<Shortcut, String> {
+    let snap = crate::dock::running::scan_once();
+    let cfg = load_config(cfg_path);
+    let menu_paths = crate::dock::menu::all_pinned_paths();
+    let owned = owned_keys(&cfg, &menu_paths);
+    if owned.contains(key) {
+        return Err(format!("key 已被固定，无需重复 pin: {key}"));
+    }
+    if !snap.contains(key) {
+        return Err(format!("key 不在运行集合中（应用已退出？）: {key}"));
+    }
+    let entry = transient_entry(key);
+    if entry.path.is_empty() {
+        return Err(format!("临时条目无可启动路径: {key}"));
+    }
+    let sc = build_shortcut(&entry.path);
+    if cfg
+        .shortcuts
+        .iter()
+        .any(|s| normalize_path_key(&s.path) == normalize_path_key(&sc.path))
+    {
+        return Err(format!("dock.json 已有同路径条目: {}", sc.path));
+    }
+    let mut cfg2 = load_config(cfg_path);
+    cfg2.shortcuts.push(sc.clone());
+    save_config(cfg_path, &cfg2)?;
+    Ok(sc)
+}
+
+/// 单击临时图标 → 激活该应用（复用 activate_or_launch 的 find_window_for_key 快路径；
+/// 临时条目必然在运行，快路径命中，launch 只是类型完备的兜底）。
+pub fn transient_activate(aumid: &Option<String>, path: &str) -> Result<(), String> {
+    activate_or_launch(aumid, path)
 }
 
 #[cfg(test)]
-mod tests {
+mod transient_tests {
     use super::*;
 
-    #[test]
-    fn fingerprint_tracks_order_and_membership() {
-        let a = vec!["exe:b".to_string(), "exe:a".to_string()];
-        let b = vec!["exe:a".to_string(), "exe:b".to_string()];
-        assert_ne!(fingerprint(&a), fingerprint(&b), "拖拽排序必须改变指纹");
-        assert_eq!(fingerprint(&a), "exe:b|exe:a");
-        assert_ne!(fingerprint(&a), fingerprint(&a[..1]));
+    fn set(v: &[&str]) -> HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
     }
 
-    /// B4 回归：新开程序不能把已有临时图标往后推，否则 FLIP 会量出 -50 的 dx 并播跳动动画。
+    /// 验收 2：key 过滤纯函数——排除固定（dock.json）条目。
     #[test]
-    fn transient_order_appends_new_keys_without_moving_existing() {
-        let mut order = vec!["exe:b".to_string(), "exe:c".to_string()];
-        let after_open = vec![
-            "exe:a".to_string(),
-            "exe:c".to_string(),
-            "exe:b".to_string(),
-        ];
-        merge_transient_order(&mut order, &after_open);
+    fn transient_filter_excludes_dock_keys() {
+        let snap = set(&[
+            "exe:c:\\a\\app1.exe",
+            "exe:c:\\b\\pinned.exe",
+            "aumid:x.y!app",
+        ]);
+        let dock = set(&["exe:c:\\b\\pinned.exe"]);
+        let got = transient_filter(&snap, &dock);
         assert_eq!(
-            order,
+            got,
             vec![
-                "exe:b".to_string(),
-                "exe:c".to_string(),
-                "exe:a".to_string()
-            ],
-            "新 key 只能追加到末尾，且枚举顺序抖动不得改变既有顺序"
+                "aumid:x.y!app".to_string(),
+                "exe:c:\\a\\app1.exe".to_string()
+            ]
         );
     }
 
+    /// 验收 2：key 过滤纯函数——排除收藏（menu.json）条目。
     #[test]
-    fn transient_order_drops_closed_apps_and_keeps_the_rest() {
-        let mut order = vec![
-            "exe:a".to_string(),
-            "exe:b".to_string(),
-            "exe:c".to_string(),
-        ];
-        merge_transient_order(&mut order, &["exe:c".to_string(), "exe:a".to_string()]);
-        assert_eq!(order, vec!["exe:a".to_string(), "exe:c".to_string()]);
-        assert_eq!(fingerprint(&order), "exe:a|exe:c");
+    fn transient_filter_excludes_menu_keys() {
+        let snap = set(&["aumid:m.calc!app", "aumid:m.pinned!app"]);
+        let owned = set(&["aumid:m.pinned!app"]);
+        let got = transient_filter(&snap, &owned);
+        assert_eq!(got, vec!["aumid:m.calc!app".to_string()]);
     }
 
+    /// owned_keys：dock + menu 两条来源都进集合（key_for_shortcut 同口径）。
     #[test]
-    fn name_falls_back_for_odd_paths() {
-        assert_eq!(name_from_path(r"C:\Apps\Notepad.exe"), "Notepad");
-        assert_eq!(name_from_path(""), "应用");
+    fn owned_keys_merges_dock_and_menu() {
+        let cfg = DockConfig {
+            shortcuts: vec![Shortcut {
+                id: "t".into(),
+                name: "n".into(),
+                path: "C:\\X\\App.exe".into(),
+                icon: placeholder_icon(),
+                aumid: None,
+                mode: IconMode::Dock,
+                free_rect: None,
+            }],
+            ..Default::default()
+        };
+        let owned = owned_keys(&cfg, &["shell:AppsFolder\\M.Calc!App".to_string()]);
+        assert!(
+            owned.contains("exe:c:\\x\\app.exe"),
+            "dock key 归一化后进集合"
+        );
+        assert!(owned.contains("aumid:m.calc!app"), "menu key 小写后进集合");
+    }
+
+    /// 验收 7：10 上限——超出部分截断并报告个数（注入列表单测，不真开 11 个应用）。
+    #[test]
+    fn cap_transients_truncates_at_max() {
+        let keys: Vec<String> = (0..12).map(|i| format!("exe:c:\\a\\app{i}.exe")).collect();
+        let (kept, dropped) = cap_transients(keys);
+        assert_eq!(kept.len(), TRANSIENT_MAX);
+        assert_eq!(dropped, 2);
+        // 未超上限时零丢弃
+        let (kept, dropped) = cap_transients(vec!["a".into()]);
+        assert_eq!((kept.len(), dropped), (1, 0));
     }
 }

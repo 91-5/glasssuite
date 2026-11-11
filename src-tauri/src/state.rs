@@ -58,7 +58,6 @@ pub struct SharedState {
     pub last_media: Mutex<Option<Value>>,
 
     pub island_hotzone: Mutex<Hotzone>,
-    pub dock_hotzone: Mutex<Hotzone>,
     /// 折叠球热区：收起时药丸缩成一颗球，球单独上报热区（移植自 glasspill）。
     /// 与 `island_hotzone` 取并集做命中判定——球本身也要可点，否则点不回来。
     pub ball_hotzone: Mutex<Hotzone>,
@@ -69,31 +68,27 @@ pub struct SharedState {
     /// AI 洞察静音：true 时后端不再 emit `ai-insight`（移植自 glasspill 的 set_muted）。
     pub muted: AtomicBool,
 
-    /// 两个窗口各自是否处于点击穿透态（WS_EX_TRANSPARENT）。
+    /// 岛是否处于点击穿透态（WS_EX_TRANSPARENT）。
+    /// dock 窗口贴合内容、没有透明宽区，永远保持可点击，因此不再需要穿透标志。
     pub island_transparent: AtomicBool,
-    pub dock_transparent: AtomicBool,
 
     /// 原生窗口句柄（地址），供钩子回调做样式对账；0 = 尚未就绪。
     pub island_hwnd: AtomicIsize,
-    pub dock_hwnd: AtomicIsize,
 
     /// 全屏让位期间窗口不可见，钩子此时不做穿透切换。
     pub island_visible: AtomicBool,
-    pub dock_visible: AtomicBool,
 
     /// 1s 采样的最新系统指标（AI 只读）。
     pub metrics: Mutex<MetricsSnapshot>,
 
-    /// 两窗逻辑→物理换算用的缩放因子。由 `set_hotzone` 命令刷新（唯一写入点），
+    /// 岛逻辑→物理换算用的缩放因子。由 `set_hotzone` 命令刷新（唯一写入点），
     /// 钩子回调只读；窗口实时原点由 `GetWindowRect` 现取，因此窗口移动后热区自动跟随。
     pub island_scale: Mutex<f64>,
-    pub dock_scale: Mutex<f64>,
 
     /// 展开态标记。展开时 `fit_island` 忽略内容尺寸上报（否则 ResizeObserver
     /// 会把窗口缩回药丸大小）；收起时用缓存的折叠尺寸复位。
     pub island_expanded: AtomicBool,
     pub island_collapsed_size: Mutex<(f64, f64)>,
-    pub dock_size: Mutex<(f64, f64)>,
 }
 
 #[cfg(test)]

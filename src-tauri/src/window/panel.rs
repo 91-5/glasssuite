@@ -112,12 +112,16 @@ pub fn spawn_fullscreen_watch(app: AppHandle, state: Arc<SharedState>) {
                             let _ = win.hide();
                         } else if seen.contains(&label) {
                             let _ = win.show();
-                            // show() 后 tao 可能重设 ExStyle，补回工具窗 + 不抢焦点。
+                            // show() 后 tao 可能重设 ExStyle，补回工具窗样式。
+                            // NOACTIVATE 只给 island：dock 要保留拿焦点的能力
+                            // （添加程序的文件对话框依附前台窗口，见 glassdesk v0.7.1）。
                             #[cfg(windows)]
                             if let Ok(h) = win.hwnd() {
                                 let raw = h.0 as isize;
                                 let _ = winplat::style::hide_from_alt_tab(raw);
-                                let _ = winplat::style::set_no_activate(raw, true);
+                                if label != "dock" && label != "startmenu" {
+                                    let _ = winplat::style::set_no_activate(raw, true);
+                                }
                             }
                         }
                     }
@@ -125,7 +129,6 @@ pub fn spawn_fullscreen_watch(app: AppHandle, state: Arc<SharedState>) {
                         seen.clear();
                     }
                     st.island_visible.store(!yielding, Ordering::Relaxed);
-                    st.dock_visible.store(!yielding, Ordering::Relaxed);
                 });
                 let _ = app.emit("fullscreen-yield", yielding);
                 winplat::log::log(&format!("fullscreen: yielding={yielding}"));

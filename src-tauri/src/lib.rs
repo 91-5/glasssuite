@@ -1,15 +1,16 @@
-//! GlassSuite 应用层：**一个进程，两个无边框窗口**。
+//! GlassSuite 应用层：**一个进程，三个无边框窗口**。
 //!
-//! 分层（对应卡内 `crates/shell` 的职责，落在 `src-tauri/` 这个 app crate 里）：
-//! - `shell`    ：建窗、摆位、内容自适应尺寸（几何全部来自 `winplat`）；
-//! - `state`    ：进程级共享状态（媒体通道、热区、穿透标志），供钩子和命令共用；
+//! 分层：
+//! - `shell`    ：建窗、摆位（几何全部来自 `winplat`）；
+//! - `state`    ：进程级共享状态（媒体通道、岛热区、穿透标志），供钩子和命令共用；
 //! - `island`   ：岛的功能域（系统指标 / 天气 / 网络 / 媒体 / 通知 / 歌词 / AI）；
+//! - `dock`     ：glassdesk v0.8.1 直移植（药丸 / 开始菜单 / 预览 / 游离图标 / 运行集合）；
 //! - `settings` ：用户配置（默认全部关闭需要联网或读取隐私数据的功能）。
 //!
 //! 启动顺序是硬约束，别调换：
 //! 1. 声明 DPI 感知（必须在任何窗口创建之前，否则窗口按虚拟像素摆放）；
 //! 2. 初始化日志与单实例锁（第二实例直接退出，不创建窗口、不抢焦点）；
-//! 3. 创建窗口 → 设为工具窗口 + 不抢焦点 → 摆位 → 最后 show（避免先出现在默认位置）；
+//! 3. 创建窗口 → 设为工具窗口 → 摆位 → 显示（dock/startmenu 先隐藏，由各自逻辑显隐）；
 //! 4. 窗口就绪后再启动功能域采样线程（早于窗口订阅会丢首帧事件）。
 
 pub mod dock;
@@ -58,36 +59,57 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Arc::clone(&shared))
         .invoke_handler(tauri::generate_handler![
-            shell::fit_dock,
+            // shell（岛几何）
             shell::fit_island,
+            // 设置
             settings::settings_get,
             settings::settings_update,
             island::ai::ai_reload,
+            // 岛功能域
             island::log_frontend,
             island::media::media_control,
             island::media::media_state,
             island::lyrics::lyrics_state,
+            // 岛窗口交互
             window::set_hotzone,
             window::set_ball_hotzone,
             window::set_muted,
             window::ai_disabled,
             window::panel::expand_panel,
             window::panel::collapse_panel,
-            dock::dock_state,
-            dock::dock_icon,
-            dock::dock_launch,
-            dock::dock_launch_path,
-            dock::dock_reorder,
-            dock::dock_auto_hide,
-            dock::dock_set_revealed,
-            dock::dock_set_free,
-            dock::dock_undock_free,
-            dock::dock_move_free,
-            dock::dock_menu_apps,
-            dock::dock_menu_favourites,
-            dock::dock_menu_toggle,
-            dock::dock_preview_show,
-            dock::dock_preview_hide,
+            // dock（glassdesk v0.8.1 命令层，dock/api.rs）
+            dock::api::dock_ready,
+            dock::api::list_shortcuts,
+            dock::api::add_shortcut,
+            dock::api::remove_shortcut,
+            dock::api::reorder_shortcuts,
+            dock::api::launch_shortcut,
+            dock::api::fit_dock,
+            dock::api::get_running_ids,
+            dock::api::preview_show,
+            dock::api::preview_hide,
+            dock::api::menu_toggle,
+            dock::api::menu_hide,
+            dock::api::get_menu_apps,
+            dock::api::menu_add,
+            dock::api::menu_remove,
+            dock::api::menu_launch,
+            dock::api::debug_note,
+            dock::api::power_lock,
+            dock::api::power_sleep,
+            dock::api::power_shutdown,
+            dock::api::drag_thresholds,
+            dock::api::dock_config_version,
+            dock::api::free_drag_out,
+            dock::api::free_launch,
+            dock::api::free_return,
+            dock::api::free_drop_result,
+            dock::api::free_ready,
+            dock::api::free_begin_drag,
+            dock::api::free_status,
+            dock::api::get_transient_running,
+            dock::api::pin_transient,
+            dock::api::transient_activate,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -97,14 +119,16 @@ pub fn run() {
             let settings = settings::load(&data_dir);
             app.manage(Mutex::new(settings));
 
+            // 窗口：island 立即显示；dock / startmenu 先隐藏（glassdesk 模型）。
             shell::create_windows(&handle)?;
-            winplat::log::log("窗口就绪：island + dock");
+            shell::create_dock_windows(&handle)?;
+            winplat::log::log("窗口就绪：island + dock + startmenu");
 
             let st = app.state::<Arc<state::SharedState>>().inner().clone();
-            cache_hwnds(&handle, &st);
+            cache_hwnd(&handle, &st);
 
             // 单一光标观测源：LL 钩子在主线程 setup 内安装（独立线程消息泵会静默停摆）。
-            window::cursor::install(handle.clone(), Arc::clone(&st));
+            window::cursor::install(handle.clone(), st.clone());
 
             // 初始穿透只给 island：dock 窗口贴合内容、没有透明宽区，必须保持可点击。
             // 钩子安装失败时降级为「两窗都可交互」，绝不留下收不到任何输入的幽灵窗。
@@ -114,19 +138,12 @@ pub fn run() {
             }
             st.island_transparent
                 .store(passthrough, std::sync::atomic::Ordering::SeqCst);
-            st.dock_transparent
-                .store(false, std::sync::atomic::Ordering::SeqCst);
             winplat::log::log(&format!("cursor: island initial passthrough={passthrough}"));
 
             window::panel::spawn_fullscreen_watch(handle.clone(), Arc::clone(&st));
 
-            // dock 数据层：迁移旧配置 → 载入 → 建开始菜单/游离窗 → 起运行集合 watcher。
-            // 迁移必须先于 DockState::new：后者会在目标文件缺失时写种子 dock.json，
-            // 把迁移目标占住（真实启动验证时发现过，见 dock::init 文档注释）。
-            dock::config::migrate_legacy(&data_dir);
-            let dock_state = Arc::new(dock::DockState::new(data_dir.clone()));
-            app.manage(Arc::clone(&dock_state));
-            dock::init(&handle, &dock_state);
+            // ---- dock 域（glassdesk setup 移植）----
+            dock_setup(&handle);
 
             // 功能域线程（各自内部按配置决定是否真的联网/读取）。
             let s = app
@@ -149,56 +166,119 @@ pub fn run() {
             ));
             app.manage(Arc::clone(&network_state));
 
-            island::metrics::spawn(handle.clone(), Arc::clone(&st));
+            island::metrics::spawn(handle.clone(), st.clone());
             island::weather::spawn(handle.clone(), s.weather.clone());
             island::network::spawn(handle.clone(), network_state);
-            island::media::spawn(handle.clone(), Arc::clone(&st));
+            island::media::spawn(handle.clone(), st.clone());
             island::notification::spawn(handle.clone(), s.notifications.clone());
-            island::ai::spawn(handle.clone(), ai_state, Arc::clone(&st));
+            island::ai::spawn(handle.clone(), ai_state, st);
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("Tauri 运行失败");
 }
 
-/// 把两窗的原生句柄与可见态写进共享状态，供鼠标钩子做样式对账。
-#[cfg(windows)]
-fn cache_hwnds(app: &tauri::AppHandle, state: &Arc<state::SharedState>) {
-    use std::sync::atomic::Ordering;
-    for (label, hwnd_slot, visible_slot, hz_slot, scale_slot, startup) in [
-        (
-            "island",
-            &state.island_hwnd,
-            &state.island_visible,
-            &state.island_hotzone,
-            &state.island_scale,
-            shell::STARTUP_ISLAND,
-        ),
-        (
-            "dock",
-            &state.dock_hwnd,
-            &state.dock_visible,
-            &state.dock_hotzone,
-            &state.dock_scale,
-            shell::STARTUP_DOCK,
-        ),
-    ] {
-        if let Some(win) = app.get_webview_window(label) {
-            if let Ok(h) = win.hwnd() {
-                hwnd_slot.store(h.0 as isize, Ordering::SeqCst);
-            }
-            visible_slot.store(true, Ordering::SeqCst);
-            // 首帧就用启动尺寸铺满热区：前端上报之前也必须能命中，否则窗口永远穿透。
-            *scale_slot.lock().unwrap() = win.scale_factor().unwrap_or(1.0);
-            *hz_slot.lock().unwrap() = state::Hotzone {
-                x: 0.0,
-                y: 0.0,
-                w: startup.0,
-                h: startup.1,
-            };
+/// dock 域初始化（从 glassdesk `lib.rs` setup 移植）。
+///
+/// 顺序硬约束：玻璃 → 工具窗口 → 按配置置顶 → 隐藏 → 数据层 → 逻辑线程。
+/// `dock_logic` 与 `spawn_*` 依赖窗口已存在，故必须在 `create_dock_windows` 之后。
+fn dock_setup(handle: &tauri::AppHandle) {
+    use std::sync::atomic::AtomicBool;
+
+    // dock 窗口：磨砂玻璃 + 工具窗口 + 按配置置顶 + 初始隐藏（dock_logic 决定何时显示）。
+    if let Some(d) = handle.get_webview_window("dock") {
+        #[cfg(windows)]
+        if let Ok(h) = d.hwnd() {
+            let scale = d.scale_factor().unwrap_or(1.0);
+            let radius = (18.0 * scale) as i32;
+            let _ =
+                dock::desktop::enable_glass(windows::Win32::Foundation::HWND(h.0), Some(radius));
+            let _ = winplat::style::hide_from_alt_tab(h.0 as isize);
         }
+        let top = handle
+            .get_webview_window("dock")
+            .and_then(|_| dock::config_path(handle))
+            .map(|p| dock::load_config(&p))
+            .map(|c| c.dock_top_layer)
+            .unwrap_or(false);
+        let _ = d.set_always_on_top(top);
+        let _ = d.hide();
+    }
+
+    // 开始菜单面板：同款玻璃 + 工具窗口 + 初始隐藏；失焦收回。
+    if let Some(sm) = handle.get_webview_window("startmenu") {
+        #[cfg(windows)]
+        if let Ok(h) = sm.hwnd() {
+            let scale = sm.scale_factor().unwrap_or(1.0);
+            let radius = (14.0 * scale) as i32;
+            let _ =
+                dock::desktop::enable_glass(windows::Win32::Foundation::HWND(h.0), Some(radius));
+            let _ = winplat::style::hide_from_alt_tab(h.0 as isize);
+        }
+        let _ = sm.hide();
+        let app = handle.clone();
+        sm.on_window_event(move |event| {
+            if let tauri::WindowEvent::Focused(focused) = event {
+                if *focused {
+                    dock::menu::log_focus(true);
+                } else {
+                    dock::menu::log_focus(false);
+                    dock::menu::on_blur(&app);
+                }
+            }
+        });
+    }
+
+    // dock 主逻辑线程（自动隐藏 / 置顶 / 任务栏让位）。
+    let h = handle.clone();
+    std::thread::spawn(move || {
+        dock::dock_logic(h, std::sync::Arc::new(AtomicBool::new(false)));
+    });
+
+    // 游离图标：注入 AppHandle → 按现有配置 reconcile → 常驻对账线程。
+    dock::free::set_app_handle(handle);
+    if let Some(p) = dock::config_path(handle) {
+        let cfg = dock::load_config(&p);
+        dock::free::reconcile(handle, &cfg);
+    }
+    let h = handle.clone();
+    std::thread::spawn(move || {
+        dock::free::spawn_reconciler(h, std::sync::Arc::new(AtomicBool::new(false)));
+    });
+
+    // 运行集合 watcher（dock running 图标与临时图标共用）。
+    dock::running::spawn_watcher();
+
+    // 预览渲染进程：读 dock.json 同级目录的图标缓存。
+    if let Some(dir) = dock::config_path(handle).and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        dock::preview::spawn(dir);
+    }
+
+    // 开始菜单数据源。
+    if let Some(dir) = dock::config_path(handle).and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        dock::menu::init(dir);
+    }
+}
+
+/// 把 island 的原生句柄与可见态写进共享状态，供鼠标钩子做样式对账。
+#[cfg(windows)]
+fn cache_hwnd(app: &tauri::AppHandle, state: &Arc<state::SharedState>) {
+    use std::sync::atomic::Ordering;
+    if let Some(win) = app.get_webview_window("island") {
+        if let Ok(h) = win.hwnd() {
+            state.island_hwnd.store(h.0 as isize, Ordering::SeqCst);
+        }
+        state.island_visible.store(true, Ordering::SeqCst);
+        // 首帧就用启动尺寸铺满热区：前端上报之前也必须能命中，否则窗口永远穿透。
+        *state.island_scale.lock().unwrap() = win.scale_factor().unwrap_or(1.0);
+        *state.island_hotzone.lock().unwrap() = state::Hotzone {
+            x: 0.0,
+            y: 0.0,
+            w: shell::STARTUP_ISLAND.0,
+            h: shell::STARTUP_ISLAND.1,
+        };
     }
 }
 
 #[cfg(not(windows))]
-fn cache_hwnds(_app: &tauri::AppHandle, _state: &Arc<state::SharedState>) {}
+fn cache_hwnd(_app: &tauri::AppHandle, _state: &Arc<state::SharedState>) {}

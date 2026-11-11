@@ -3,6 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- data:, 抑制浏览器自动请求 /favicon.ico（dist 无该文件时 Tauri asset 协议返回 500 刷错误日志） -->
+    <link rel="icon" href="data:," />
     <title>GlassSuite Dock</title>
   </head>
   <body>
