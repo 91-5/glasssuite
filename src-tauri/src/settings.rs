@@ -4,10 +4,14 @@
 //! 的功能填进 `%APPDATA%\com.glasssuite.app\settings.json` 即可打开——首次运行会写一份
 //! 全默认的模板，方便发现有哪些开关。
 //!
-//! 为什么要文件而不是设置面板：桌面美化工具的用户画像偏「愿意改配置文件」，
-//! 先把配置落到文件、语义定清楚，面板可以后面再加，避免一上来就做一堆 UI 状态管理。
+//! 配置有两个写入面，语义完全一致（同一文件、同一校验）：
+//! - 直接改文件：重启后生效；
+//! - UI 面板（island → AI 与网络设置）：`settings_update` 原子完成
+//!   「写回文件 → 更新 managed state → 应用运行时（AI / 网络探测热加载）」，
+//!   无需重启。本卡（OC-20261110-003）补齐的就是后者。
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use winplat::config;
@@ -58,9 +62,15 @@ pub struct Settings {
     /// AI 摘要服务地址（OpenAI 兼容）。`null` = 关闭（默认）。**不得内置任何私有网关。**
     #[serde(default, rename = "aiBaseUrl")]
     pub ai_base_url: Option<String>,
-    /// AI 密钥。建议改用环境变量 `GLASSSUITE_AI_KEY`，避免把密钥写进磁盘。
+    /// AI 密钥。建议改用环境变量 `GLASSSUITE_AI_KEY`，避免把密钥写进磁盘；
+    /// UI 面板保存的密钥走这里（仅用户自填，默认模板仍为 null）。
     #[serde(default, rename = "aiApiKey")]
     pub ai_api_key: Option<String>,
+    /// AI 总开关（UI 面板）。`null`/缺省 = 开（与基线行为一致），`false` = 用户显式关闭。
+    /// 不是外联字段：外联仍由「端点 + 密钥配齐」门控；env `GLASSSUITE_AI_ENABLED=0`
+    /// 是更高优先级的 kill switch。
+    #[serde(default, rename = "aiEnabled")]
+    pub ai_enabled: Option<bool>,
     /// 歌词源地址（LRCLIB 兼容 `/api/get`、`/api/search`）。`null` = 关闭（默认，不联网）。
     #[serde(default, rename = "lyricsSourceUrl")]
     pub lyrics_source_url: Option<String>,
@@ -100,8 +110,56 @@ pub fn load(data_dir: &Path) -> Settings {
 
 /// 把当前配置交给前端（只读）：岛据此决定显示哪些区块。
 #[tauri::command]
-pub fn settings_get(settings: tauri::State<'_, Settings>) -> Settings {
-    settings.inner().clone()
+pub fn settings_get(settings: tauri::State<'_, Mutex<Settings>>) -> Settings {
+    settings.lock().unwrap().clone()
+}
+
+/// 写回 settings.json（原子：临时文件 + rename，见 `winplat::config::save_json`）。
+/// 独立出来便于单测：命令层只做「写盘 → 换内存态 → 应用运行时」的编排。
+fn persist(data_dir: &Path, next: &Settings) -> Result<(), String> {
+    config::save_json(&path(data_dir), next).map_err(|e| format!("配置写入失败：{e}"))
+}
+
+/// 把新配置应用进运行时：替换 managed state、派生并换入 AI 配置、更新网络探测开关。
+///
+/// 返回「AI 是否已配齐」（只回布尔，URL/密钥不进日志）。热加载机制见
+/// `island::ai::AiState`：AI 常驻线程每个 tick 读最新配置，换槽即生效，不重启线程、
+/// 不留旧任务；网络探测线程同理（`island::network::NetworkState`）。
+fn apply(
+    next: &Settings,
+    store: &Mutex<Settings>,
+    ai: &crate::island::ai::AiState,
+    network: &crate::island::network::NetworkState,
+) -> bool {
+    let cfg = {
+        let mut cur = store.lock().unwrap();
+        *cur = next.clone();
+        crate::island::ai::config::AiConfig::load(&cur)
+    };
+    let configured = cfg.is_configured();
+    ai.swap(cfg);
+    network.set(next.network_probe_url.clone());
+    configured
+}
+
+/// 前端保存配置：写回文件 + 更新 managed state + 应用运行时，一次调用全部完成。
+///
+/// 写盘失败时不动内存态并返回 `Err`（前端提示保存失败）；成功则新配置即刻生效，
+/// `ai_reload` 之后只是幂等兜底。async 是刻意的：约束 14 禁止阻塞式系统调用跑在
+/// UI/事件循环线程，文件 I/O 交给 Tauri 的异步命令线程。
+#[tauri::command]
+pub async fn settings_update(
+    store: tauri::State<'_, Mutex<Settings>>,
+    ai: tauri::State<'_, Arc<crate::island::ai::AiState>>,
+    network: tauri::State<'_, Arc<crate::island::network::NetworkState>>,
+    next: Settings,
+) -> Result<Settings, String> {
+    let data_dir = config::app_data_dir(winplat::IDENTIFIER).unwrap_or_else(std::env::temp_dir);
+    persist(&data_dir, &next)?;
+
+    let configured = apply(&next, &store, &ai, &network);
+    winplat::log::log(&format!("settings: 已保存 ai_configured={configured}"));
+    Ok(next)
 }
 
 #[cfg(test)]
@@ -141,6 +199,11 @@ mod tests {
             );
         }
         assert_eq!(template["notifications"]["enabled"].as_bool(), Some(false));
+        assert_eq!(
+            template["aiEnabled"].as_bool(),
+            None,
+            "首启模板不预置 AI 开关（null = 跟随默认开）"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -163,5 +226,80 @@ mod tests {
         assert!(s.network_probe_url.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D1 单测：`settings_update` 的写回路径 → reload 出正确 `AiConfig`；
+    /// 未配齐（缺 key）仍然零外联。
+    #[test]
+    fn update_persists_and_reload_yields_configured_ai() {
+        let dir = std::env::temp_dir().join("gs-settings-update");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let next = Settings {
+            ai_base_url: Some("https://llm.example.com/v1".into()),
+            ai_api_key: Some("test-key".into()),
+            ai_model: Some("my-model".into()),
+            ..Settings::default()
+        };
+        persist(&dir, &next).unwrap();
+        let loaded = load(&dir);
+        assert_eq!(loaded, next, "写回后再读应原样回来");
+        let cfg = crate::island::ai::config::AiConfig::load(&loaded);
+        assert!(cfg.is_configured(), "端点+密钥配齐后 reload 应视为已配置");
+        assert_eq!(cfg.model, "my-model");
+
+        // 缺 key：写回同样的文件再 reload，仍未配置——零外联门槛不因写回路径松动。
+        let no_key = Settings {
+            ai_api_key: None,
+            ..next.clone()
+        };
+        persist(&dir, &no_key).unwrap();
+        let cfg = crate::island::ai::config::AiConfig::load(&load(&dir));
+        assert!(!cfg.is_configured());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `settings_update` 的应用路径：内存态整体替换 + AI/网络运行时同步生效，
+    /// 开关可逆（B4 的命令层语义）。
+    #[test]
+    fn apply_swaps_runtime_states_and_reports_configured() {
+        use crate::island::ai;
+        use crate::island::network;
+
+        let store = Mutex::new(Settings::default());
+        let ai = ai::AiState::new(ai::config::AiConfig::load(&Settings::default()));
+        let network = network::NetworkState::new(None);
+
+        // 只填端点缺 key：AI 槽仍未配置（零外联），网络开关保持关闭。
+        let partial = Settings {
+            ai_base_url: Some("https://llm.example.com/v1".into()),
+            ..Settings::default()
+        };
+        assert!(!apply(&partial, &store, &ai, &network));
+        assert!(!ai.current().is_configured());
+        assert!(network.current().is_none());
+
+        // 配齐 + 打开网络探测：一次 apply 两处同时生效，managed state 已是新值。
+        let full = Settings {
+            ai_base_url: Some("https://llm.example.com/v1".into()),
+            ai_api_key: Some("k".into()),
+            network_probe_url: Some("https://example.com".into()),
+            ..Settings::default()
+        };
+        assert!(apply(&full, &store, &ai, &network));
+        assert!(ai.current().is_configured());
+        assert_eq!(network.current().as_deref(), Some("https://example.com"));
+        assert_eq!(store.lock().unwrap().ai_api_key.as_deref(), Some("k"));
+
+        // 再关：AI 回到未配置、空白探测地址视为关闭——保存开关语义可逆。
+        let off = Settings {
+            network_probe_url: Some("   ".into()),
+            ..Settings::default()
+        };
+        assert!(!apply(&off, &store, &ai, &network));
+        assert!(!ai.current().is_configured());
+        assert!(network.current().is_none());
     }
 }

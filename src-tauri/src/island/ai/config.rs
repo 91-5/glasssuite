@@ -6,7 +6,8 @@
 //!   写进源码——把私有域名（哪怕拼成片段）留在公开仓库里本身就是卫生问题。
 //! - 密钥只来自 `settings.aiApiKey` 或环境变量 `GLASSSUITE_AI_KEY`；**绝不写进仓库、
 //!   绝不进日志**；建议用环境变量而不是把密钥落在配置文件里。
-//! - `GLASSSUITE_AI_ENABLED=0` 是总 kill switch。
+//! - `GLASSSUITE_AI_ENABLED=0` 是总 kill switch，优先于一切配置；UI 的
+//!   `settings.aiEnabled` 开关只能关掉默认开启，翻不回被 env 压死的 off。
 //! - 未配置齐（enabled + base_url + key）时一切 AI 功能静默跳过。
 
 use crate::settings::Settings;
@@ -43,13 +44,16 @@ pub struct AiConfig {
 
 impl AiConfig {
     pub fn load(s: &Settings) -> Self {
-        let enabled = match std::env::var(ENV_ENABLED) {
+        // env kill switch（默认开）∧ 用户开关（缺省 = 开，与基线行为一致）。
+        // 两个都是 false 才全关；env=0 时 settings 里怎么勾都压不回来。
+        let env_enabled = match std::env::var(ENV_ENABLED) {
             Ok(v) => !matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "off" | "no"
             ),
             Err(_) => true,
         };
+        let enabled = env_enabled && s.ai_enabled.unwrap_or(true);
 
         let base_url = s
             .ai_base_url
@@ -133,5 +137,27 @@ mod tests {
         };
         let cfg = AiConfig::load(&s);
         assert!(!cfg.is_configured(), "没有密钥不得外联");
+    }
+
+    #[test]
+    fn settings_switch_defaults_to_on_like_baseline() {
+        // 不勾选开关（aiEnabled=null）时行为与基线一致：端点配齐即视为已配置。
+        let s = Settings {
+            ai_base_url: Some("https://llm.example.com/v1".into()),
+            ai_api_key: Some("test-key".into()),
+            ..Settings::default()
+        };
+        assert!(AiConfig::load(&s).is_configured());
+    }
+
+    #[test]
+    fn settings_switch_can_disable_ai() {
+        let s = Settings {
+            ai_enabled: Some(false),
+            ai_base_url: Some("https://llm.example.com/v1".into()),
+            ai_api_key: Some("test-key".into()),
+            ..Settings::default()
+        };
+        assert!(!AiConfig::load(&s).is_configured(), "UI 开关关闭后不得外联");
     }
 }

@@ -353,3 +353,88 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ── AI 与网络设置第二视图（panel-head 的 ⚙ 进入）────────────────────────── */
+
+.panel-head-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.panel-settings {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+}
+
+.panel-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.panel-field-label {
+  font-size: 11px;
+  color: var(--gs-text-dim);
+}
+
+.panel-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 7px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  outline: none;
+}
+
+.panel-input:focus {
+  border-color: rgba(255, 255, 255, 0.32);
+}
+
+.panel-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--gs-text-dim);
+  cursor: pointer;
+}
+
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: auto;
+}
+
+.panel-save {
+  flex: 0 0 auto;
+  padding: 4px 14px;
+  border: 0;
+  border-radius: 7px;
+  background: rgba(138, 215, 255, 0.25);
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.panel-save:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.panel-status {
+  font-size: 11px;
+  color: var(--gs-text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

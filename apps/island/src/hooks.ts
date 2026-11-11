@@ -7,8 +7,11 @@
 import { useEffect, useState } from "react";
 import {
   EVENTS,
+  aiReload,
   getSettings,
+  logFrontend,
   subscribe,
+  updateSettings,
   type Settings,
   type SysMetrics,
   type WeatherSnapshot,
@@ -33,6 +36,34 @@ export function useSettings(): Settings | null {
   }, []);
 
   return settings;
+}
+
+/** `saveSettings` 的结果：保存后的配置 + 后端视角「AI 是否已配齐」。 */
+export interface SaveResult {
+  saved: Settings;
+  /** enabled + base_url + key 三项齐备；ai_reload 兜底失败时按保存值推算。 */
+  aiConfigured: boolean;
+}
+
+/**
+ * 保存配置并触发 AI 重载（卡片 D2 的「保存 → reload」链路）。
+ *
+ * `settings_update` 已在后端原子应用（AI / 网络探测随之热加载），这里的 `ai_reload`
+ * 是幂等兜底：失败不影响保存结果（配置已经生效），只记一条前端诊断日志。
+ * 写盘失败时抛错，由调用方提示。
+ */
+export async function saveSettings(next: Settings): Promise<SaveResult> {
+  const saved = await updateSettings(next);
+  const aiConfigured = await aiReload().catch(() => {
+    logFrontend("[settings] ai_reload 兜底失败（settings_update 已应用，按保存值推算）").catch(
+      () => {
+        /* 非 Tauri 环境 */
+      },
+    );
+    // 兜底失败时按保存值推算给状态条用；env 密钥场景可能因此少算，不影响真实行为。
+    return Boolean(saved.aiBaseUrl && saved.aiApiKey && saved.aiEnabled !== false);
+  });
+  return { saved, aiConfigured };
 }
 
 /** 天气快照；`null` = 未配置或还没收到第一份数据。 */

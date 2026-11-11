@@ -19,7 +19,7 @@ pub mod shell;
 pub mod state;
 pub mod window;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tauri::Manager;
 
@@ -61,6 +61,8 @@ pub fn run() {
             shell::fit_dock,
             shell::fit_island,
             settings::settings_get,
+            settings::settings_update,
+            island::ai::ai_reload,
             island::log_frontend,
             island::media::media_control,
             island::media::media_state,
@@ -88,8 +90,9 @@ pub fn run() {
             let handle = app.handle().clone();
 
             // 配置先于窗口：窗口尺寸/内容依赖配置（例如天气是否显示）。
+            // 放进 Mutex 是因为 settings_update 要整体替换它（前端保存即生效）。
             let settings = settings::load(&data_dir);
-            app.manage(settings);
+            app.manage(Mutex::new(settings));
 
             shell::create_windows(&handle)?;
             winplat::log::log("窗口就绪：island + dock");
@@ -123,19 +126,32 @@ pub fn run() {
             dock::init(&handle, &dock_state);
 
             // 功能域线程（各自内部按配置决定是否真的联网/读取）。
-            let s = app.state::<settings::Settings>().inner().clone();
+            let s = app
+                .state::<Mutex<settings::Settings>>()
+                .lock()
+                .unwrap()
+                .clone();
 
             // 歌词源与 AI 配置必须在媒体/AI 线程启动前定下来：两者都遵循
             // 「默认 null → 零外联」，配置没配齐时模块内部直接短路。
             island::lyrics::configure(s.lyrics_source_url.clone());
             let ai_cfg = island::ai::config::AiConfig::load(&s);
 
+            // AI / 网络的运行时配置槽：settings_update / ai_reload 换槽即热加载，
+            // 常驻线程每轮读取（见 island::ai::AiState / island::network::NetworkState）。
+            let ai_state = Arc::new(island::ai::AiState::new(ai_cfg));
+            app.manage(Arc::clone(&ai_state));
+            let network_state = Arc::new(island::network::NetworkState::new(
+                s.network_probe_url.clone(),
+            ));
+            app.manage(Arc::clone(&network_state));
+
             island::metrics::spawn(handle.clone(), Arc::clone(&st));
             island::weather::spawn(handle.clone(), s.weather.clone());
-            island::network::spawn(handle.clone(), s.network_probe_url.clone());
+            island::network::spawn(handle.clone(), network_state);
             island::media::spawn(handle.clone(), Arc::clone(&st));
             island::notification::spawn(handle.clone(), s.notifications.clone());
-            island::ai::spawn(handle.clone(), ai_cfg, Arc::clone(&st));
+            island::ai::spawn(handle.clone(), ai_state, Arc::clone(&st));
             Ok(())
         })
         .run(tauri::generate_context!())

@@ -22,8 +22,12 @@ export const COMMANDS = {
   fitDock: "fit_dock",
   /** 上报岛药丸实际尺寸（同上）。 */
   fitIsland: "fit_island",
-  /** 读取用户配置（只读；写配置走 settings.json 文件）。 */
+  /** 读取用户配置（只读）。 */
   settingsGet: "settings_get",
+  /** 保存用户配置：写回 settings.json + 应用运行时（AI / 网络探测热加载）。 */
+  settingsUpdate: "settings_update",
+  /** 显式触发 AI 配置重载（幂等；settings_update 已应用，这里是兜底）。返回是否已配齐。 */
+  aiReload: "ai_reload",
   /** 前端诊断日志。 */
   logFrontend: "log_frontend",
   /** 媒体控制：play | pause | play_pause | next | prev | seek。 */
@@ -157,19 +161,41 @@ export interface WeatherConfig {
  */
 export interface Settings {
   weather?: WeatherConfig | null;
+  /** 网络探测地址；null/空白 = 关闭（默认不联网）。 */
   networkProbeUrl?: string | null;
+  /** AI 端点（OpenAI 兼容）；null = 未配置（零外联）。 */
   aiBaseUrl?: string | null;
+  /** AI 密钥（用户自填时保存到本机 settings.json；也可用环境变量）。 */
   aiApiKey?: string | null;
+  /** AI 模型名；null = 后端默认。 */
   aiModel?: string | null;
+  /** AI 总开关；null/缺省 = 开（与基线一致），false = 用户显式关闭。 */
+  aiEnabled?: boolean | null;
   /** 歌词源地址；null = 关闭（默认不联网）。 */
   lyricsSourceUrl?: string | null;
   /** 系统通知摘要读取，默认关闭。 */
-  notifications?: { enabled: boolean };
+  notifications?: { enabled: boolean; uiaFallback?: boolean };
   dock?: { autoHide: boolean };
 }
 
 export async function getSettings(): Promise<Settings> {
   return invoke<Settings>(COMMANDS.settingsGet);
+}
+
+/**
+ * 保存用户配置。后端一次调用完成「写 settings.json → 更新内存态 → 应用运行时」，
+ * AI 与网络探测随之热加载（无需重启）。写盘失败时抛错且后端不应用内存态。
+ */
+export async function updateSettings(next: Settings): Promise<Settings> {
+  return invoke<Settings>(COMMANDS.settingsUpdate, { next });
+}
+
+/**
+ * 显式触发 AI 配置重载（幂等兜底，卡片 D2 的「保存 → AI reload」链路）。
+ * 返回后端视角「AI 是否已配齐」（enabled + base_url + key）。
+ */
+export async function aiReload(): Promise<boolean> {
+  return invoke<boolean>(COMMANDS.aiReload);
 }
 
 /** 前端诊断日志（进 Rust 侧日志文件，便于排查「后端有数据但界面没反应」）。 */
