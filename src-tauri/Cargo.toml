@@ -32,6 +32,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # windows 0.62 不再转发 IAsyncOperation/AsyncStatus，直连同版本 windows-future
 windows-future = "0.3"
 
+[dev-dependencies]
+# tauri::test（MockRuntime + get_ipc_response）的门控 feature；
+# dev-dependencies 只在 test profile 启用，release 二进制不受影响。
+tauri = { version = "2", features = ["test"] }
+
 [target.'cfg(windows)'.dependencies]
 # 与 winplat 共用 workspace.dependencies 里的 0.62，feature 由 cargo 合并；
 # 此处只补 shell 层自己需要的 Win32/WinRT 面（媒体、通知、光标、dock）。
