@@ -87,7 +87,10 @@ pub struct Suggestion {
 }
 
 const GLOBAL_GAP: Duration = Duration::from_secs(20 * 60);
-const SAME_KIND_GAP: Duration = Duration::from_secs(6 * 60 * 60);
+/// 同类建议的最小展示间隔（展示层）。LLM 调用的「同规则 6h」间隔在 ai::mod 的
+/// `LlmGate`——久坐一天 6 次（间隔可低至 60min）与 6h 的 LLM 间隔不冲突：
+/// 模板直出不受限，只有润色受限。
+const SAME_KIND_GAP: Duration = Duration::from_secs(20 * 60);
 const CPU_HIGH: f64 = 85.0;
 const CPU_SUSTAIN: Duration = Duration::from_secs(180);
 const MEM_HIGH: f64 = 92.0;
@@ -168,6 +171,10 @@ pub struct Suggester {
 impl Suggester {
     /// 由调用方注入全部输入（B5 的注入式测试口）。
     pub fn evaluate(&mut self, ctx: &Ctx) -> Option<Suggestion> {
+        // 静音：连模板都不出（会话记账也无意义）。
+        if ctx.muted {
+            return None;
+        }
         // 久坐会话记账必须每次都跑（无论最终谁触发）：空闲 >5min 判「离开」。
         if ctx.input.idle > INPUT_AWAY {
             self.session_since = None;
@@ -459,29 +466,34 @@ mod tests {
         let snap = Snapshot::default();
         let t0 = Instant::now();
         let active = Duration::from_secs(30);
+        // 首次观察：会话从这一刻开始计时（观察者只能从首次见到活跃输入起算）。
+        assert!(s
+            .evaluate(&ctx(&snap, t0, 14, 0, 20_000, active))
+            .is_none());
         // 会话 49 分钟：不触发
         assert!(s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(49 * 60), 14, 0, 20_000, active))
+            .evaluate(&ctx(&snap, t0 + Duration::from_secs(49 * 60), 14, 49, 20_000, active))
             .is_none());
         // 51 分钟：触发
         let hit = s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(51 * 60), 14, 1, 20_000, active))
+            .evaluate(&ctx(&snap, t0 + Duration::from_secs(51 * 60), 14, 51, 20_000, active))
             .expect("久坐应触发");
         assert_eq!(hit.kind, "sedentary");
         // 间隔未到（默认 60min）：即使会话继续也不触发
         assert!(s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(80 * 60), 14, 20, 20_000, active))
+            .evaluate(&ctx(&snap, t0 + Duration::from_secs(80 * 60), 15, 20, 20_000, active))
             .is_none());
         // 5 分钟空档（离开）→ 会话重置，回来后 30 分钟不触发
         assert!(s
             .evaluate(&ctx(&snap, t0 + Duration::from_secs(140 * 60), 16, 20, 20_000, Duration::from_secs(6 * 60)))
             .is_none());
         assert!(s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(140 * 60 + 30 * 60), 17, 20, 20_000, active))
+            .evaluate(&ctx(&snap, t0 + Duration::from_secs(170 * 60), 16, 50, 20_000, active))
             .is_none(), "重置后 30min 不算久坐");
-        // 重置后再满 51min → 再次触发（间隔 60min 已过）
+        // 重置后的会话从「回来观察」那刻（170min）起算，再满 51min → 再次触发
+        // （距上次提醒已远超 60min 间隔）。
         let hit2 = s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(140 * 60 + 51 * 60), 17, 51, 20_000, active))
+            .evaluate(&ctx(&snap, t0 + Duration::from_secs(221 * 60), 17, 41, 20_000, active))
             .expect("重置后的新会话满 50min 应再触发");
         assert_eq!(hit2.kind, "sedentary");
     }
@@ -491,12 +503,17 @@ mod tests {
         let mut s = Suggester::default();
         let snap = Snapshot::default();
         let t0 = Instant::now();
+        // 首次观察建立会话基线（t0）。
+        assert!(s
+            .evaluate(&ctx(&snap, t0, 8, 0, 20_000, Duration::from_secs(30)))
+            .is_none());
         let mut n = 0;
-        for i in 0..10u64 {
+        // 每小时查一次（≥50min 会话 + 60min 提醒间隔都满足），一天内最多 6 次。
+        for i in 1..=10u64 {
             let r = s.evaluate(&ctx(
                 &snap,
-                t0 + Duration::from_secs(60 * 60 * i + 51 * 60),
-                8 + i as u32 % 12,
+                t0 + Duration::from_secs(60 * 60 * i),
+                8 + (i as u32 - 1) % 12,
                 0,
                 20_000,
                 Duration::from_secs(30),

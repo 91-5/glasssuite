@@ -65,6 +65,15 @@ export default function App() {
   // 设置面板（AI 与网络）
   const [showSettings, setShowSettings] = useState(false);
 
+  // 夜间状态表达（OC-20261113-001 P3）：23:00–07:00 岛变暗（proactive 开启时后端下发）。
+  const [nightDim, setNightDim] = useState(false);
+  useEffect(() => {
+    const un = listen<boolean>("night-state", (e) => setNightDim(e.payload?.on === true));
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
+
   const idle = !media;
 
   /**
@@ -156,7 +165,7 @@ export default function App() {
     <div
       className={`island-root ${mode} ${isCollapsed ? "is-collapsed" : ""} ${
         showSettings ? "settings-open" : ""
-      }`}
+      } ${nightDim ? "night-dim" : ""}`}
     >
       <CollapseBall
         collapsed={isCollapsed}

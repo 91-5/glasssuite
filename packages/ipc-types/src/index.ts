@@ -91,8 +91,10 @@ export const EVENTS = {
   notification: "notification",
   /** 歌词行（整曲一次下发，前端按 positionMs 选行）。 */
   lyrics: "lyrics",
-  /** AI / 本地规则产生的一行洞察（默认 AI 关闭时永不触发）。 */
+  /** AI / 本地规则产生的一行洞察（proactive 关闭时永不触发）。 */
   aiInsight: "ai-insight",
+  /** 夜间状态表达（23:00–07:00）：岛变暗、dock 降饱和。payload `{ on: boolean }`。 */
+  nightState: "night-state",
   /** 光标进入/离开岛热区（Rust 侧 LL 钩子判定，非 DOM 事件）。 */
   islandHover: "island-hover",
   /** dock 贴底唤出 / 收起（与岛共用同一个 LL 钩子）。 */
@@ -369,8 +371,13 @@ export interface LyricsState {
 export interface AiInsight {
   kind: string;
   text: string;
-  source: "ai" | "local";
+  source: "ai" | "local" | "rule" | "off";
   at: number;
+}
+
+/** 夜间状态表达（OC-20261113-001 P3）：只在 proactive 开启时由后端翻转下发。 */
+export interface NightState {
+  on: boolean;
 }
 
 /** 取当前歌词快照（前端挂载补齐）。 */
