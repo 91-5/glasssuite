@@ -1,7 +1,7 @@
 {
   "name": "glasssuite",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "GlassSuite — a glass-styled desktop suite for Windows: top island + bottom dock, single process.",
   "engines": {

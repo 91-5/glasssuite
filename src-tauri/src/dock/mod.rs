@@ -426,21 +426,26 @@ unsafe fn com_apps_folder_info(aumid: &str) -> Option<(String, IconData)> {
     Some((name, icon.unwrap_or_else(placeholder_icon)))
 }
 
-/// 出厂默认快捷方式：系统里真实存在的常见程序。
+/// 出厂默认快捷方式（sir 2026-11-12）：控制面板 / 资源管理器 / 设置 三个，
+/// 用户自行添加其余。控制面板走 control.exe（任意 Windows 机器都在），
+/// 设置走 ms-settings: URI（图标由 shell 命名空间解析，本机验证可拿到 32×32）。
 pub fn default_shortcuts() -> Vec<Shortcut> {
-    let candidates: [(&str, &str); 4] = [
-        ("文件资源管理器", r"C:\Windows\explorer.exe"),
-        ("记事本", r"C:\Windows\System32\notepad.exe"),
-        ("命令提示符", r"C:\Windows\System32\cmd.exe"),
-        (
-            "Edge",
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        ),
+    let candidates: [(&str, &str); 3] = [
+        ("控制面板", r"C:\Windows\System32\control.exe"),
+        ("资源管理器", r"C:\Windows\explorer.exe"),
+        ("设置", r"ms-settings:"),
     ];
     candidates
         .iter()
-        .filter(|(_, p)| Path::new(p).exists())
-        .map(|(_, p)| build_shortcut(p))
+        .filter(|(_, p)| {
+            // URI（ms-settings:）无对应文件但必然可启动，始终保留；其余检查存在性
+            p.contains(':') && !Path::new(p).is_absolute() || Path::new(p).exists()
+        })
+        .map(|(name, p)| {
+            let mut s = build_shortcut(p);
+            s.name = name.to_string();
+            s
+        })
         .collect()
 }
 
@@ -1278,5 +1283,23 @@ mod transient_tests {
         // 未超上限时零丢弃
         let (kept, dropped) = cap_transients(vec!["a".into()]);
         assert_eq!((kept.len(), dropped), (1, 0));
+    }
+
+    /// sir 2026-11-12：默认快捷方式 = 控制面板 / 资源管理器 / 设置 三个
+    ///（用户自行添加其余）。锁死顺序与数量，防漂移。
+    #[test]
+    fn default_shortcuts_are_exactly_three() {
+        let s = default_shortcuts();
+        let names: Vec<&str> = s.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["控制面板", "资源管理器", "设置"],
+            "默认快捷方式应为 3 个（名称顺序）：{:?}",
+            names
+        );
+        // 每个都必须有图标（容许 placeholder，但结构必须完整）
+        for x in &s {
+            assert!(x.icon.w > 0 && x.icon.h > 0, "{} 缺图标", x.name);
+        }
     }
 }
