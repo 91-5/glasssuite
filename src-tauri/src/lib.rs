@@ -13,6 +13,7 @@
 //! 3. 创建窗口 → 设为工具窗口 → 摆位 → 显示（dock/startmenu 先隐藏，由各自逻辑显隐）；
 //! 4. 窗口就绪后再启动功能域采样线程（早于窗口订阅会丢首帧事件）。
 
+pub mod cli;
 pub mod dock;
 pub mod island;
 pub mod settings;
@@ -171,7 +172,11 @@ pub fn run() {
             island::weather::spawn(handle.clone(), s.weather.clone());
             island::network::spawn(handle.clone(), network_state);
             island::media::spawn(handle.clone(), st.clone());
-            island::notification::spawn(handle.clone(), s.notifications.clone());
+            // 通知域：默认关（零线程零监听）；总开关热启停经 NotificationState
+            // 由 settings_update 驱动（OC-20261113-001 P2）。
+            let notif_state = Arc::new(island::notification::NotificationState::new());
+            app.manage(Arc::clone(&notif_state));
+            island::notification::spawn(handle.clone(), s.notifications.clone(), notif_state);
             island::ai::spawn(handle.clone(), ai_state, st);
             Ok(())
         })

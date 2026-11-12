@@ -5,7 +5,8 @@
 //!
 //! 事件回调只把结果投递到汇聚通道，不做任何阻塞调用；日志不含应用名与标题。
 
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc::Sender, Arc};
 use std::time::Duration;
 
 use windows::Foundation::TypedEventHandler;
@@ -18,21 +19,21 @@ use windows::UI::Notifications::Management::{
 use super::{now_unix_ms, RawNotification};
 use crate::island::media::await_op;
 
-pub fn spawn(tx: Sender<RawNotification>) -> bool {
+pub fn spawn(tx: Sender<RawNotification>, stop: Arc<AtomicBool>) -> bool {
     std::thread::Builder::new()
         .name("glasssuite-notification-listener".into())
         .spawn(move || {
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             }
-            if run(tx).is_err() {
+            if run(tx, stop).is_err() {
                 winplat::log::log("notifications: listener source unavailable, degraded count=1");
             }
         })
         .is_ok()
 }
 
-fn run(tx: Sender<RawNotification>) -> windows::core::Result<()> {
+fn run(tx: Sender<RawNotification>, stop: Arc<AtomicBool>) -> windows::core::Result<()> {
     let listener = UserNotificationListener::Current()?;
     let mut access = listener.GetAccessStatus()?;
     if access == UserNotificationListenerAccessStatus::Unspecified {
@@ -80,8 +81,13 @@ fn run(tx: Sender<RawNotification>) -> windows::core::Result<()> {
     winplat::log::log("notifications: listener source started count=1");
 
     // 保持 listener 与回调存活；WinRT 事件回调本身在系统线程池上，无需本地轮询。
+    // 热停检查点：≤60s 内退出（非 socket 源，不影响 netstat 判据）。
     loop {
-        std::thread::sleep(Duration::from_secs(60));
+        if stop.load(Ordering::Relaxed) {
+            winplat::log::log("notifications: listener source stopped count=1");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 

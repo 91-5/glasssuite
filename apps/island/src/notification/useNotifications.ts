@@ -18,6 +18,43 @@ export function useNotifications(): NotificationItem | null {
   return item;
 }
 
+/** 通知流的原始缓冲上限（内存显示用，不落盘；渲染时再做同日同源去重）。 */
+const STREAM_CAP = 100;
+
+/**
+ * 展开面板的**通知流**（OC-20261113-001 P2 的 L1 呈现通道）。
+ *
+ * 只在内存里保留最近 STREAM_CAP 条摘要（应用名 + 截断标题 + 时间——后端
+ * 本来就不发正文）；「同日同类只展示最新一条」的归并在渲染侧做，事件层
+ * 保持无损，改展示策略不用回炉后端。
+ */
+export function useNotificationStream(): NotificationItem[] {
+  const [items, setItems] = useState<NotificationItem[]>([]);
+
+  useEffect(
+    () =>
+      subscribe<NotificationItem>(EVENTS.notification, (item) => {
+        setItems((prev) => [item, ...prev].slice(0, STREAM_CAP));
+      }),
+    [],
+  );
+
+  return items;
+}
+
+/** 通知摘要去重：同日（本地日历日）同源只保留最新一条。 */
+export function latestPerDayApp(items: NotificationItem[]): NotificationItem[] {
+  const seen = new Set<string>();
+  const out: NotificationItem[] = [];
+  for (const item of items) {
+    const key = `${new Date(item.arrivedAt).toDateString()}|${item.app}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
 /**
  * 首启一次性隐私提示：用户显式打开通知读取后，第一次启动告知「纯本地，不上报」。
  * 只在 localStorage 里记一个不含任何内容的标记。

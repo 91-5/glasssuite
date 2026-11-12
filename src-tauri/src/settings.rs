@@ -83,11 +83,27 @@ pub struct Settings {
     /// dock 行为。
     #[serde(default)]
     pub dock: DockSettings,
+    /// AI 主动建议总开关（OC-20261113-001 P3）。**默认 false**（硬约束 3：功能默认关）。
+    /// 开启后：日程/久坐/环境规则走本地模板（零外联），LLM 仅在端点配齐时做异步润色。
+    #[serde(default, rename = "proactive")]
+    pub proactive: bool,
+    /// 熬夜关怀（01:00 后持续打字时的一条 insight，一夜一次）。默认 false。
+    #[serde(default, rename = "nightCare")]
+    pub night_care: bool,
+    /// 久坐提醒间隔（分钟）。缺省 = 60（上限一天 6 次，写死在 suggester）。
+    #[serde(default, rename = "sedentaryIntervalMin")]
+    pub sedentary_interval_min: Option<u64>,
 }
 
 /// 配置文件名。放在 `%APPDATA%\com.glasssuite.app\` 下。
 pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join("settings.json")
+}
+
+/// 应用数据目录（`%APPDATA%\com.glasssuite.app`）。无 `APPDATA` 时退回临时目录。
+/// ingest token 等运行时文件也放这里（与 settings.json 同一目录语义）。
+pub fn data_dir() -> PathBuf {
+    config::app_data_dir(winplat::IDENTIFIER).unwrap_or_else(std::env::temp_dir)
 }
 
 /// 读配置；文件不存在时写一份默认模板并返回默认值。
@@ -148,17 +164,24 @@ fn apply(
 /// `ai_reload` 之后只是幂等兜底。async 是刻意的：约束 14 禁止阻塞式系统调用跑在
 /// UI/事件循环线程，文件 I/O 交给 Tauri 的异步命令线程。
 #[tauri::command]
-pub async fn settings_update(
+pub async fn settings_update<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     store: tauri::State<'_, Mutex<Settings>>,
     ai: tauri::State<'_, Arc<crate::island::ai::AiState>>,
     network: tauri::State<'_, Arc<crate::island::network::NetworkState>>,
+    notif: tauri::State<'_, Arc<crate::island::notification::NotificationState>>,
     next: Settings,
 ) -> Result<Settings, String> {
-    let data_dir = config::app_data_dir(winplat::IDENTIFIER).unwrap_or_else(std::env::temp_dir);
-    persist(&data_dir, &next)?;
+    persist(&data_dir(), &next)?;
 
     let configured = apply(&next, &store, &ai, &network);
-    winplat::log::log(&format!("settings: 已保存 ai_configured={configured}"));
+    // 通知域总开关热启停（OC-20261113-001 P2）：开 = 拉起三源 + ingest 监听；
+    // 关 = 全部停止（端口解绑，netstat 零监听）。
+    crate::island::notification::apply_runtime(&app, &notif, &next.notifications);
+    winplat::log::log(&format!(
+        "settings: 已保存 ai_configured={configured} notifications_enabled={}",
+        next.notifications.enabled
+    ));
     Ok(next)
 }
 

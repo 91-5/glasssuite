@@ -10,6 +10,8 @@ import type { SysMetrics, MetricsHistory } from "../../hooks/useSystemMetrics";
 import type { WeatherData } from "../../hooks/useWeather";
 import type { NetworkStatus } from "../../hooks/useNetwork";
 import { currentLyricText, type LyricsState } from "../../hooks/useLyrics";
+import { NotificationStream } from "../../notification/NotificationStream";
+import type { NotificationItem } from "@glasssuite/ipc-types";
 
 export type IslandMode = "collapsed" | "hover" | "expanded";
 
@@ -27,6 +29,7 @@ interface PillProps {
   network: NetworkStatus | null;
   networkHistory: number[];
   lyrics: LyricsState | null;
+  notifications: NotificationItem[];
   onExpand: () => void;
   onControl: (action: string) => void;
   onSeek: (ms: number) => void;
@@ -39,7 +42,7 @@ interface PillProps {
  *
  * sir 2026-10-26: 眼睛→时钟，删AI聊天，修溢出，轮换滚动+长度一致。
  */
-export function Pill({ media, positionMs, mode, tint, idle, metrics, history, weather, musicActive, battery, network, networkHistory, lyrics, onExpand, onControl, onSeek }: PillProps) {
+export function Pill({ media, positionMs, mode, tint, idle, metrics, history, weather, musicActive, battery, network, networkHistory, lyrics, notifications, onExpand, onControl, onSeek }: PillProps) {
   const playing = media?.playing ?? false;
 
   /**
@@ -173,6 +176,9 @@ export function Pill({ media, positionMs, mode, tint, idle, metrics, history, we
           />
           <Weather weather={weather} />
         </div>
+        {/* 通知流（OC-20261113-001 P2）：应用主动上报 + 系统三源的摘要，
+            同日同源只展示最新一条；不做 toast 强推。 */}
+        <NotificationStream items={notifications} />
       </div>
     </div>
   );

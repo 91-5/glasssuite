@@ -1,0 +1,37 @@
+<svg width="1024" height="1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="0.55" stop-color="#4f46e5"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.55" stop-color="#eaf1ff"/>
+      <stop offset="1" stop-color="#c3d6ff"/>
+    </linearGradient>
+    <linearGradient id="dock" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d3e0ff"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.55">
+      <stop offset="0" stop-color="#93c5fd" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#93c5fd" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+  <rect width="1024" height="1024" fill="url(#glow)"/>
+
+  <!-- dock: bottom glass bar with app dots -->
+  <rect x="192" y="692" width="640" height="104" rx="52" fill="url(#dock)"/>
+  <circle cx="352" cy="744" r="16" fill="#6366f1"/>
+  <circle cx="452" cy="744" r="16" fill="#0ea5e9"/>
+  <circle cx="552" cy="744" r="16" fill="#f472b6"/>
+  <circle cx="652" cy="744" r="16" fill="#34d399"/>
+
+  <!-- island: top glowing capsule with status dot -->
+  <rect x="282" y="212" width="460" height="232" rx="116" fill="url(#glass)"/>
+  <circle cx="392" cy="328" r="18" fill="#4f46e5"/>
+  <rect x="440" y="316" width="220" height="24" rx="12" fill="#8ea3e0"/>
+</svg>

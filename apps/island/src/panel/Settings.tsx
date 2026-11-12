@@ -1,12 +1,13 @@
 /**
- * 「AI 与网络」设置表单 —— 面板内的第二视图（OC-20261110-003 D2）。
+ * 「AI 与网络」设置表单 —— 面板内的第二视图（OC-20261110-003 D2 + OC-20261113-001 P2）。
  *
- * 范围刻意收窄：只编辑本卡的字段（AI 端点/密钥/模型/开关、网络探测地址）。
- * 保存时其余配置项从最新 settings **原样透传**——表单永远不成为未展示字段的真相源，
- * 避免「打开表单时配置还没读到 → 保存把天气等清空」这类静默丢配置。
+ * 范围刻意收窄：只编辑表单字段（AI 端点/密钥/模型/开关、网络探测地址、通知同步
+ * 总开关）。保存时其余配置项从最新 settings **原样透传**——表单永远不成为未展示
+ * 字段的真相源，避免「打开表单时配置还没读到 → 保存把天气等清空」这类静默丢配置。
  *
  * 外联语义（红线 B13/12）：端点 + 密钥不配齐，后端零外联；密钥只落本机
  * settings.json，不进日志；env `GLASSSUITE_AI_ENABLED=0` 仍可整体压死 AI。
+ * 通知总开关保存即热启停：关闭 = 三源线程退出 + ingest 端口解绑（零监听）。
  */
 import { useState } from "react";
 import { saveSettings } from "../hooks";
@@ -19,6 +20,7 @@ interface Draft {
   aiApiKey: string | null;
   aiModel: string | null;
   networkProbeUrl: string | null;
+  notificationsEnabled: boolean;
 }
 
 function draftFrom(s: Settings | null): Draft {
@@ -28,6 +30,7 @@ function draftFrom(s: Settings | null): Draft {
     aiApiKey: s?.aiApiKey ?? null,
     aiModel: s?.aiModel ?? null,
     networkProbeUrl: s?.networkProbeUrl ?? null,
+    notificationsEnabled: s?.notifications?.enabled ?? false,
   };
 }
 
@@ -48,14 +51,26 @@ export function SettingsForm({ settings }: { settings: Settings | null }) {
     setStatus(null);
     try {
       const base: Settings = settings ?? {};
-      const { aiConfigured } = await saveSettings({ ...base, ...draft });
+      // notifications 只覆写 enabled，uiaFallback 等未展示字段原样透传。
+      const next: Settings = {
+        ...base,
+        ...draft,
+        notifications: {
+          ...(base.notifications ?? { enabled: false }),
+          enabled: draft.notificationsEnabled,
+        },
+      };
+      const { aiConfigured } = await saveSettings(next);
       const aiState =
         draft.aiEnabled === false
           ? "AI 已关闭"
           : aiConfigured
             ? "AI 已接入"
             : "AI 未配齐（不会外联）";
-      setStatus(`已保存，${aiState}，网络开关即时生效`);
+      const notifState = draft.notificationsEnabled
+        ? "通知同步已开启"
+        : "通知同步已关闭（零监听）";
+      setStatus(`已保存，${aiState}，${notifState}，网络开关即时生效`);
     } catch {
       setStatus("保存失败：写配置文件出错");
     } finally {
@@ -113,6 +128,15 @@ export function SettingsForm({ settings }: { settings: Settings | null }) {
           placeholder="https://example.com"
           onChange={(e) => set({ networkProbeUrl: fromInput(e.target.value) })}
         />
+      </label>
+
+      <label className="panel-check">
+        <input
+          type="checkbox"
+          checked={draft.notificationsEnabled}
+          onChange={(e) => set({ notificationsEnabled: e.target.checked })}
+        />
+        通知同步（本地摘要上岛 + 本机 ingest 端点；关闭即停止全部监听）
       </label>
 
       <div className="panel-actions">

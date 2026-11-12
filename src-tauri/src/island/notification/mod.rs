@@ -15,11 +15,14 @@
 //! - 三条路径在汇聚处去重，避免同一条通知被重复弹。
 
 pub mod db;
+pub mod ingest;
 pub mod listener;
 pub mod uia;
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -36,7 +39,11 @@ const TITLE_CHARS: usize = 60;
 /// 去重窗口：同一来源在 8 秒内报出相同 (app, title) 只算一条。
 const DEDUP_WINDOW: Duration = Duration::from_secs(8);
 
+/// 聚合线程空转检查停机旗的节奏。
+const STOP_POLL: Duration = Duration::from_millis(250);
+
 /// 内部采集结果。**没有 body 字段**——正文从一开始就不进我们的内存。
+/// （ingest 路径的 body 只参与去重哈希，见 `ingest.rs`。）
 #[derive(Clone, Debug)]
 pub struct RawNotification {
     pub app: String,
@@ -81,60 +88,144 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
-/// 启动通知功能域。`enabled=false` 时**完全不启动任何线程**（B3「off 完全无反应」）。
-pub fn spawn(handle: AppHandle, cfg: NotificationConfig) {
-    if !cfg.enabled {
-        winplat::log::log("notifications: 未启用，跳过（纯本地读取，不上报）");
-        return;
+/// 通知域运行时状态：总开关**热启停**（OC-20261113-001 P2）。
+///
+/// 启动时按配置决定是否起线程；`settings_update` 把 `notifications.enabled`
+/// 翻转时，`apply_runtime` 负责启/停：
+/// - 停：`running`/`ingest_shutdown` 置位 → ingest 的 accept 循环退出（TcpListener
+///   drop = 端口解绑，netstat 零监听）、聚合线程退出、采集源在各自下一轮检查点退出；
+/// - 启：重置旗标后整套重新拉起（ingest 换新随机端口、重写 token 文件）。
+///
+/// 两个旗标都包 `Arc`：聚合线程把 `running` 的克隆交给全部采集源观察，
+/// `ingest_shutdown` 则作为 ingest 服务器独立的停机通道（与本结构体无生命周期耦合）。
+#[derive(Debug, Default)]
+pub struct NotificationState {
+    running: Arc<AtomicBool>,
+    pub ingest_shutdown: Arc<AtomicBool>,
+}
+
+impl NotificationState {
+    pub fn new() -> Self {
+        Self::default()
     }
 
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+}
+
+/// 启动通知功能域。`enabled=false` 时**完全不启动任何线程、零监听**（红线 B3）。
+pub fn spawn(handle: AppHandle, cfg: NotificationConfig, state: Arc<NotificationState>) {
+    if !cfg.enabled {
+        winplat::log::log("notifications: 未启用，跳过（零线程、零监听）");
+        return;
+    }
+    start_domain(&handle, &cfg, &state);
+}
+
+/// 总开关热启停入口：`settings_update` 保存后调用，按新配置收敛运行时。
+/// 泛型 R：命令层在 Wry（真机）与 MockRuntime（IPC 测试）两个运行时下都要能调。
+pub fn apply_runtime<R: tauri::Runtime>(
+    handle: &AppHandle<R>,
+    state: &Arc<NotificationState>,
+    cfg: &NotificationConfig,
+) {
+    if cfg.enabled && !state.is_running() {
+        winplat::log::log("notifications: enabled=true，热启动通知域");
+        start_domain(handle, cfg, state);
+    } else if !cfg.enabled && state.is_running() {
+        winplat::log::log("notifications: enabled=false，热停（零监听）");
+        stop_domain(state);
+    }
+}
+
+fn start_domain<R: tauri::Runtime>(
+    handle: &AppHandle<R>,
+    cfg: &NotificationConfig,
+    state: &Arc<NotificationState>,
+) {
+    state.running.store(true, Ordering::Relaxed);
+    state.ingest_shutdown.store(false, Ordering::Relaxed);
+    let st = Arc::clone(state);
+    let handle = handle.clone();
+    let cfg = cfg.clone();
     std::thread::Builder::new()
         .name("glasssuite-notifications".into())
-        .spawn(move || {
-            let (tx, rx) = mpsc::channel::<RawNotification>();
-
-            let db_started = db::spawn(tx.clone());
-            let listener_started = listener::spawn(tx.clone());
-            let uia_started = uia::spawn(tx, cfg.uia_fallback);
-            // 只记「启用了哪几类事件源 + 数量」，不记任何内容。
-            winplat::log::log(&format!(
-                "notifications: sources started count={}",
-                [db_started, listener_started, uia_started]
-                    .iter()
-                    .filter(|b| **b)
-                    .count()
-            ));
-
-            let mut recent: VecDeque<(Instant, String)> = VecDeque::new();
-            let mut keys = HashSet::<String>::new();
-
-            while let Ok(item) = rx.recv() {
-                let now = Instant::now();
-                while let Some((t, _)) = recent.front() {
-                    if now.duration_since(*t) >= DEDUP_WINDOW {
-                        if let Some((_, k)) = recent.pop_front() {
-                            keys.remove(&k);
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                let key = format!("{}|{}", item.app, item.title);
-                if !keys.insert(key.clone()) {
-                    continue; // 三路重复上报
-                }
-                recent.push_back((now, key));
-
-                let source = item.source;
-                let summary: NotificationSummary = item.into();
-                let _ = handle.emit(EVENT, summary);
-                // 日志：事件类型 + 数量，无正文、无应用名。
-                winplat::log::log(&format!("notifications: delivered source={source} count=1"));
-            }
-        })
+        .spawn(move || run_aggregator(handle, cfg, st))
         .expect("spawn notification aggregator");
 }
+
+fn stop_domain(state: &Arc<NotificationState>) {
+    state.running.store(false, Ordering::Relaxed);
+    state.ingest_shutdown.store(true, Ordering::Relaxed);
+}
+
+fn run_aggregator<R: tauri::Runtime>(
+    handle: AppHandle<R>,
+    cfg: NotificationConfig,
+    state: Arc<NotificationState>,
+) {
+    let (tx, rx) = mpsc::channel::<RawNotification>();
+
+    // 采集源直接观察 running 旗：热停时各自在下一个检查点退出。
+    let source_stop = Arc::clone(&state.running);
+    let db_started = db::spawn(tx.clone(), Arc::clone(&source_stop));
+    let listener_started = listener::spawn(tx.clone(), Arc::clone(&source_stop));
+    let uia_started = uia::spawn(tx.clone(), cfg.uia_fallback, source_stop);
+    let ingest = ingest::spawn(tx);
+    // 只记「启用了哪几类事件源 + 数量」，不记任何内容。
+    winplat::log::log(&format!(
+        "notifications: sources started count={} ingest={}",
+        [db_started, listener_started, uia_started]
+            .iter()
+            .filter(|b| **b)
+            .count(),
+        ingest.is_some()
+    ));
+
+    let mut recent: VecDeque<(Instant, String)> = VecDeque::new();
+    let mut keys = HashSet::<String>::new();
+
+    loop {
+        if !state.is_running() {
+            break; // 热停：sources 随各自的检查点退出，ingest 端口即刻解绑
+        }
+        let item = match rx.recv_timeout(STOP_POLL) {
+            Ok(item) => item,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        let now = Instant::now();
+        while let Some((t, _)) = recent.front() {
+            if now.duration_since(*t) >= DEDUP_WINDOW {
+                if let Some((_, k)) = recent.pop_front() {
+                    keys.remove(&k);
+                }
+            } else {
+                break;
+            }
+        }
+
+        let key = format!("{}|{}", item.app, item.title);
+        if !keys.insert(key.clone()) {
+            continue; // 多路重复上报
+        }
+        recent.push_back((now, key));
+
+        let source = item.source;
+        let summary: NotificationSummary = item.into();
+        let _ = handle.emit(EVENT, summary);
+        // 日志：事件类型 + 数量，无正文、无应用名。
+        winplat::log::log(&format!("notifications: delivered source={source} count=1"));
+    }
+    // ingest 服务器随聚合线程一起停（端口解绑 + token 文件删除）。
+    state.ingest_shutdown.store(true, Ordering::Relaxed);
+}
+
+// 采集源在各自轮询/检查点观察 `running` 旗（`Arc<AtomicBool>`）：热停后
+// db ≤2s、uia ≤数秒、listener ≤60s 内退出；ingest 的 TcpListener 立即解绑。
+// 四个源都不是长驻 socket，netstat 判据只落在 ingest 上。
 
 #[cfg(test)]
 mod tests {
@@ -173,5 +264,21 @@ mod tests {
     #[test]
     fn truncate_keeps_short_text_intact() {
         assert_eq!(truncate("短标题", TITLE_CHARS), "短标题");
+    }
+
+    /// 热启停状态机：默认未运行；start/stop 旗标翻转一致（B3 的命令层语义）。
+    #[test]
+    fn notification_state_hot_toggle_flags() {
+        let st = Arc::new(NotificationState::new());
+        assert!(!st.is_running(), "默认零线程零监听");
+        st.running.store(true, Ordering::Relaxed);
+        st.ingest_shutdown.store(false, Ordering::Relaxed);
+        assert!(st.is_running());
+        stop_domain(&st);
+        assert!(!st.is_running());
+        assert!(
+            st.ingest_shutdown.load(Ordering::Relaxed),
+            "停机必须同时停 ingest"
+        );
     }
 }

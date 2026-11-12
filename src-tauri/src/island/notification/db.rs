@@ -19,8 +19,9 @@
 //! 绝不阻塞 UI / 事件循环。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -126,7 +127,7 @@ struct Mark {
     id: i64,
 }
 
-pub fn spawn(tx: Sender<RawNotification>) -> bool {
+pub fn spawn(tx: Sender<RawNotification>, stop: Arc<AtomicBool>) -> bool {
     let Some(dir) = db_dir() else {
         winplat::log::log("notifications: db source unavailable (no LOCALAPPDATA)");
         return false;
@@ -148,7 +149,13 @@ pub fn spawn(tx: Sender<RawNotification>) -> bool {
             winplat::log::log("notifications: db source started count=1");
 
             loop {
+                if stop.load(Ordering::Relaxed) {
+                    break; // 总开关热停（OC-20261113-001 P2）
+                }
                 std::thread::sleep(POLL);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 let current_wal = wal_stamp(&dir);
                 if current_wal == known_wal {
                     continue; // 无变化：零 I/O
@@ -158,6 +165,7 @@ pub fn spawn(tx: Sender<RawNotification>) -> bool {
                     mark = next;
                 }
             }
+            winplat::log::log("notifications: db source stopped count=1");
         })
         .is_ok()
 }

@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { DragSession, makeWayOffsets, offsetToTransform } from "./dragOrder";
 
 interface IconData {
   w: number;
@@ -17,13 +18,6 @@ interface Shortcut {
   mode?: "dock" | "free";
   /** 游离模式下的窗口矩形（物理像素虚拟桌面坐标） */
   free_rect?: { x: number; y: number; w: number; h: number } | null;
-}
-
-/** 拖出阈值（Rust 侧统一给出，前端不自带另一份口径） */
-interface Thresholds {
-  min_px: number;
-  min_ms: number;
-  max_free: number;
 }
 
 /** v0.8：未固定的运行中应用（dock 行临时图标） */
@@ -65,8 +59,6 @@ function App() {
   // v0.8：运行中但未固定的应用（临时图标，固定右侧、RunDot 常亮）
   const [transients, setTransients] = useState<TransientApp[]>([]);
   const pillRef = useRef<HTMLDivElement>(null);
-  // 拖出阈值（卡面 §1.3-4：位移 ≥32px 且持续 ≥80ms）——口径只在 Rust 定义一处。
-  const [thr, setThr] = useState<Thresholds>({ min_px: 32, min_ms: 80, max_free: 30 });
   // 提示条（例：游离图标达上限被拒 —— 不许静默失败）
   const [notice, setNotice] = useState<string | null>(null);
   // 任务 B：悬停预览。300ms 定时（卡面：悬停 300~500ms 弹出），
@@ -95,13 +87,6 @@ function App() {
     invoke<Shortcut[]>("list_shortcuts")
       .then(setIcons)
       .catch((e) => console.error("list_shortcuts failed", e));
-  }, []);
-
-  // 拖出阈值：向 Rust 取（唯一口径来源）
-  useEffect(() => {
-    invoke<Thresholds>("drag_thresholds")
-      .then(setThr)
-      .catch(() => {});
   }, []);
 
   // 配置版本轮询：dock.json 被改过（拖出/拖回/外部改配置）就重拉列表。
@@ -310,39 +295,64 @@ function App() {
     }
   };
 
-  // v0.5.1（sir 反馈）：dock 图标拖动排序——**提起-跟随-放下**（Windows 桌面式）。
-  // 演进：live-swap（边拖边换位）三轮真机调试存在不可消除的振荡/「选中被抢」观感
-  // （menu.log 实测 3↔4 反复换位），改为：拖起 = 图标变浮动幽灵跟光标走
-  // （原位留空槽，其他图标全程不动——无中途换位，振荡/被抢/弹回整类问题不存在），
-  // 松手 = 按落点一次性换位 + 持久化。
-  // 槽位几何 = dock.css 常量（base=15：dock padding 4 + pill border 1 +
-  // pill padding 10；pitch=50：icon 44 + gap 6）。⚠ 勿用 offsetLeft 测量：本机
-  // WebView2 拖拽中途取值不可信（实测 x=237 命中槽 0），改间距须同步探针公式。
+  // v0.5.1：dock 图标拖动排序——提起-跟随-放下（Windows 桌面式）。
+  // OC-20261113-001 P1「实时化」改版：旧实现拖动期间其他图标不动、松手才按
+  // 写死 base=15/pitch=50 的公式一次性 splice——图标改 52px 后公式早已失准，
+  // 落点错就弹回，用户只能反复试。现改为：
+  //   ① pointerdown 一次性快照全部槽位中心（此刻无任何 transform，自然位）；
+  //   ② 拖动中被跨过的图标立即 translateX(±1 槽) 让位（等宽图标 = 纯算术，
+  //     不做每帧 DOM 重排、不需要 FLIP）；
+  //   ③ 落点 = 快照中心线性扫描 + 0.25×槽距 滞回死区（抖动整类消失）；
+  //   ④ pointer capture 打在**容器**上（让位移动的是图标本身，capture 打在
+  //     图标上会在重排时跟丢）；松手用滞回槽位直接落，无弹回重试。
+  // 决策核心全部在 ./dragOrder（纯函数，走查脚本可脱离 WebView 驱动同一份逻辑）。
   const dragRef = useRef<{
     index: number;
     startX: number;
     startY: number;
-    startT: number; // 按下时刻（拖出判定用：持续 ≥80ms）
+    startT: number;
     lastX: number; // 最近一次指针位置（拖出落点用）
     lastY: number;
     active: boolean;
-    out: boolean; // 已判定「拖出」（越出 dock 行 + 位移 + 时长三者同时满足）
+    out: boolean; // 已判定「拖出」（脱离区：垂直 >48px + 驻留 ≥200ms + 方向向外）
     pid: number;
     offset: number; // 按下点相对被拖图标左缘的偏移（幽灵跟随用）
     top: number; // 按下时图标上缘（幽灵 y）
+    iconW: number; // 图标宽（幽灵中心 = clientX - offset + iconW/2）
+    session: DragSession | null; // pointerdown 快照 + 滞回状态机
+    beyondSince: number | null; // 进入脱离区 (>48px) 的时刻（驻留判定）
+    lastDistY: number; // 上一帧的行外垂直距离（「方向向外」判定）
   } | null>(null);
-  const suppressClick = useRef(false);
-  const iconsLenRef = useRef(0);
+  // 拖动结束后的短暂点击抑制：capture 在容器上时，松手那次 click 不会落到
+  // 图标上（老内核无 capture 的兼容路径仍会落到）——改用时间窗双兼容。
+  const suppressClickUntil = useRef(0);
   const [dragIndex, setDragIndex] = useState(-1);
   const [dragGhost, setDragGhost] = useState<{ x: number; y: number } | null>(null);
+  // 当前让位态：drop = 滞回后的插入位（others 语义），pitch = 快照槽距。
+  // null = 没有让位（未起拖 / 已拖出 / 已松手）。
+  const [makeWay, setMakeWay] = useState<{ drop: number; pitch: number } | null>(null);
   // dock 行可见条目（游离图标不在行内）
   const dockIcons = useMemo(
     () => icons.filter((s) => (s.mode ?? "dock") === "dock"),
     [icons]
   );
-  useEffect(() => {
-    iconsLenRef.current = dockIcons.length;
-  }, [dockIcons]);
+
+  /** pointerdown 快照：剥掉可能残留的 FLIP inline transform 后量自然位中心。 */
+  const snapshotCenters = (): number[] => {
+    const out: number[] = [];
+    for (const sc of dockIcons) {
+      const el = rowRefs.current.get(sc.id);
+      if (!el) continue;
+      if (el.style.transform) {
+        el.style.transition = "none";
+        el.style.transform = "";
+        void el.offsetWidth;
+      }
+      const r = el.getBoundingClientRect();
+      out.push(r.left + r.width / 2);
+    }
+    return out;
+  };
 
   const iconDown = (i: number) => (e: React.PointerEvent<HTMLButtonElement>) => {
     if (e.button !== 0) return;
@@ -363,13 +373,22 @@ function App() {
       pid: e.pointerId,
       offset: e.clientX - r.left,
       top: r.top,
+      iconW: r.width,
+      session: new DragSession(snapshotCenters(), i),
+      beyondSince: null,
+      lastDistY: 0,
     };
     try {
-      e.currentTarget.setPointerCapture(e.pointerId);
+      // capture 打在容器：让位时图标自己在动，capture 在图标上会跟丢。
+      pillRef.current?.setPointerCapture(e.pointerId);
     } catch {
       /* 老内核无 capture 也不至于崩 */
     }
   };
+
+  /** 脱离区判定（卡面 P1 三区）：垂直出界 >48px、驻留 ≥200ms、方向向外。 */
+  const DETACH_DIST = 48;
+  const DETACH_DWELL_MS = 200;
 
   const iconMove = (clientX: number, clientY: number, pointerId?: number) => {
     const d = dragRef.current;
@@ -378,59 +397,77 @@ function App() {
     d.lastX = clientX;
     d.lastY = clientY;
     const dx = clientX - d.startX;
-    const dy = clientY - d.startY;
     if (!d.active) {
       if (Math.abs(dx) < 6) return;
       d.active = true;
       setDragIndex(d.index);
+      setMakeWay({ drop: d.index, pitch: d.session?.slotPitch() ?? 0 });
       invoke("debug_note", { msg: `active idx=${d.index} x=${Math.round(clientX)}` }).catch(() => {});
     }
-    // v0.7 Phase 1：越出 dock 行（药丸）→ 转「拖出意图」。
-    // 判定口径（卡面 §1.3-4，阈值由 Rust 统一给出）：越界 **且** 位移 ≥32px
-    // **且** 按住 ≥80ms；否则仍是行内排序（行内排序已实现，不推倒重来）。
+
+    // 三区判定：重排区/灰区（clamp 不脱离）只在行内让位；只有「垂直出界
+    // >48px 且驻留 ≥200ms 且没有在往回走」才转拖出意图。
     if (!d.out) {
       const row = pillRef.current?.getBoundingClientRect();
-      const outside =
-        !!row &&
-        (clientX < row.left - 8 ||
-          clientX > row.right + 8 ||
-          clientY < row.top - 8 ||
-          clientY > row.bottom + 8);
-      const elapsed = Date.now() - d.startT;
-      if (
-        outside &&
-        Math.hypot(dx, dy) >= thr.min_px &&
-        elapsed >= thr.min_ms
-      ) {
-        d.out = true;
-        setDragGhost(null); // 图标「离开」dock 行（幽灵不再跟随）
+      if (row) {
+        const dy =
+          clientY < row.top
+            ? row.top - clientY
+            : clientY > row.bottom
+              ? clientY - row.bottom
+              : 0;
+        const now = Date.now();
+        if (dy > DETACH_DIST) {
+          const outward = dy >= d.lastDistY - 1; // 没有明显在往回走
+          if (d.beyondSince === null) d.beyondSince = now;
+          if (outward && now - d.beyondSince >= DETACH_DWELL_MS) {
+            d.out = true;
+            setMakeWay(null); // 图标「离开」dock 行：让位复位，幽灵消失
+            setDragGhost(null);
+            invoke("debug_note", { msg: `detach dy=${Math.round(dy)}` }).catch(() => {});
+          }
+        } else {
+          d.beyondSince = null; // 回到行附近：重新计驻留
+        }
+        d.lastDistY = dy;
       }
     }
+
     if (!d.out) {
       // 幽灵跟随（唯一视觉；y 固定为按下时图标上缘）
       setDragGhost({ x: clientX - d.offset, y: d.top });
+      // 让位 + 滞回：被跨过的图标立即平移，落点在死区内不抖。
+      const s = d.session;
+      if (s) {
+        const ghostCenterX = clientX - d.offset + d.iconW / 2;
+        const prev = s.current;
+        const cur = s.update(ghostCenterX);
+        if (cur !== prev) {
+          setMakeWay({ drop: cur, pitch: s.slotPitch() });
+          invoke("debug_note", { msg: `make-way ${prev}->${cur}` }).catch(() => {});
+        }
+      }
     }
   };
 
-  const iconUp = (pointerId?: number, currentTarget?: HTMLElement) => {
+  const iconUp = (pointerId?: number) => {
     const d = dragRef.current;
     if (!d) return;
     if (pointerId !== undefined && pointerId !== d.pid) return;
     dragRef.current = null;
     draggingRef.current = false; // 拖动结束，恢复版本轮询校准
-    if (currentTarget) {
-      try {
-        currentTarget.releasePointerCapture(d.pid);
-      } catch {
-        /* 已释放 */
-      }
+    try {
+      pillRef.current?.releasePointerCapture(d.pid);
+    } catch {
+      /* 已释放 */
     }
+    setMakeWay(null);
     if (!d.active) {
       setDragIndex(-1);
       setDragGhost(null);
       return;
     }
-    suppressClick.current = true;
+    suppressClickUntil.current = Date.now() + 400;
     setDragIndex(-1);
     setDragGhost(null);
     // v0.7：拖出成游离图标（落点 = 松手位置；Rust 换算成物理像素虚拟桌面坐标）
@@ -449,15 +486,14 @@ function App() {
         });
       return;
     }
-    // 落点槽位：幽灵中心 → 最近槽（clamp 到两端）
-    const base = 15;
-    const pitch = 50;
-    const drop = Math.max(
-      0,
-      Math.min(iconsLenRef.current - 1, Math.round(((dragGhost?.x ?? base) - base) / pitch))
-    );
+    // 落点 = 滞回状态机当前的插入位（others 语义），不再从幽灵坐标反推——
+    // 快照中心扫描对 DPI/图标尺寸/间距变化天然免疫，也没有 Math.round 边界抖动。
+    const drop = d.session?.drop ?? d.index;
     invoke("debug_note", { msg: `drop from=${d.index} to=${drop}` }).catch(() => {});
     if (drop !== d.index) {
+      // 让位已把图标画到了最终位置：这次重排是「确认」，FLIP 不再播动画
+      // （清掉基线，下一次 layout effect 只重新计量）。
+      lastLeft.current.clear();
       setIcons((prev) => {
         // 只重排 **dock 行内**的条目：d.index/drop 都是行内下标，
         // 而 prev 含游离条目（不在行内）——直接对 prev 操作会串位。
@@ -522,6 +558,10 @@ function App() {
   // 修复：测量前先剥掉 inline transform——记录的永远是「自然位」，环路切断；
   // 另：全体图标同向同幅的平移是窗口几何变化（不是行内补位），不播动画。
   useLayoutEffect(() => {
+    // P1：拖动期间让位 transform 由 DragSession 独占——FLIP 若在此期间剥 transform /
+    // 记基线，会把让位中间态当成「自然位」，松手后算出反号 dx 再播一遍（打架）。
+    // 整段跳过；松手时 iconUp 已清空 lastLeft 基线，下一轮只重新计量、不播动画。
+    if (draggingRef.current) return;
     invoke("debug_note", { msg: `FLIP tick render=${flipsRef.current++}` }).catch(() => {});
     const cur = new Map<string, number>();
     rowRefs.current.forEach((el, id) => {
@@ -566,9 +606,18 @@ function App() {
     }
   });
 
+  // P1：让位偏移（拖动中逐图标 translateX）；松手/未拖动时为 null。
+  const wayOffsets =
+    dragIndex >= 0 && makeWay
+      ? makeWayOffsets(dragIndex, makeWay.drop, dockIcons.length)
+      : null;
+
   return (
     <div className="dock">
-      <div className="dock-icons" ref={pillRef}>
+      <div
+        className={`dock-icons${dragIndex >= 0 ? " is-dragging" : ""}`}
+        ref={pillRef}
+      >
         {/* 任务 C：开始菜单入口（⊞），点击 toggle 玻璃面板 */}
         <button
           className="dock-icon dock-start"
@@ -579,6 +628,8 @@ function App() {
         </button>
         {dockIcons.map((sc, i) => {
           const lifted = dragIndex === i && dragGhost != null;
+          const way =
+            wayOffsets && !lifted ? offsetToTransform(wayOffsets[i], makeWay!.pitch) : undefined;
           return (
             <button
               key={sc.id}
@@ -589,19 +640,19 @@ function App() {
               }}
               className={`dock-icon${lifted ? " dock-icon-lift" : ""}`}
               title={sc.name}
-              style={lifted ? { visibility: "hidden" } : undefined}
+              style={
+                lifted ? { visibility: "hidden" } : way ? { transform: way } : undefined
+              }
               onPointerDown={iconDown(i)}
               onPointerMove={(e) => iconMove(e.clientX, e.clientY, e.pointerId)}
-              onPointerUp={(e) => iconUp(e.pointerId, e.currentTarget)}
-              onPointerCancel={(e) => iconUp(e.pointerId, e.currentTarget)}
+              onPointerUp={(e) => iconUp(e.pointerId)}
+              onPointerCancel={(e) => iconUp(e.pointerId)}
               onMouseEnter={enterIcon(sc)}
               onMouseLeave={leaveIcon}
               onClick={() => {
-                // 拖动结束的那次 click 不触发启动
-                if (suppressClick.current) {
-                  suppressClick.current = false;
-                  return;
-                }
+                // 拖动结束后的短暂时间窗内不触发启动（capture 在容器上时
+                // 松手 click 通常落在容器，这里主要防老内核兼容路径误触）
+                if (Date.now() < suppressClickUntil.current) return;
                 launch(sc.path);
               }}
               onContextMenu={(e) => {

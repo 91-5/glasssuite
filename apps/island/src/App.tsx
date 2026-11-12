@@ -12,7 +12,7 @@ import { useLyrics } from "./hooks/useLyrics";
 import { useInsight } from "./hooks/useInsight";
 import { SettingsForm } from "./panel/Settings";
 import { useSettings } from "./hooks";
-import { usePrivacyNotice } from "./notification/useNotifications";
+import { useNotificationStream, usePrivacyNotice } from "./notification/useNotifications";
 
 /**
  * 灵动岛主组件（形态与交互移植自 glasspill v0.2.x，视觉零改动）。
@@ -42,6 +42,7 @@ export default function App() {
   const { status: network, history: networkHistory } = useNetwork();
   const lyrics = useLyrics();
   const insight = useInsight();
+  const notifications = useNotificationStream();
   const settings = useSettings();
   // 首启一次性隐私提示：开启「系统通知摘要」时明示只本地读取、不上报
   // （002 D2 的合规项；只在首次显示，之后 localStorage 记住）。
@@ -178,6 +179,7 @@ export default function App() {
           network={network}
           networkHistory={networkHistory}
           lyrics={lyrics}
+          notifications={notifications}
           onExpand={() => setMode("expanded")}
           onControl={onControl}
           onSeek={onSeek}

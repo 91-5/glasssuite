@@ -444,3 +444,14 @@ body,
 .dock-icons [data-drag] {
   will-change: transform;
 }
+
+/* ── P1 拖拽实时化（OC-20261113-001）：拖动期间压掉 hover 位移/过渡 ──
+   让位 transform 由 DragSession 的 inline style 独占；:hover 的 translateY(-2px)
+   若仍生效，会让快照外的视觉位移参与进来（且 transition 会拖慢让位响应）。 */
+.dock-icons.is-dragging .dock-icon {
+  transition: none;
+}
+.dock-icons.is-dragging .dock-icon:hover {
+  transform: none;
+  background: rgba(255, 255, 255, 0.2);
+}

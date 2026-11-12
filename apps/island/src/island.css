@@ -605,3 +605,60 @@
   pointer-events: none;
   animation: settings-in 0.26s cubic-bezier(0.32, 0.72, 0.24, 1);
 }
+
+/* ── 通知流（OC-20261113-001 P2，展开面板内的一节）──────────────────────── */
+
+.notif-stream {
+  margin-top: 4px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.07);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+}
+
+.notif-stream-head {
+  font-size: 11px;
+  opacity: 0.6;
+}
+
+.notif-empty {
+  font-size: 11px;
+  opacity: 0.45;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notif-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  min-width: 0;
+}
+
+.notif-app {
+  flex: 0 0 auto;
+  max-width: 30%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.6;
+}
+
+.notif-title {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notif-time {
+  flex: 0 0 auto;
+  font-size: 10px;
+  opacity: 0.5;
+  font-variant-numeric: tabular-nums;
+}

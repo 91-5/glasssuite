@@ -77,6 +77,7 @@ impl Drop for AppDataGuard {
 fn build_app(initial: &Settings) -> tauri::App<MockRuntime> {
     let ai_state = Arc::new(ai::AiState::new(AiConfig::load(initial)));
     let network = Arc::new(NetworkState::new(initial.network_probe_url.clone()));
+    let notif = Arc::new(glasssuite::island::notification::NotificationState::new());
     let store = Mutex::new(initial.clone());
 
     mock_builder()
@@ -88,6 +89,7 @@ fn build_app(initial: &Settings) -> tauri::App<MockRuntime> {
         .manage(store)
         .manage(ai_state)
         .manage(network)
+        .manage(notif)
         .build(mock_context(noop_assets()))
         .expect("failed to build mock app")
 }
