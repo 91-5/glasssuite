@@ -40,13 +40,6 @@ const DEDUP_TTL: Duration = Duration::from_secs(90);
 /// 去重容量（LRU 上限，卡面 512）。
 const DEDUP_CAP: usize = 512;
 
-/// ingest 服务器句柄：调用方持有 shutdown 旗，置位后下一轮循环退出。
-#[derive(Debug)]
-pub struct IngestHandle {
-    pub port: u16,
-    pub shutdown: Arc<AtomicBool>,
-}
-
 /// 客户端上报载荷。**没有 body 字段会流入通知数据结构**——body 在 `into_raw`
 /// 之前只以哈希形式存在。
 #[derive(serde::Deserialize)]
@@ -140,8 +133,10 @@ impl DedupLru {
     }
 }
 
-/// 启动 ingest 服务器。失败返回 None（不阻断其他通知源）。
-pub fn spawn(tx: Sender<RawNotification>) -> Option<IngestHandle> {
+/// 启动 ingest 服务器。`shutdown` 由调用方持有（`NotificationState.ingest_shutdown`）：
+/// **同一把旗**，热停置位后 accept 循环退出、TcpListener drop、端口解绑。
+/// 失败返回 None（不阻断其他通知源）。
+pub fn spawn(tx: Sender<RawNotification>, shutdown: Arc<AtomicBool>) -> Option<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
     let port = listener.local_addr().ok()?.port();
     let token = make_token(port);
@@ -150,7 +145,6 @@ pub fn spawn(tx: Sender<RawNotification>) -> Option<IngestHandle> {
         "notifications: ingest listening count=1 port={port}"
     ));
 
-    let shutdown = Arc::new(AtomicBool::new(false));
     let sd = Arc::clone(&shutdown);
     std::thread::Builder::new()
         .name("glasssuite-ingest".into())
@@ -174,7 +168,7 @@ pub fn spawn(tx: Sender<RawNotification>) -> Option<IngestHandle> {
         })
         .ok()?;
 
-    Some(IngestHandle { port, shutdown })
+    Some(port)
 }
 
 fn write_endpoint(port: u16, token: &str) {
@@ -358,16 +352,19 @@ mod tests {
     }
 
     /// 端到端：起服务器 → 带 token POST → 聚合通道收到；关停 → 端口拒绝连接。
+    /// shutdown 旗由调用方传入（与 NotificationState.ingest_shutdown 同一把，
+    /// 回归测试：热停必须解绑真实监听端口）。
     /// （B3/B4 的进程级等价证据；CLI 与真实 UI 走查见交付报告。）
     #[test]
     fn ingest_end_to_end_and_shutdown_unbinds_port() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let handle = spawn(tx).expect("ingest 服务器应能启动");
-        let token = read_token(handle.port).expect("endpoint 文件应可读");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let port = spawn(tx, Arc::clone(&shutdown)).expect("ingest 服务器应能启动");
+        let token = read_token(port).expect("endpoint 文件应可读");
 
         // B4：同一内容连发 3 次 → 通道里只有 1 条
         for _ in 0..3 {
-            let st = post_ingest(handle.port, &token, "opencode", "工作完成", "任务 A");
+            let st = post_ingest(port, &token, "opencode", "工作完成", "任务 A");
             assert_eq!(st, 200);
         }
         let first = rx.recv_timeout(Duration::from_secs(2)).expect("应有 1 条");
@@ -381,20 +378,20 @@ mod tests {
 
         // 不同内容 → 再进一条
         assert_eq!(
-            post_ingest(handle.port, &token, "opencode", "构建结束", "exit 0"),
+            post_ingest(port, &token, "opencode", "构建结束", "exit 0"),
             200
         );
         assert!(rx.recv_timeout(Duration::from_secs(2)).is_ok());
 
         // 错 token → 401
-        assert_eq!(post_ingest(handle.port, "bad-token", "x", "y", ""), 401);
+        assert_eq!(post_ingest(port, "bad-token", "x", "y", ""), 401);
 
         // 关停 → 端口解绑（netstat 判据的进程级等价：connect 被拒绝）
-        handle.shutdown.store(true, Ordering::Relaxed);
+        shutdown.store(true, Ordering::Relaxed);
         // 等 accept 循环退出（≤ 一轮 150ms 轮询 + 余量）
         std::thread::sleep(Duration::from_millis(500));
         assert!(
-            std::net::TcpStream::connect(("127.0.0.1", handle.port)).is_err(),
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
             "关停后端口必须拒绝连接（零监听）"
         );
     }

@@ -172,7 +172,9 @@ fn run_aggregator<R: tauri::Runtime>(
     let db_started = db::spawn(tx.clone(), Arc::clone(&source_stop));
     let listener_started = listener::spawn(tx.clone(), Arc::clone(&source_stop));
     let uia_started = uia::spawn(tx.clone(), cfg.uia_fallback, source_stop);
-    let ingest = ingest::spawn(tx);
+    // ingest 的停机旗 = NotificationState.ingest_shutdown 本体（同一把 Arc）：
+    // 热停置位后 accept 循环退出、TcpListener drop、端口即刻解绑。
+    let ingest = ingest::spawn(tx, Arc::clone(&state.ingest_shutdown));
     // 只记「启用了哪几类事件源 + 数量」，不记任何内容。
     winplat::log::log(&format!(
         "notifications: sources started count={} ingest={}",

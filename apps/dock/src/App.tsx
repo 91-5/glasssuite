@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { DragSession, makeWayOffsets, offsetToTransform } from "./dragOrder";
 
 interface IconData {
@@ -328,6 +329,14 @@ function App() {
   const suppressClickUntil = useRef(0);
   const [dragIndex, setDragIndex] = useState(-1);
   const [dragGhost, setDragGhost] = useState<{ x: number; y: number } | null>(null);
+  // 夜间状态表达（OC-20261113-001 P3）：23:00–07:00 dock 降饱和（后端下发）。
+  const [nightDim, setNightDim] = useState(false);
+  useEffect(() => {
+    const un = listen<{ on: boolean }>("night-state", (e) => setNightDim(e.payload?.on === true));
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
   // 当前让位态：drop = 滞回后的插入位（others 语义），pitch = 快照槽距。
   // null = 没有让位（未起拖 / 已拖出 / 已松手）。
   const [makeWay, setMakeWay] = useState<{ drop: number; pitch: number } | null>(null);
@@ -613,7 +622,7 @@ function App() {
       : null;
 
   return (
-    <div className="dock">
+    <div className={`dock${nightDim ? " night-dim" : ""}`}>
       <div
         className={`dock-icons${dragIndex >= 0 ? " is-dragging" : ""}`}
         ref={pillRef}

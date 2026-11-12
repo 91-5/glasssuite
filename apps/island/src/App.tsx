@@ -68,7 +68,7 @@ export default function App() {
   // 夜间状态表达（OC-20261113-001 P3）：23:00–07:00 岛变暗（proactive 开启时后端下发）。
   const [nightDim, setNightDim] = useState(false);
   useEffect(() => {
-    const un = listen<boolean>("night-state", (e) => setNightDim(e.payload?.on === true));
+    const un = listen<{ on: boolean }>("night-state", (e) => setNightDim(e.payload?.on === true));
     return () => {
       un.then((f) => f());
     };

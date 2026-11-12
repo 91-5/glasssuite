@@ -281,9 +281,7 @@ impl Suggester {
         if ctx.input.idle > INPUT_AWAY || ctx.media_playing {
             return None;
         }
-        let Some(since) = self.session_since else {
-            return None;
-        };
+        let since = self.session_since?;
         let elapsed = ctx.now.duration_since(since);
         if elapsed < SEDENTARY_SESSION {
             return None;
@@ -409,8 +407,12 @@ mod tests {
             charging: true,
             ..Default::default()
         };
-        assert!(s.evaluate(&ctx(&low, t0, 14, 0, 20_000, Duration::ZERO)).is_some());
-        assert!(s.evaluate(&ctx(&mem, t0, 14, 0, 20_000, Duration::ZERO)).is_none());
+        assert!(s
+            .evaluate(&ctx(&low, t0, 14, 0, 20_000, Duration::ZERO))
+            .is_some());
+        assert!(s
+            .evaluate(&ctx(&mem, t0, 14, 0, 20_000, Duration::ZERO))
+            .is_none());
     }
 
     // ---- B5：午饭窗口一天一次 -----------------------------------------------
@@ -426,20 +428,48 @@ mod tests {
             .is_none());
         // 预生成窗（11:16）不触发（触发在 11:20 之后）
         assert!(s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(6 * 60), 11, 16, 20_000, Duration::ZERO))
+            .evaluate(&ctx(
+                &snap,
+                t0 + Duration::from_secs(6 * 60),
+                11,
+                16,
+                20_000,
+                Duration::ZERO
+            ))
             .is_none());
         // 触发窗（11:21）触发一次
         let hit = s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(7 * 60), 11, 21, 20_000, Duration::ZERO))
+            .evaluate(&ctx(
+                &snap,
+                t0 + Duration::from_secs(7 * 60),
+                11,
+                21,
+                20_000,
+                Duration::ZERO,
+            ))
             .expect("触发窗应给午饭建议");
         assert_eq!(hit.kind, "lunch");
         // 同窗口内第二次（11:25）不再触发
         assert!(s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(11 * 60), 11, 25, 20_000, Duration::ZERO))
+            .evaluate(&ctx(
+                &snap,
+                t0 + Duration::from_secs(11 * 60),
+                11,
+                25,
+                20_000,
+                Duration::ZERO
+            ))
             .is_none());
         // 第二天同窗口 → 再次触发（每日标记按天翻转）
         let hit2 = s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(86_400 + 7 * 60), 11, 21, 20_001, Duration::ZERO))
+            .evaluate(&ctx(
+                &snap,
+                t0 + Duration::from_secs(86_400 + 7 * 60),
+                11,
+                21,
+                20_001,
+                Duration::ZERO,
+            ))
             .expect("第二天应再触发");
         assert_eq!(hit2.kind, "lunch");
     }
@@ -454,7 +484,14 @@ mod tests {
             .expect("晚饭触发窗");
         assert_eq!(hit.kind, "dinner");
         assert!(s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(300), 17, 27, 20_000, Duration::ZERO))
+            .evaluate(&ctx(
+                &snap,
+                t0 + Duration::from_secs(300),
+                17,
+                27,
+                20_000,
+                Duration::ZERO
+            ))
             .is_none());
     }
 
@@ -467,33 +504,75 @@ mod tests {
         let t0 = Instant::now();
         let active = Duration::from_secs(30);
         // 首次观察：会话从这一刻开始计时（观察者只能从首次见到活跃输入起算）。
-        assert!(s
-            .evaluate(&ctx(&snap, t0, 14, 0, 20_000, active))
-            .is_none());
+        assert!(s.evaluate(&ctx(&snap, t0, 14, 0, 20_000, active)).is_none());
         // 会话 49 分钟：不触发
         assert!(s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(49 * 60), 14, 49, 20_000, active))
+            .evaluate(&ctx(
+                &snap,
+                t0 + Duration::from_secs(49 * 60),
+                14,
+                49,
+                20_000,
+                active
+            ))
             .is_none());
         // 51 分钟：触发
         let hit = s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(51 * 60), 14, 51, 20_000, active))
+            .evaluate(&ctx(
+                &snap,
+                t0 + Duration::from_secs(51 * 60),
+                14,
+                51,
+                20_000,
+                active,
+            ))
             .expect("久坐应触发");
         assert_eq!(hit.kind, "sedentary");
         // 间隔未到（默认 60min）：即使会话继续也不触发
         assert!(s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(80 * 60), 15, 20, 20_000, active))
+            .evaluate(&ctx(
+                &snap,
+                t0 + Duration::from_secs(80 * 60),
+                15,
+                20,
+                20_000,
+                active
+            ))
             .is_none());
         // 5 分钟空档（离开）→ 会话重置，回来后 30 分钟不触发
         assert!(s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(140 * 60), 16, 20, 20_000, Duration::from_secs(6 * 60)))
+            .evaluate(&ctx(
+                &snap,
+                t0 + Duration::from_secs(140 * 60),
+                16,
+                20,
+                20_000,
+                Duration::from_secs(6 * 60)
+            ))
             .is_none());
-        assert!(s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(170 * 60), 16, 50, 20_000, active))
-            .is_none(), "重置后 30min 不算久坐");
+        assert!(
+            s.evaluate(&ctx(
+                &snap,
+                t0 + Duration::from_secs(170 * 60),
+                16,
+                50,
+                20_000,
+                active
+            ))
+            .is_none(),
+            "重置后 30min 不算久坐"
+        );
         // 重置后的会话从「回来观察」那刻（170min）起算，再满 51min → 再次触发
         // （距上次提醒已远超 60min 间隔）。
         let hit2 = s
-            .evaluate(&ctx(&snap, t0 + Duration::from_secs(221 * 60), 17, 41, 20_000, active))
+            .evaluate(&ctx(
+                &snap,
+                t0 + Duration::from_secs(221 * 60),
+                17,
+                41,
+                20_000,
+                active,
+            ))
             .expect("重置后的新会话满 50min 应再触发");
         assert_eq!(hit2.kind, "sedentary");
     }
@@ -529,7 +608,14 @@ mod tests {
     fn media_playing_exempts_sedentary() {
         let mut s = Suggester::default();
         let snap = Snapshot::default();
-        let mut c = ctx(&snap, Instant::now(), 14, 30, 20_000, Duration::from_secs(55 * 60));
+        let mut c = ctx(
+            &snap,
+            Instant::now(),
+            14,
+            30,
+            20_000,
+            Duration::from_secs(55 * 60),
+        );
         c.media_playing = true;
         assert!(s.evaluate(&c).is_none(), "看视频不算久坐");
     }
@@ -550,13 +636,27 @@ mod tests {
             assert!(s.evaluate(&c).is_none(), "勿扰时段 {h}:{m} 不应触发");
         }
         // 熬夜关怀开启后：01:00+ 持续打字 → 允许一条
-        let mut c = ctx(&low_batt, Instant::now(), 1, 30, 20_000, Duration::from_secs(60));
+        let mut c = ctx(
+            &low_batt,
+            Instant::now(),
+            1,
+            30,
+            20_000,
+            Duration::from_secs(60),
+        );
         c.night_care = true;
         let hit = s.evaluate(&c).expect("熬夜关怀应触发");
         assert_eq!(hit.kind, "night_care");
         // 一夜一次（23:50 与次日 00:10 同夜——night_key 按夜计）
         assert!(s
-            .evaluate(&ctx(&low_batt, Instant::now(), 2, 0, 20_000, Duration::from_secs(60)))
+            .evaluate(&ctx(
+                &low_batt,
+                Instant::now(),
+                2,
+                0,
+                20_000,
+                Duration::from_secs(60)
+            ))
             .is_none());
     }
 
@@ -566,10 +666,24 @@ mod tests {
         let snap = Snapshot::default();
         // 未开启：永不触发
         assert!(s
-            .evaluate(&ctx(&snap, Instant::now(), 2, 0, 20_000, Duration::from_secs(60)))
+            .evaluate(&ctx(
+                &snap,
+                Instant::now(),
+                2,
+                0,
+                20_000,
+                Duration::from_secs(60)
+            ))
             .is_none());
         // 开启但已离开（空闲 >2min）：不触发
-        let mut c = ctx(&snap, Instant::now(), 2, 0, 20_000, Duration::from_secs(3 * 60));
+        let mut c = ctx(
+            &snap,
+            Instant::now(),
+            2,
+            0,
+            20_000,
+            Duration::from_secs(3 * 60),
+        );
         c.night_care = true;
         assert!(s.evaluate(&c).is_none());
         // 开启 + 打字中：触发
@@ -580,10 +694,26 @@ mod tests {
 
     #[test]
     fn night_key_uses_4am_boundary() {
-        let late = Clock { hour: 23, minute: 50, day: 100 };
-        let early = Clock { hour: 0, minute: 10, day: 101 };
-        assert_eq!(late.night_key(), early.night_key(), "23:50 与次日 00:10 同夜");
-        let after4 = Clock { hour: 4, minute: 0, day: 101 };
+        let late = Clock {
+            hour: 23,
+            minute: 50,
+            day: 100,
+        };
+        let early = Clock {
+            hour: 0,
+            minute: 10,
+            day: 101,
+        };
+        assert_eq!(
+            late.night_key(),
+            early.night_key(),
+            "23:50 与次日 00:10 同夜"
+        );
+        let after4 = Clock {
+            hour: 4,
+            minute: 0,
+            day: 101,
+        };
         assert_ne!(after4.night_key(), late.night_key(), "04:00 起算新的一夜");
     }
 
@@ -591,13 +721,51 @@ mod tests {
     fn meal_windows_and_pregen_partition_the_window() {
         let day = 20_000;
         // 11:14 未到窗；11:16 预生成；11:21 触发；11:31 出窗
-        assert!(meal_pregen(Clock { hour: 11, minute: 16, day }) == Some("lunch"));
-        assert!(meal_pregen(Clock { hour: 11, minute: 21, day }).is_none());
-        assert!(lunch_trigger(Clock { hour: 11, minute: 16, day }) == false);
-        assert!(lunch_trigger(Clock { hour: 11, minute: 21, day }));
-        assert!(!lunch_trigger(Clock { hour: 11, minute: 31, day }));
-        assert!(meal_pregen(Clock { hour: 17, minute: 17, day }) == Some("dinner"));
-        assert!(dinner_trigger(Clock { hour: 17, minute: 21, day }));
-        assert!(meal_pregen(Clock { hour: 12, minute: 16, day }).is_none());
+        assert!(
+            meal_pregen(Clock {
+                hour: 11,
+                minute: 16,
+                day
+            }) == Some("lunch")
+        );
+        assert!(meal_pregen(Clock {
+            hour: 11,
+            minute: 21,
+            day
+        })
+        .is_none());
+        assert!(!lunch_trigger(Clock {
+            hour: 11,
+            minute: 16,
+            day
+        }));
+        assert!(lunch_trigger(Clock {
+            hour: 11,
+            minute: 21,
+            day
+        }));
+        assert!(!lunch_trigger(Clock {
+            hour: 11,
+            minute: 31,
+            day
+        }));
+        assert!(
+            meal_pregen(Clock {
+                hour: 17,
+                minute: 17,
+                day
+            }) == Some("dinner")
+        );
+        assert!(dinner_trigger(Clock {
+            hour: 17,
+            minute: 21,
+            day
+        }));
+        assert!(meal_pregen(Clock {
+            hour: 12,
+            minute: 16,
+            day
+        })
+        .is_none());
     }
 }

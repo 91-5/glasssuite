@@ -455,3 +455,14 @@ body,
   transform: none;
   background: rgba(255, 255, 255, 0.2);
 }
+
+/* ── 夜间状态表达（OC-20261113-001 P3）──────────────────────────────────── */
+/* 深夜（23:00–07:00，proactive 开启时后端下发 night-state）：降低饱和度 +
+   压暗 —— 「状态表达」而非通知打扰；无 toast、无音效。 */
+.dock.night-dim .dock-icon {
+  filter: saturate(0.4) brightness(0.75);
+  transition: filter 600ms ease;
+}
+.dock.night-dim .dock-icons {
+  background: rgba(255, 255, 255, 0.22);
+}
