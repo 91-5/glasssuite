@@ -87,6 +87,73 @@ pub fn ai_reload(
     configured
 }
 
+/// 「测试连接」结果：ok=端点可达且鉴权通过（HTTP 2xx/4xx 都算「连上了」，
+/// 4xx 说明端点活着但密钥/参数有问题——用户能据此区分「网不通」和「key 错」）。
+#[derive(serde::Serialize)]
+pub struct AiTestResult {
+    pub ok: bool,
+    pub status: u16,
+    pub detail: String,
+}
+
+/// 显式向用户配置的端点发一次 GET {base}/models（OpenAI 兼容标准端点）。
+/// 触发条件只有前端按钮，不在任何轮询路径上。短命线程 + 硬截止，不阻塞事件循环。
+#[tauri::command]
+pub fn ai_test_connection(settings: tauri::State<'_, Mutex<Settings>>) -> AiTestResult {
+    let cfg = AiConfig::load(&settings.lock().unwrap());
+    if !cfg.is_configured() {
+        return AiTestResult {
+            ok: false,
+            status: 0,
+            detail: "未配齐：端点或密钥缺失，或端点格式不合法".into(),
+        };
+    }
+    let base = cfg
+        .base_url
+        .as_deref()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let key = cfg.api_key.as_deref().unwrap().to_string();
+    let (tx, rx) = mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("glasssuite-ai-test".into())
+        .spawn(move || {
+            let r = ureq::get(&format!("{base}/models"))
+                .set("Authorization", &format!("Bearer {key}"))
+                .timeout(Duration::from_secs(8))
+                .call();
+            let outcome = match r {
+                Ok(resp) => (resp.status(), true),
+                // 4xx/5xx：端点本身活着，只是拒绝这次请求（密钥/权限问题）
+                Err(ureq::Error::Status(st, _)) => (st, true),
+                Err(_) => (0, false),
+            };
+            let _ = tx.send(outcome);
+        });
+    match rx.recv_timeout(Duration::from_secs(11)) {
+        Ok((st, reached)) if reached => AiTestResult {
+            ok: true,
+            status: st,
+            detail: format!("连接成功（HTTP {st}）"),
+        },
+        Ok((st, _)) => AiTestResult {
+            ok: false,
+            status: st,
+            detail: if st > 0 {
+                format!("端点拒绝（HTTP {st}，检查密钥或模型权限）")
+            } else {
+                "无法连接：超时或网络不通".into()
+            },
+        },
+        Err(_) => AiTestResult {
+            ok: false,
+            status: 0,
+            detail: "测试超时".into(),
+        },
+    }
+}
+
 fn run(handle: AppHandle, ai: Arc<AiState>, state: Arc<SharedState>) {
     let mut suggester = suggest::Suggester::default();
     loop {

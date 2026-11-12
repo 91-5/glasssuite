@@ -152,7 +152,11 @@ export default function App() {
   }, []);
 
   return (
-    <div className={`island-root ${mode} ${isCollapsed ? "is-collapsed" : ""}`}>
+    <div
+      className={`island-root ${mode} ${isCollapsed ? "is-collapsed" : ""} ${
+        showSettings ? "settings-open" : ""
+      }`}
+    >
       <CollapseBall
         collapsed={isCollapsed}
         onToggle={toggleCollapse}

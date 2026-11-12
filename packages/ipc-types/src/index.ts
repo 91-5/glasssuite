@@ -28,6 +28,8 @@ export const COMMANDS = {
   settingsUpdate: "settings_update",
   /** 显式触发 AI 配置重载（幂等；settings_update 已应用，这里是兜底）。返回是否已配齐。 */
   aiReload: "ai_reload",
+  /** 「测试连接」：向用户配置的端点发一次 GET /models。 */
+  aiTestConnection: "ai_test_connection",
   /** 前端诊断日志。 */
   logFrontend: "log_frontend",
   /** 媒体控制：play | pause | play_pause | next | prev | seek。 */
@@ -196,6 +198,21 @@ export async function updateSettings(next: Settings): Promise<Settings> {
  */
 export async function aiReload(): Promise<boolean> {
   return invoke<boolean>(COMMANDS.aiReload);
+}
+
+/** 「测试连接」结果：ok=端点可达（含 4xx——端点活着但密钥/参数有问题）。 */
+export interface AiTestResult {
+  ok: boolean;
+  status: number;
+  detail: string;
+}
+
+/**
+ * 显式向用户配置的端点发一次 GET {base}/models（OpenAI 兼容标准端点），
+ * 让「我填的 API 到底通没通」有可见反馈。仅在按钮点击时触发，无轮询。
+ */
+export async function aiTestConnection(): Promise<AiTestResult> {
+  return invoke<AiTestResult>(COMMANDS.aiTestConnection);
 }
 
 /** 前端诊断日志（进 Rust 侧日志文件，便于排查「后端有数据但界面没反应」）。 */

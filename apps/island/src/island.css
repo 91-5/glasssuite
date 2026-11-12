@@ -439,15 +439,64 @@
   white-space: nowrap;
 }
 
+.panel-test {
+  flex: 0 0 auto;
+  padding: 4px 12px;
+  border: 0;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.12);
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.panel-test:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.panel-test-ok {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  font-size: 12px;
+  color: rgb(120, 220, 150);
+  background: rgba(90, 200, 120, 0.12);
+}
+
+.panel-test-err {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  font-size: 12px;
+  color: rgb(255, 150, 140);
+  background: rgba(230, 90, 80, 0.14);
+}
+
 /* ===== GlassSuite 增量：展开态设置视图（AI 与网络） =====
  * 外观与 glass.css 的 .pill 同一套玻璃语言：同一填充色、同一模糊半径、同一圆角谱系。
  * 只此一处增量，其余视觉全部沿用 glasspill 原件。
  */
 
+/* 设置打开时把背后的展开面板压暗——否则面板内容（图表/控件）透过半透明
+ * 设置层漏出来，两个界面叠成"一个在前一个在后"。 */
+.island-root.settings-open .island-main {
+  opacity: 0.32;
+  transition: opacity 0.2s ease;
+  pointer-events: none;
+}
+
 .island-gear {
   position: absolute;
   top: 18px;
-  right: 22px;
+  /* 可见的药丸右缘在窗口 x=640（窗口 720、药丸 560 居中），
+   * 齿轮必须落在药丸内部，否则飘到窗口透明区、视觉上脱离岛。 */
+  right: 90px;
+  pointer-events: auto;
+  /* .island-main 是 position:absolute + z-index:10（glass.css 原件），
+   * 设置入口必须高于它，否则齿轮和设置面板都被展开的药丸盖住——
+   * 视觉上就是「设置面板被展开的岛挡在后面」。 */
+  z-index: 40;
   width: 26px;
   height: 26px;
   display: grid;
@@ -461,7 +510,6 @@
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 50%;
   cursor: pointer;
-  z-index: 6;
   transition: color 0.18s ease, background 0.18s ease;
 }
 
@@ -480,7 +528,7 @@
   flex-direction: column;
   gap: 10px;
   padding: 16px 20px 14px;
-  background: rgba(24, 24, 31, 0.72);
+  background: rgba(24, 24, 31, 0.92);
   -webkit-backdrop-filter: blur(28px) saturate(180%);
   backdrop-filter: blur(28px) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.1);
@@ -490,7 +538,7 @@
     inset 0 1px 0 rgba(255, 255, 255, 0.06);
   overflow-y: auto;
   pointer-events: auto;
-  z-index: 5;
+  z-index: 40;
   animation: settings-in 0.26s cubic-bezier(0.32, 0.72, 0.24, 1);
 }
 

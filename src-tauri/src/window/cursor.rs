@@ -114,9 +114,10 @@ impl HookCtx {
         let in_island = self.hit_test(pt);
 
         // ---- island：穿透切换 ----
-        if self.state.island_visible.load(Ordering::Relaxed)
-            && !self.state.island_expanded.load(Ordering::Relaxed)
-        {
+        // 注意：**展开态不豁免**。glasspill 原版没有 expanded 门控——展开后光标
+        // 离开面板（超过 LEAVE_HYSTERESIS）恰恰是收起面板的唯一路径。一旦在这
+        // 里加 `!expanded` 短路，前端永远收不到 island-hover=false，面板卡死。
+        if self.state.island_visible.load(Ordering::Relaxed) {
             let transparent = self.state.island_transparent.load(Ordering::Relaxed);
             if in_island {
                 *self.island_last_in.lock().unwrap() = Some(now);
@@ -195,6 +196,11 @@ impl HookCtx {
     }
 
     fn apply_island(&self, transparent: bool, now: Instant) {
+        winplat::log::log(if transparent {
+            "cursor: island -> passthrough=true (leave)"
+        } else {
+            "cursor: island -> passthrough=false (enter)"
+        });
         self.state
             .island_transparent
             .store(transparent, Ordering::Relaxed);

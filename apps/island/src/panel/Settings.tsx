@@ -9,8 +9,8 @@
  * settings.json，不进日志；env `GLASSSUITE_AI_ENABLED=0` 仍可整体压死 AI。
  */
 import { useState } from "react";
-import type { Settings } from "@glasssuite/ipc-types";
 import { saveSettings } from "../hooks";
+import { aiTestConnection, type AiTestResult, type Settings } from "@glasssuite/ipc-types";
 
 /** 表单拥有的字段；保存时覆盖到最新 settings 上。 */
 interface Draft {
@@ -38,6 +38,8 @@ export function SettingsForm({ settings }: { settings: Settings | null }) {
   const [draft, setDraft] = useState<Draft>(() => draftFrom(settings));
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [test, setTest] = useState<AiTestResult | null>(null);
 
   const set = (patch: Partial<Draft>) => setDraft((d) => ({ ...d, ...patch }));
 
@@ -117,8 +119,32 @@ export function SettingsForm({ settings }: { settings: Settings | null }) {
         <button type="button" className="panel-save" disabled={saving} onClick={save}>
           {saving ? "保存中…" : "保存"}
         </button>
+        <button
+          type="button"
+          className="panel-test"
+          disabled={testing}
+          onClick={async () => {
+            setTesting(true);
+            setTest(null);
+            try {
+              setTest(await aiTestConnection());
+            } catch {
+              setTest({ ok: false, status: 0, detail: "调用失败：命令未响应" });
+            } finally {
+              setTesting(false);
+            }
+          }}
+        >
+          {testing ? "测试中…" : "测试连接"}
+        </button>
         {status ? <span className="panel-status">{status}</span> : null}
       </div>
+      {test ? (
+        <div className={test.ok ? "panel-test-ok" : "panel-test-err"}>
+          {test.ok ? "✓ " : "✗ "}
+          {test.detail}
+        </div>
+      ) : null}
     </div>
   );
 }

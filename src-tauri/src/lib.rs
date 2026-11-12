@@ -65,6 +65,7 @@ pub fn run() {
             settings::settings_get,
             settings::settings_update,
             island::ai::ai_reload,
+            island::ai::ai_test_connection,
             // 岛功能域
             island::log_frontend,
             island::media::media_control,
