@@ -111,6 +111,8 @@ pub fn reorder_shortcuts(
 
 #[tauri::command]
 pub fn launch_shortcut(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    // [诊断] 真实点击到达 Rust 的判别日志（临时，定位后删除）
+    winplat::log::log(&format!("launch_shortcut invoked path={} chars={}", path.len(), path.chars().count()));
     // 已运行应用走激活快路径（同 running 的 key 体系）；未运行才真的启动。
     // v0.6：反查走归一化（小写 + / → \）——前端传回大小写/分隔符不同的 path
     // 时不再把 UWP 应用当 Win32 启动（v0.4-a verdict advisory）。

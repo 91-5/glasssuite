@@ -10,7 +10,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -788,7 +788,8 @@ pub fn dock_logic(app: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
         }
 
         let fullscreen = crate::dock::desktop::is_foreground_fullscreen();
-        let want_visible = if fullscreen {
+        let maximized = crate::dock::desktop::is_foreground_maximized();
+        let want_visible = if fullscreen || maximized {
             false
         } else if !auto_hide {
             true
@@ -816,6 +817,26 @@ pub fn dock_logic(app: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
             None => false,
         };
 
+        // 临时诊断（2026-11-13，sir 反馈 dock 图标点击无反应）：状态快照
+        static SNAP: AtomicUsize = AtomicUsize::new(0);
+        let snap_n = SNAP.fetch_add(1, Ordering::Relaxed);
+        if snap_n % 10 == 0 || want_visible != visible {
+            let (cx, cy) = cursor_pos();
+            winplat::log::log(&format!(
+                "dock DBG: vis={} want={} show_ready={} fs={} max={} cx={} cy={} x={} y={} w={}",
+                visible,
+                want_visible,
+                show_ready,
+                fullscreen,
+                maximized,
+                cx,
+                cy,
+                x,
+                y,
+                size.width
+            ));
+        }
+
         if want_visible && !visible && show_ready {
             if let Some(h) = hwnd {
                 unsafe {
@@ -823,20 +844,11 @@ pub fn dock_logic(app: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
                         h,
                         windows::Win32::UI::WindowsAndMessaging::SW_SHOWNA,
                     );
-                    // v0.7.2（sir 反馈「dock 一直在最上面」）：SW_SHOWNA 把 dock 提到
-                    // 同层窗口之上，观感=置顶。D7 语义是桌面层（可被窗口盖住），显示后
-                    // 立刻压回同层底部（HWND_BOTTOM）——已开窗口盖得住 dock。
-                    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-                        h,
-                        Some(windows::Win32::UI::WindowsAndMessaging::HWND_BOTTOM),
-                        0,
-                        0,
-                        0,
-                        0,
-                        windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                            | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
-                            | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
-                    );
+                    // 不再 SetWindowPos(HWND_BOTTOM)：那会把 dock 压到桌面图标
+                    // 视图（SHELLDLL_DefView）之下，真实鼠标点击被桌面层吃掉
+                    // （2026-11-13 sir 反馈「图标点了没反应」，实锤命中测试：
+                    // dock 可见态 WindowFromPoint(dock 中心) 返回的是桌面视图）。
+                    // 「最大化窗口盖住 dock」改由 is_foreground_maximized 让位解决。
                 }
             } else {
                 let _ = dock.show();

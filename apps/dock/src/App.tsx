@@ -476,6 +476,11 @@ function App() {
     if (!d.active) {
       setDragIndex(-1);
       setDragGhost(null);
+      // 点击（未起拖）：pointer capture 打在容器上，松手时 click 被规范
+      // retarget 到容器，按钮的 onClick 收不到——这里直接启动。
+      // suppressClickUntil 仍守「拖动刚结束 400ms 内不启动」。
+      const sc = dockIcons[d.index];
+      if (sc && Date.now() >= suppressClickUntil.current) launch(sc.path);
       return;
     }
     suppressClickUntil.current = Date.now() + 400;

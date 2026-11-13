@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, FindWindowW, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
-    GetWindowThreadProcessId, IsWindowVisible, SM_CXSCREEN, SM_CYSCREEN,
+    GetWindowThreadProcessId, IsWindowVisible, IsZoomed, SM_CXSCREEN, SM_CYSCREEN,
 };
 
 /// 给任意窗口（含 dock 的 tao 窗口）开遗留 DWM 玻璃模糊。
@@ -205,6 +205,39 @@ pub fn is_foreground_fullscreen() -> bool {
         let ix = (r.right.min(m.right) - r.left.max(m.left)).max(0) as f64;
         let iy = (r.bottom.min(m.bottom) - r.top.max(m.top)).max(0) as f64;
         (ix * iy) / (mw * mh) >= 0.995
+    }
+}
+
+/// 前台窗口是否处于最大化状态（非本进程、非 shell 桌面类）。
+///
+/// 用途：dock 显示逻辑的「最大化让位」——v0.7.2 sir 反馈「dock 一直在
+/// 最上面」盖住最大化窗口，当时的修法是显示后 SetWindowPos(HWND_BOTTOM)
+/// 把 dock 压到同层底部；但 HWND_BOTTOM 会把 dock 压到桌面图标视图
+/// （SHELLDLL_DefView）之下，导致 dock 的鼠标点击全被桌面层吃掉
+/// （sir 反馈「图标点了没反应」，2026-11-13）。改为：dock 保持同层顶部
+/// （SW_SHOWNA 不激活、不压底），前台最大化时 dock 直接不显示。
+pub fn is_foreground_maximized() -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(fg, Some(&mut pid));
+        if pid == std::process::id() {
+            return false;
+        }
+        let mut cls_buf = [0u16; 64];
+        let n = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(fg, &mut cls_buf).max(0)
+            as usize;
+        let cls = String::from_utf16_lossy(&cls_buf[..n]);
+        if matches!(
+            cls.as_str(),
+            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+        ) {
+            return false;
+        }
+        IsZoomed(fg).as_bool()
     }
 }
 
