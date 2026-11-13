@@ -388,12 +388,18 @@ mod tests {
 
         // 关停 → 端口解绑（netstat 判据的进程级等价：connect 被拒绝）
         shutdown.store(true, Ordering::Relaxed);
-        // 等 accept 循环退出（≤ 一轮 150ms 轮询 + 余量）
-        std::thread::sleep(Duration::from_millis(500));
-        assert!(
-            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
-            "关停后端口必须拒绝连接（零监听）"
-        );
+        // accept 循环退出 + listener drop 需要时间；CI runner 上固定 sleep
+        // 500ms 不够（实测 flake）。轮询最多 5s，connect 被拒绝即成功。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("关停后 5s 内端口仍接受连接（零监听未达成）");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     fn read_token(port: u16) -> Option<String> {
