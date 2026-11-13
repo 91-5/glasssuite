@@ -317,8 +317,9 @@ function App() {
     active: boolean;
     out: boolean; // 已判定「拖出」（脱离区：垂直 >48px + 驻留 ≥200ms + 方向向外）
     pid: number;
-    offset: number; // 按下点相对被拖图标左缘的偏移（幽灵跟随用）
-    top: number; // 按下时图标上缘（幽灵 y）
+    offset: number; // 按下点相对被拖图标左缘的偏移（幽灵 x 跟随用）
+    grabDy: number; // 按下点相对被拖图标上缘的偏移（幽灵 y 跟随用）
+    top: number; // 按下时图标上缘
     iconW: number; // 图标宽（幽灵中心 = clientX - offset + iconW/2）
     session: DragSession | null; // pointerdown 快照 + 滞回状态机
     beyondSince: number | null; // 进入脱离区 (>48px) 的时刻（驻留判定）
@@ -381,6 +382,7 @@ function App() {
       out: false,
       pid: e.pointerId,
       offset: e.clientX - r.left,
+      grabDy: e.clientY - r.top,
       top: r.top,
       iconW: r.width,
       session: new DragSession(snapshotCenters(), i),
@@ -443,8 +445,8 @@ function App() {
     }
 
     if (!d.out) {
-      // 幽灵跟随（唯一视觉；y 固定为按下时图标上缘）
-      setDragGhost({ x: clientX - d.offset, y: d.top });
+      // 幽灵完全跟手（x/y 都跟随光标，垂直微调不再读作「黏」）
+      setDragGhost({ x: clientX - d.offset, y: clientY - d.grabDy });
       // 让位 + 滞回：被跨过的图标立即平移，落点在死区内不抖。
       const s = d.session;
       if (s) {

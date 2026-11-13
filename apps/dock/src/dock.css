@@ -60,7 +60,9 @@ body,
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: background 120ms ease, transform 120ms ease;
+  /* 让位 transform 走 inline style；这条 transition 让它平滑而非瞬变
+     （拖动手感核心：aero-dock / Noctalia 同款「邻居实时移位」）。 */
+  transition: background 120ms ease, transform 120ms cubic-bezier(0.2, 0.9, 0.3, 1);
 }
 
 .dock-icon:hover {
@@ -383,9 +385,13 @@ body,
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.55);
   border: 1px solid rgba(255, 255, 255, 0.65);
-  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
+  box-shadow:
+    0 14px 32px rgba(0, 0, 0, 0.4),
+    0 2px 6px rgba(0, 0, 0, 0.22);
   pointer-events: none;
-  opacity: 0.85;
+  opacity: 0.92;
+  /* 抬起感：提起的图标略微放大；inline left/top 由 App 跟手设置。 */
+  transform: scale(1.08) translateY(-6px);
 }
 
 .drag-ghost-name {
@@ -448,9 +454,9 @@ body,
 /* ── P1 拖拽实时化（OC-20261113-001）：拖动期间压掉 hover 位移/过渡 ──
    让位 transform 由 DragSession 的 inline style 独占；:hover 的 translateY(-2px)
    若仍生效，会让快照外的视觉位移参与进来（且 transition 会拖慢让位响应）。 */
-.dock-icons.is-dragging .dock-icon {
-  transition: none;
-}
+/* 拖动态压制 hover 效果（让位由 inline transform 驱动，优先级高于
+   :hover 规则；这里只挡 hover 的视觉翻起，不再压 transition ——
+   让位动画必须保留，否则邻居瞬移 =「拖手感差」的主要来源）。 */
 .dock-icons.is-dragging .dock-icon:hover {
   transform: none;
   background: rgba(255, 255, 255, 0.2);

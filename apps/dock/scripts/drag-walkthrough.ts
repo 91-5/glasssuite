@@ -99,7 +99,7 @@ function simulateDrag(
 {
   const centers = [0, 1, 2, 3, 4, 5, 6, 7].map((i) => 100 + i * 58);
   const pitch = slotPitch(centers);
-  const dead = pitch * 0.25; // 14.5px
+  const dead = pitch * 0.08; // 与 DEADZONE_RATIO 同步（手感反馈后由 0.25 降到 0.08）
   const from = 2;
   const boundary = 100 + 1 * 58; // 槽 1 的中心（drop 1 ↔ 2 的切换中心）
   const s = new DragSession(centers, from);

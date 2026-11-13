@@ -21,8 +21,14 @@ export interface RowSnapshot {
   centers: number[];
 }
 
-/** 滞回死区 = 0.25 × 槽距（卡面 P1 方案第 4 条；B2 的判据口径）。 */
-export const DEADZONE_RATIO = 0.25;
+/**
+ * 滞回死区 = 0.08 × 槽距。
+ *
+ * 借鉴 aero-dock / oskbt 的落点语义（越过图标中心即翻转，邻居实时让位
+ * 而非边界滞回），死区只留极小一档防传感器抖动；较大的死区（原 0.25）
+ * 会被读作「拖到位了但图标没反应」——见 OC-20261113-001 手感反馈。
+ */
+export const DEADZONE_RATIO = 0.08;
 
 /** 等宽图标的槽距（中心间距）。图标不足两枚时返回 0。 */
 export function slotPitch(centers: number[]): number {
