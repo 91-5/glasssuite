@@ -10,7 +10,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -816,26 +816,6 @@ pub fn dock_logic(app: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
             Some(t) => t.elapsed() >= Duration::from_millis(FIRST_SHOW_DELAY_MS),
             None => false,
         };
-
-        // 临时诊断（2026-11-13，sir 反馈 dock 图标点击无反应）：状态快照
-        static SNAP: AtomicUsize = AtomicUsize::new(0);
-        let snap_n = SNAP.fetch_add(1, Ordering::Relaxed);
-        if snap_n % 10 == 0 || want_visible != visible {
-            let (cx, cy) = cursor_pos();
-            winplat::log::log(&format!(
-                "dock DBG: vis={} want={} show_ready={} fs={} max={} cx={} cy={} x={} y={} w={}",
-                visible,
-                want_visible,
-                show_ready,
-                fullscreen,
-                maximized,
-                cx,
-                cy,
-                x,
-                y,
-                size.width
-            ));
-        }
 
         if want_visible && !visible && show_ready {
             if let Some(h) = hwnd {

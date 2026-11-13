@@ -255,7 +255,14 @@ function App() {
   }, []);
 
   const launch = (path: string) => {
-    invoke("launch_shortcut", { path }).catch((e) => console.error("launch failed", e));
+    invoke("launch_shortcut", { path })
+      .catch((e) => {
+        // 失效快捷方式（如已删除的桌面 lnk）不能静默吞错——
+        // 弹出与 pin/add 同款的状态条，告知哪个路径起不来。
+        const msg = typeof e === "string" ? e : String(e);
+        setNotice(`无法打开：${msg}`);
+        window.setTimeout(() => setNotice(null), 4000);
+      });
     // 任务 C：dock 图标点击属于「面板外」，开始菜单面板随之收回
     // （面板失焦复查对「新前台是 dock」不收回，交给这里显式关）
     invoke("menu_hide").catch(() => {});
@@ -309,6 +316,7 @@ function App() {
   // 决策核心全部在 ./dragOrder（纯函数，走查脚本可脱离 WebView 驱动同一份逻辑）。
   const dragRef = useRef<{
     index: number;
+    shortcut: Shortcut; // iconDown 时的新鲜引用：iconUp 走 window 监听器（陈旧闭包），不能读 state
     startX: number;
     startY: number;
     startT: number;
@@ -321,6 +329,8 @@ function App() {
     grabDy: number; // 按下点相对被拖图标上缘的偏移（幽灵 y 跟随用）
     top: number; // 按下时图标上缘
     iconW: number; // 图标宽（幽灵中心 = clientX - offset + iconW/2）
+    startScreenX: number; // 屏幕坐标基准（不受窗口平移影响）
+    lastScreenX: number;
     session: DragSession | null; // pointerdown 快照 + 滞回状态机
     beyondSince: number | null; // 进入脱离区 (>48px) 的时刻（驻留判定）
     lastDistY: number; // 上一帧的行外垂直距离（「方向向外」判定）
@@ -371,8 +381,12 @@ function App() {
     // 按下即收预览（预览窗 TOPMOST 悬在图标上方，会吃掉拖动的移动事件）
     leaveIcon();
     const r = e.currentTarget.getBoundingClientRect();
+    // window 级 pointerup 监听器是 mount 时注册的（useEffect[]），捕获的是
+    // 首次渲染的闭包——那时 icons 还没从 Rust 异步加载，dockIcons=[] 永远
+    // 读不到值。把快捷方式本身存进 dragRef，iconUp 不再依赖陈旧 state。
     dragRef.current = {
       index: i,
+      shortcut: dockIcons[i],
       startX: e.clientX,
       startY: e.clientY,
       startT: Date.now(),
@@ -385,6 +399,11 @@ function App() {
       grabDy: e.clientY - r.top,
       top: r.top,
       iconW: r.width,
+      // 屏幕坐标基准：dock 唤出/隐藏的滑动动画里窗口自身在平移，
+      // 光标静止 clientX 也会跳（实测点击内可跳 29px）。screenX 不受
+      // 窗口位移影响，是「光标到底动没动」的唯一可靠信号。
+      startScreenX: e.screenX,
+      lastScreenX: e.screenX,
       session: new DragSession(snapshotCenters(), i),
       beyondSince: null,
       lastDistY: 0,
@@ -401,19 +420,34 @@ function App() {
   const DETACH_DIST = 48;
   const DETACH_DWELL_MS = 200;
 
-  const iconMove = (clientX: number, clientY: number, pointerId?: number) => {
+  const iconMove = (clientX: number, clientY: number, pointerId?: number, screenX?: number) => {
     const d = dragRef.current;
     if (!d) return;
     if (pointerId !== undefined && pointerId !== d.pid) return;
+    // 噪声剔除：用屏幕坐标判「光标是否真的在动」。窗口滑动动画里
+    // clientX 会被带偏 29px，但 screenX 不动 → 不算拖动。
+    const sx = screenX ?? clientX;
+    if (Math.abs(sx - d.lastScreenX) > 40) {
+      // 真实瞬移（多显示器跳变）也可能是合法的——只丢弃窗口平移噪声。
+      // 窗口平移特征：screenX 近乎静止而 clientX 大幅跳变。
+      if (Math.abs(sx - d.lastScreenX) <= 2 && Math.abs(clientX - d.lastX) > 20) {
+        // 窗口在动，光标没动：只更新 lastX 让幽灵不抖，不算拖动。
+        d.lastX = clientX;
+        d.lastY = clientY;
+        return;
+      }
+      return;
+    }
+    d.lastScreenX = sx;
     d.lastX = clientX;
     d.lastY = clientY;
-    const dx = clientX - d.startX;
+    const dx = sx - d.startScreenX;
     if (!d.active) {
       if (Math.abs(dx) < 6) return;
       d.active = true;
       setDragIndex(d.index);
       setMakeWay({ drop: d.index, pitch: d.session?.slotPitch() ?? 0 });
-      invoke("debug_note", { msg: `active idx=${d.index} x=${Math.round(clientX)}` }).catch(() => {});
+      invoke("debug_note", { msg: `active idx=${d.index} x=${Math.round(sx)}` }).catch(() => {});
     }
 
     // 三区判定：重排区/灰区（clamp 不脱离）只在行内让位；只有「垂直出界
@@ -465,7 +499,7 @@ function App() {
     const d = dragRef.current;
     if (!d) return;
     if (pointerId !== undefined && pointerId !== d.pid) return;
-    dragRef.current = null;
+      dragRef.current = null;
     draggingRef.current = false; // 拖动结束，恢复版本轮询校准
     try {
       pillRef.current?.releasePointerCapture(d.pid);
@@ -473,13 +507,17 @@ function App() {
       /* 已释放 */
     }
     setMakeWay(null);
-    if (!d.active) {
+    // 点击救援：用屏幕坐标判净位移——窗口滑动动画会污染 clientX
+    // （一次点击内 clientX 可能跳 29px，但 screenX 稳如泰山）。
+    const netX = Math.abs(d.lastScreenX - d.startScreenX);
+    const isClick = !d.out && netX < 10;
+    if (!d.active || isClick) {
       setDragIndex(-1);
       setDragGhost(null);
       // 点击（未起拖）：pointer capture 打在容器上，松手时 click 被规范
       // retarget 到容器，按钮的 onClick 收不到——这里直接启动。
       // suppressClickUntil 仍守「拖动刚结束 400ms 内不启动」。
-      const sc = dockIcons[d.index];
+      const sc = d.shortcut;
       if (sc && Date.now() >= suppressClickUntil.current) launch(sc.path);
       return;
     }
@@ -488,7 +526,7 @@ function App() {
     setDragGhost(null);
     // v0.7：拖出成游离图标（落点 = 松手位置；Rust 换算成物理像素虚拟桌面坐标）
     if (d.out) {
-      const sc = dockIcons[d.index];
+      const sc = d.shortcut;
       if (!sc) return;
       invoke("free_drag_out", { id: sc.id, cx: d.lastX, cy: d.lastY })
         .then(() => {
@@ -531,7 +569,7 @@ function App() {
 
   // 双保险：capture 之外的 window 级兜底（两路都到 = 幂等，无副作用）
   useEffect(() => {
-    const wm = (e: PointerEvent) => iconMove(e.clientX, e.clientY, e.pointerId);
+    const wm = (e: PointerEvent) => iconMove(e.clientX, e.clientY, e.pointerId, e.screenX);
     const wu = (e: PointerEvent) => iconUp(e.pointerId);
     const wm2 = (e: MouseEvent) => {
       // 老内核只发兼容 mouse 事件时也能走通（与 pointer 路径幂等）
@@ -660,7 +698,7 @@ function App() {
                 lifted ? { visibility: "hidden" } : way ? { transform: way } : undefined
               }
               onPointerDown={iconDown(i)}
-              onPointerMove={(e) => iconMove(e.clientX, e.clientY, e.pointerId)}
+              onPointerMove={(e) => iconMove(e.clientX, e.clientY, e.pointerId, e.screenX)}
               onPointerUp={(e) => iconUp(e.pointerId)}
               onPointerCancel={(e) => iconUp(e.pointerId)}
               onMouseEnter={enterIcon(sc)}

@@ -93,6 +93,8 @@ pub fn install(app: AppHandle, state: Arc<SharedState>) {
 }
 
 unsafe extern "system" fn ll_mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // ---- 诊断（dp 大脑 A1/A5）：在系统投递前逐层记录按键事件 ----
+    // 钩子是最早能看到真实鼠标按键的地方：若这里都没有 WM_LBUTTONDOWN，
     if code >= 0 && wparam.0 as u32 == WM_MOUSEMOVE {
         let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
         // try_lock：钩子回调绝不能为等一把锁而阻塞输入管线。
