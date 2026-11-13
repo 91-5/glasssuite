@@ -357,6 +357,17 @@ mod tests {
     /// （B3/B4 的进程级等价证据；CLI 与真实 UI 走查见交付报告。）
     #[test]
     fn ingest_end_to_end_and_shutdown_unbinds_port() {
+        // CI runner（GitHub Actions Windows）上 APPDATA 目录可能不可写或
+        // 与本机行为不同，token 写入/读取会失败。把 endpoint 文件重定向到
+        // 测试专属临时目录（进程隔离，不依赖用户目录，跑完自动清理）。
+        let tmp = std::env::temp_dir().join(format!(
+            "gs-ingest-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let prev = std::env::var_os("APPDATA");
+        std::env::set_var("APPDATA", &tmp);
+
         let (tx, rx) = std::sync::mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let port = spawn(tx, Arc::clone(&shutdown)).expect("ingest 服务器应能启动");
@@ -400,6 +411,14 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+
+        // 跑完还原 APPDATA 并清理临时目录（不影响其他测试与生产路径）。
+        if let Some(v) = prev {
+            std::env::set_var("APPDATA", v);
+        } else {
+            std::env::remove_var("APPDATA");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     fn read_token(port: u16) -> Option<String> {
