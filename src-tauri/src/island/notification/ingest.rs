@@ -173,7 +173,13 @@ pub fn spawn(tx: Sender<RawNotification>, shutdown: Arc<AtomicBool>) -> Option<u
 
 fn write_endpoint(port: u16, token: &str) {
     let body = serde_json::json!({ "port": port, "token": token }).to_string();
-    if std::fs::write(endpoint_path(), body).is_err() {
+    let path = endpoint_path();
+    // 父目录在全新环境（CI runner / 首次运行）可能不存在；
+    // 静默建目录，失败则写文件必然失败，仅记日志。
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(&path, body).is_err() {
         // 错误细节可能带本机路径，不进日志
         winplat::log::log("notifications: ingest token write failed count=1");
     }
@@ -357,17 +363,6 @@ mod tests {
     /// （B3/B4 的进程级等价证据；CLI 与真实 UI 走查见交付报告。）
     #[test]
     fn ingest_end_to_end_and_shutdown_unbinds_port() {
-        // CI runner（GitHub Actions Windows）上 APPDATA 目录可能不可写或
-        // 与本机行为不同，token 写入/读取会失败。把 endpoint 文件重定向到
-        // 测试专属临时目录（进程隔离，不依赖用户目录，跑完自动清理）。
-        let tmp = std::env::temp_dir().join(format!(
-            "gs-ingest-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::create_dir_all(&tmp);
-        let prev = std::env::var_os("APPDATA");
-        std::env::set_var("APPDATA", &tmp);
-
         let (tx, rx) = std::sync::mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let port = spawn(tx, Arc::clone(&shutdown)).expect("ingest 服务器应能启动");
@@ -411,14 +406,6 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-
-        // 跑完还原 APPDATA 并清理临时目录（不影响其他测试与生产路径）。
-        if let Some(v) = prev {
-            std::env::set_var("APPDATA", v);
-        } else {
-            std::env::remove_var("APPDATA");
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     fn read_token(port: u16) -> Option<String> {
