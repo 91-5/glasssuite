@@ -227,11 +227,7 @@ fn run(handle: AppHandle, ai: Arc<AiState>, state: Arc<SharedState>) {
             let s = handle.state::<Mutex<Settings>>();
             let s = s.lock().unwrap();
             let mins = s.sedentary_interval_min.unwrap_or(60).clamp(15, 240);
-            (
-                s.proactive,
-                s.night_care,
-                Duration::from_secs(mins * 60),
-            )
+            (s.proactive, s.night_care, Duration::from_secs(mins * 60))
         };
 
         // 夜间状态表达（23:00–07:00 岛变暗/dock 降饱和）：只在 proactive 开启时
@@ -273,10 +269,7 @@ fn run(handle: AppHandle, ai: Arc<AiState>, state: Arc<SharedState>) {
                     let template = suggest::meal_template(kind);
                     let r = call_with_deadline(&cfg, template, LLM_DEADLINE)
                         .filter(|t| !t.trim().is_empty());
-                    winplat::log::log(&format!(
-                        "ai: pregen kind={kind} ok={}",
-                        r.is_some()
-                    ));
+                    winplat::log::log(&format!("ai: pregen kind={kind} ok={}", r.is_some()));
                     // 失败也记 Some(None)：今天不再重复烧预算（模板兜底）。
                     cache.insert((kind, clock.day), r);
                 }
@@ -332,14 +325,11 @@ fn run(handle: AppHandle, ai: Arc<AiState>, state: Arc<SharedState>) {
         // （避免文案翻转），超时/失败静默保留模板（B5）。
         if configured && gate.allow(clock.day, Instant::now(), sugg.kind) {
             let shown_at = Instant::now();
-            let r = call_with_deadline(&cfg, &sugg.text, LLM_DEADLINE)
-                .filter(|t| !t.trim().is_empty());
+            let r =
+                call_with_deadline(&cfg, &sugg.text, LLM_DEADLINE).filter(|t| !t.trim().is_empty());
             if let Some(text) = r {
                 if shown_at.elapsed() < REPLACE_WINDOW {
-                    winplat::log::log(&format!(
-                        "ai: insight kind={} source=ai count=1",
-                        sugg.kind
-                    ));
+                    winplat::log::log(&format!("ai: insight kind={} source=ai count=1", sugg.kind));
                     let _ = handle.emit(
                         EVENT,
                         json!({ "kind": sugg.kind, "text": text, "source": "ai", "at": now_unix_ms() }),
@@ -568,7 +558,13 @@ mod tests {
     fn days_from_civil_known_dates() {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(2026, 1, 1), 20_454);
-        assert_eq!(days_from_civil(2026, 11, 13), days_from_civil(2026, 11, 12) + 1);
-        assert_eq!(days_from_civil(2024, 2, 29), days_from_civil(2024, 3, 1) - 1);
+        assert_eq!(
+            days_from_civil(2026, 11, 13),
+            days_from_civil(2026, 11, 12) + 1
+        );
+        assert_eq!(
+            days_from_civil(2024, 2, 29),
+            days_from_civil(2024, 3, 1) - 1
+        );
     }
 }

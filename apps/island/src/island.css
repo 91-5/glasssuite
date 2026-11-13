@@ -662,3 +662,11 @@
   opacity: 0.5;
   font-variant-numeric: tabular-nums;
 }
+
+/* ── 夜间状态表达（OC-20261113-001 P3）──────────────────────────────────── */
+/* 深夜（23:00–07:00，proactive 开启时后端下发 night-state）：岛压暗。
+   「状态表达」而非通知打扰；设置面板保持可读（filter 不作用于 settings）。 */
+.island-root.night-dim .island-main {
+  filter: brightness(0.6) saturate(0.85);
+  transition: filter 600ms ease;
+}
