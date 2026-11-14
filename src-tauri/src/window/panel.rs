@@ -25,14 +25,21 @@ pub fn expand_panel(
     state: tauri::State<'_, Arc<SharedState>>,
 ) -> Result<(), String> {
     if state.island_expanded.load(Ordering::Relaxed) {
+        winplat::log::log("panel: expand ignored (already expanded)");
         return Ok(());
     }
     state.island_expanded.store(true, Ordering::Relaxed);
 
     let win = app
         .get_webview_window("island")
-        .ok_or_else(|| "island 窗口不存在".to_string())?;
-    shell::place(&win, Anchor::Island, PANEL_W, PANEL_H)?;
+        .ok_or_else(|| {
+            winplat::log::log("panel: expand FAILED - island window not found");
+            "island 窗口不存在".to_string()
+        })?;
+    if let Err(e) = shell::place(&win, Anchor::Island, PANEL_W, PANEL_H) {
+        winplat::log::log(&format!("panel: expand place FAILED: {e}"));
+        return Err(e);
+    }
 
     // 展开面板必须可交互：取消穿透，并把热区扩到整个面板。
     let _ = win.set_ignore_cursor_events(false);

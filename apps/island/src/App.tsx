@@ -119,10 +119,14 @@ export default function App() {
   const wasExpanded = useRef(false);
   useEffect(() => {
     if (mode === "expanded") {
-      invoke("expand_panel").catch(() => {});
+      invoke("expand_panel").catch((e) => {
+        invoke("log_frontend", { msg: `expand_panel invoke FAILED: ${e}` }).catch(() => {});
+      });
       wasExpanded.current = true;
     } else if (wasExpanded.current) {
-      invoke("collapse_panel").catch(() => {});
+      invoke("collapse_panel").catch((e) => {
+        invoke("log_frontend", { msg: `collapse_panel invoke FAILED: ${e}` }).catch(() => {});
+      });
       wasExpanded.current = false;
       setShowSettings(false);
     }
