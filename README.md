@@ -27,6 +27,82 @@ visual language):
 Full-resolution and later-milestone captures live in the local, git-ignored `artifacts/` directory —
 `artifacts/` is deliberately never committed (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+## Quick Start
+
+> **快速上手（普通用户看这里就够了，不用自己编译）**
+
+### 1. Install
+
+1. Go to [Releases](https://github.com/91-5/glasssuite/releases/latest) and download
+   `GlassSuite_<version>_x64-setup.exe`.
+2. Verify the checksum against the release's `SHA256SUMS` (see [Install](#install)).
+3. Run the installer. SmartScreen will warn (the build is unsigned) — click **More info → Run anyway**
+   *after* you have verified the checksum. No admin rights are needed (per-user install).
+4. Launch GlassSuite from the Start menu or the desktop shortcut. Two surfaces appear:
+   - **Island** — a glass pill at the **top center** of your screen.
+   - **Dock** — a glass bar at the **bottom center**.
+
+### 2. The dock (bottom)
+
+| Action | How |
+|---|---|
+| Show the dock | If auto-hide is on: move the mouse to the **bottom edge** of the screen. |
+| Open an app | **Click** its icon once. |
+| Start menu | Click the **⊞ button** at the left end of the dock. |
+| Reorder icons | **Press and drag** an icon; neighbours slide aside. Release to drop. |
+| Pin an app | In the start-menu panel, click the pin button on an app's row. |
+| Running apps | Apps that are running but not pinned appear as extra icons; clicking them focuses the window. |
+| Hover preview | Hover an icon to see a live DWM window preview (when supported). |
+
+### 3. The island (top)
+
+| Action | How |
+|---|---|
+| Expand the panel | **Hover** the island; the metrics panel (CPU / memory / GPU / network / weather) opens. |
+| Collapse | Move the mouse away. |
+| Open settings | Click the **⚙ gear** inside the expanded island. |
+| Media controls | When a player is active, prev / play-pause / next appear on the island. |
+| Notifications | Enable in settings — a one-line **summary** shows on the island (bodies never leave Windows' own toast). |
+
+### 4. Settings (the ⚙ panel)
+
+Everything is **off / empty by default** — GlassSuite phones home to no one. Enable only what you want:
+
+| Setting | What to fill in |
+|---|---|
+| **Weather** | Latitude / longitude (e.g. `21.27` / `110.35`). Uses [Open-Meteo](https://open-meteo.com), free, no API key. Refreshes every 15 min. |
+| **Network probe** | A URL to check reachability, e.g. `https://www.baidu.com`. Shows online/offline on the island. |
+| **AI endpoint** | Any **OpenAI-compatible** base URL (`https://host/v1`) + your API key + model name. Use **Test connection** to verify — the result shows right under the form. |
+| **Notifications** | Toggle on. Read-only summary; nothing is uploaded. |
+| **AI proactive care** | Optional gentle suggestions (lunch / dinner / sedentary / late-night). Off by default. |
+
+> **Notes on weather**
+> - The default source is Open-Meteo. If weather shows nothing while other network features work,
+>   the Open-Meteo endpoint may be unreachable from your network (TLS handshake timeouts have been
+>   observed on some routes). Check the log file — alternating `weather: updated` and
+>   `weather: 读取失败` lines confirm this.
+> - Coordinates are plain decimal degrees. Longitude **west** and latitude **south** are negative.
+
+> **Notes on the AI endpoint**
+> - The base URL must be half-width characters — a full-width slash (`／` U+FF0F) is silently
+>   rejected and the AI stays "not configured". Use **Test connection** if in doubt.
+> - The key is stored **only** in your local `settings.json` and is sent **only** to the endpoint
+>   you configured. There is no built-in or fallback endpoint in the source tree.
+
+### 5. Config files
+
+Everything lives in `%APPDATA%\com.glasssuite.app\`:
+
+| File | Purpose |
+|---|---|
+| `settings.json` | Weather / network / AI / notifications. Edit while the app is **not** running, or use the ⚙ panel (which writes it for you). |
+| `dock.json` | Pinned shortcuts and dock options. |
+| `menu.json` | Start-menu panel options. |
+| `glasssuite.log` | Event log (types and counts only — no paths, no bodies, no keys). |
+
+If you used the predecessor apps, existing `dev.glassdesk.app\dock.json` / `menu.json` are copied
+once on first launch — see [docs/migrate-from-glassdesk-glasspill.md](docs/migrate-from-glassdesk-glasspill.md).
+
 ## Features
 
 - **One process, shared state.** One WebView2 runtime, one GPU pipeline, one event loop. Full-screen
@@ -89,7 +165,7 @@ Releases publish two artifacts plus `SHA256SUMS`:
 Both are **unsigned**: expect the SmartScreen warning described at the top. Verify the checksum first:
 
 ```powershell
-Get-FileHash .\GlassSuite_0.1.0_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\GlassSuite_0.1.3_x64-setup.exe -Algorithm SHA256
 # compare with SHA256SUMS from the release
 ```
 
