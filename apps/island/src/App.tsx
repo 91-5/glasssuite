@@ -84,6 +84,11 @@ export default function App() {
    * 取消点击穿透，把下面窗口（浏览器标签栏等）的点击和拖拽全部吃掉。
    */
   const reportHotzone = useCallback((m: IslandMode, collapsed: boolean) => {
+    // OC-20261115-001：展开态不参与热区上报。Rust 的 expand_panel 在改窗口之前
+    // 就把冻结区域写成整面板（含药丸/球/10px 容差），前端这里按 PILL_METRICS
+    // 算出的 560×480 包围盒（且 x 被折成 -70）会把它缩小，正是「展开后快甩到
+    // 右上角 AI/网络按钮时面板突然收起」的结构性诱因。判定事实源只留 Rust 一份。
+    if (m === "expanded") return;
     if (collapsed) {
       invoke("set_hotzone", { x: 0, y: 0, w: 0, h: 0 }).catch(() => {});
       return;

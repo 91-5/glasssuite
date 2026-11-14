@@ -11,6 +11,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::shell::{self, Anchor};
 use crate::state::{Hotzone, SharedState};
+use crate::window::cursor;
 
 /// 展开面板尺寸（逻辑像素）。必须与 `packages/ipc-types` 的 `PANEL_SIZE` 一致。
 pub const PANEL_W: f64 = 720.0;
@@ -30,26 +31,39 @@ pub fn expand_panel(
     }
     state.island_expanded.store(true, Ordering::Relaxed);
 
+    // OC-20261115-001 D2：**改窗口之前**先把冻结区域写成覆盖展开前/后两个原点的
+    // 整面板并集。旧实现先 place 再写热区，中间那段窗口已变大而热区仍是药丸的
+    // 时序窗口，正是「快甩被误收起」的入口之一。
+    cursor::pre_expand_region(state.inner().as_ref());
+
     let win = app
         .get_webview_window("island")
         .ok_or_else(|| {
             winplat::log::log("panel: expand FAILED - island window not found");
+            state.island_expanded.store(false, Ordering::Relaxed);
+            cursor::refresh_region(state.inner().as_ref(), "expand-rollback");
             "island 窗口不存在".to_string()
         })?;
     if let Err(e) = shell::place(&win, Anchor::Island, PANEL_W, PANEL_H) {
         winplat::log::log(&format!("panel: expand place FAILED: {e}"));
+        state.island_expanded.store(false, Ordering::Relaxed);
+        cursor::refresh_region(state.inner().as_ref(), "expand-rollback");
         return Err(e);
     }
 
-    // 展开面板必须可交互：取消穿透，并把热区扩到整个面板。
+    // 展开面板必须可交互：取消穿透。展开期间 passthrough 不再随 enter/leave 翻转
+    // （cursor 确认 leave 时只发 island-hover=false，由 collapse_panel 统一恢复）。
     let _ = win.set_ignore_cursor_events(false);
     state.island_transparent.store(false, Ordering::Relaxed);
+    *state.island_scale.lock().unwrap() = win.scale_factor().unwrap_or(1.0);
     *state.island_hotzone.lock().unwrap() = Hotzone {
         x: 0.0,
         y: 0.0,
         w: PANEL_W,
         h: PANEL_H,
     };
+    // place 之后按新原点精确刷新；与展开前保守区域取并集，只增不减。
+    cursor::refresh_region_keep(state.inner().as_ref(), "post-expand");
 
     let _ = app.emit(PANEL_EVENT, true);
     winplat::log::log("panel: expanded");
@@ -73,14 +87,20 @@ pub fn collapse_panel(
         .ok_or_else(|| "island 窗口不存在".to_string())?;
     shell::place(&win, Anchor::Island, w, h)?;
 
-    // 热区清零：前端收到 `panel-state=false` 后会按当前模式重报（药丸或球）。
-    // 清零而不是沿用旧矩形——否则面板收起那一刻，透明区里还留着能吃掉桌面点击的旧热区。
+    // 热区清零：前端收到 `panel-state=false` / `island-placed` 后会按当前模式重报
+    // （药丸或球），每次上报都会重建冻结区域。清零而不是沿用旧矩形——否则面板
+    // 收起那一刻，透明区里还留着能吃掉桌面点击的旧热区。
     *state.island_hotzone.lock().unwrap() = Hotzone::default();
     *state.ball_hotzone.lock().unwrap() = Hotzone::default();
+    *state.ball_center.lock().unwrap() = (0.0, 0.0);
+    cursor::clear_region(state.inner().as_ref(), "collapse");
     // 恢复穿透。若光标仍在药丸上，钩子会在 80ms 防抖后重新置为可交互。
     state.island_transparent.store(true, Ordering::Relaxed);
     let _ = win.set_ignore_cursor_events(true);
 
+    // place() 内部已 emit 一次 island-placed；这里再显式发一次，兜住
+    // 「前端 mode effect 先于本命令执行」的时序，保证折叠热区一定被重报。
+    let _ = app.emit("island-placed", ());
     let _ = app.emit(PANEL_EVENT, false);
     winplat::log::log("panel: collapsed");
     Ok(())
