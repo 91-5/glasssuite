@@ -57,7 +57,27 @@ fn url_for(cfg: &WeatherConfig) -> String {
     )
 }
 
+/// 备选源（wttr.in，`format=j1` JSON）。Open-Meteo（OVH 线路）在部分网络下
+/// TLS 握手超时（2026-11-14 实测：TCP 可达但 ClientHello 无响应，三种 TLS
+/// 栈均复现），wttr.in 可达——主源失败时自动切换，恢复后仍优先主源。
+fn fallback_url_for(cfg: &WeatherConfig) -> String {
+    format!("https://wttr.in/{},{}?format=j1", cfg.latitude, cfg.longitude)
+}
+
 fn fetch(cfg: &WeatherConfig) -> Result<WeatherSnapshot, String> {
+    match fetch_primary(cfg) {
+        Ok(s) => Ok(s),
+        Err(primary_err) => match fetch_fallback(cfg) {
+            Ok(s) => {
+                winplat::log::log("weather: primary failed, fallback ok (wttr.in)");
+                Ok(s)
+            }
+            Err(fallback_err) => Err(format!("{primary_err}; fallback: {fallback_err}")),
+        },
+    }
+}
+
+fn fetch_primary(cfg: &WeatherConfig) -> Result<WeatherSnapshot, String> {
     let body = ureq::get(&url_for(cfg))
         .timeout(Duration::from_secs(10))
         .call()
@@ -65,6 +85,16 @@ fn fetch(cfg: &WeatherConfig) -> Result<WeatherSnapshot, String> {
         .into_string()
         .map_err(|e| format!("body: {e}"))?;
     parse(&body)
+}
+
+fn fetch_fallback(cfg: &WeatherConfig) -> Result<WeatherSnapshot, String> {
+    let body = ureq::get(&fallback_url_for(cfg))
+        .timeout(Duration::from_secs(10))
+        .call()
+        .map_err(|e| format!("HTTP: {e}"))?
+        .into_string()
+        .map_err(|e| format!("body: {e}"))?;
+    parse_fallback(&body)
 }
 
 /// 从 Open-Meteo 的 `current_weather` 里取三个字段。抽出来便于单测（无网络）。
@@ -84,6 +114,29 @@ fn parse(body: &str) -> Result<WeatherSnapshot, String> {
             .unwrap_or(0) as u32,
         is_day: current.get("is_day").and_then(|v| v.as_u64()).unwrap_or(1) == 1,
     })
+}
+
+/// wttr.in `format=j1`：`current_condition[0]` 的 `temp_C`（字符串）、
+/// `weatherCode`（字符串）、`isday`（"yes"/"no"）。
+fn parse_fallback(body: &str) -> Result<WeatherSnapshot, String> {
+    let json: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("JSON: {e}"))?;
+    let cc = json
+        .get("current_condition")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .ok_or_else(|| "缺少 current_condition".to_string())?;
+    let temp_c = cc
+        .get("temp_C")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .ok_or_else(|| "缺少 temp_C".to_string())?;
+    let code = cc
+        .get("weatherCode")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let is_day = cc.get("isday").and_then(|v| v.as_str()) != Some("no");
+    Ok(WeatherSnapshot { temp_c, code, is_day })
 }
 
 #[cfg(test)]
@@ -116,5 +169,33 @@ mod tests {
         assert!(url.contains("latitude=48.85"));
         assert!(url.contains("longitude=2.35"));
         assert!(url.contains("timezone=Europe/Paris"));
+    }
+
+    #[test]
+    fn fallback_url_uses_configured_coords() {
+        let cfg = WeatherConfig {
+            latitude: 21.27,
+            longitude: 110.35,
+            timezone: None,
+        };
+        let url = fallback_url_for(&cfg);
+        assert!(url.starts_with("https://wttr.in/"));
+        assert!(url.contains("21.27,110.35"));
+    }
+
+    /// wttr.in `format=j1` 的 current_condition 结构（字段名与 Open-Meteo 完全不同）。
+    #[test]
+    fn parse_fallback_current_condition() {
+        let body = r#"{"current_condition":[{"temp_C":"27","weatherCode":"113","isday":"yes"}]}"#;
+        let s = parse_fallback(body).unwrap();
+        assert!((s.temp_c - 27.0).abs() < 1e-9);
+        assert_eq!(s.code, 113);
+        assert!(s.is_day);
+    }
+
+    #[test]
+    fn parse_fallback_missing_field_is_error() {
+        assert!(parse_fallback(r#"{"current_condition":[]}"#).is_err());
+        assert!(parse_fallback("not json").is_err());
     }
 }
