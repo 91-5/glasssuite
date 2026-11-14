@@ -15,6 +15,13 @@ use crate::settings::WeatherConfig;
 const FIRST_DELAY: Duration = Duration::from_secs(5);
 /// 刷新周期。Open-Meteo 免费额度按请求计，15min 完全够用。
 const REFRESH: Duration = Duration::from_secs(900);
+/// 失败后的快速重试间隔：重启后首拉失败不该空窗 15 分钟（2026-11-14 实测）。
+const QUICK_RETRY: Duration = Duration::from_secs(60);
+/// 快速重试次数上限，超过后退回常规节奏（别对故障源打请求）。
+const QUICK_RETRY_MAX: u32 = 3;
+/// 单轮拉取的硬截止。ureq 的 timeout 不覆盖 DNS/connect 挂死
+/// （ai/mod.rs 同款教训），放短命线程里等结果，超时放弃本轮。
+const FETCH_DEADLINE: Duration = Duration::from_secs(30);
 
 /// 归一化后的天气快照。只给界面需要的最小集合，不透传第三方 JSON 结构。
 #[derive(Debug, Clone, Serialize)]
@@ -35,18 +42,60 @@ pub fn spawn(handle: AppHandle, config: Option<WeatherConfig>) {
     };
 
     std::thread::spawn(move || {
-        std::thread::sleep(FIRST_DELAY);
-        loop {
-            match fetch(&cfg) {
-                Ok(snapshot) => {
-                    let _ = handle.emit("weather", snapshot);
-                    winplat::log::log("weather: updated");
-                }
-                Err(e) => winplat::log::log(&format!("weather: 拉取失败：{e}")),
-            }
-            std::thread::sleep(REFRESH);
+        // 线程 panic 不能静默死（2026-11-14：进程内无线程级 panic 钩子，
+        // 静默死亡的表象就是「天气再也不更新」）。记日志后退出，重启应用恢复。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            weather_loop(&handle, &cfg);
+        }));
+        if result.is_err() {
+            winplat::log::log("weather: 线程 panic，已退出（重启应用恢复）");
         }
     });
+}
+
+fn weather_loop(handle: &AppHandle, cfg: &WeatherConfig) {
+    std::thread::sleep(FIRST_DELAY);
+    let mut failures: u32 = 0;
+    loop {
+        match fetch_with_deadline(cfg) {
+            Ok(snapshot) => {
+                let _ = handle.emit("weather", snapshot);
+                winplat::log::log("weather: updated");
+                failures = 0;
+            }
+            Err(e) => {
+                failures += 1;
+                winplat::log::log(&format!("weather: 拉取失败（连续 {failures} 次）：{e}"));
+            }
+        }
+        let wait = if failures == 0 || failures > QUICK_RETRY_MAX {
+            REFRESH
+        } else {
+            QUICK_RETRY
+        };
+        std::thread::sleep(wait);
+    }
+}
+
+/// 硬截止包装：DNS/connect 挂死时 ureq 的 timeout 不生效
+/// （ai/mod.rs:354 同款教训），放短命线程里等结果，超时放弃本轮。
+/// 超时后阻塞线程会泄漏一个，量级（每 15min 至多一个）可接受。
+fn fetch_with_deadline(cfg: &WeatherConfig) -> Result<WeatherSnapshot, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cfg2 = cfg.clone();
+    std::thread::Builder::new()
+        .name("glasssuite-weather-fetch".into())
+        .spawn(move || {
+            let _ = tx.send(fetch(&cfg2));
+        })
+        .map_err(|e| format!("spawn: {e}"))?;
+    match rx.recv_timeout(FETCH_DEADLINE) {
+        Ok(res) => res,
+        Err(_) => Err(format!(
+            "硬截止超时（{}s），本轮放弃",
+            FETCH_DEADLINE.as_secs()
+        )),
+    }
 }
 
 fn url_for(cfg: &WeatherConfig) -> String {
