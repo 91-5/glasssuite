@@ -61,7 +61,10 @@ fn url_for(cfg: &WeatherConfig) -> String {
 /// TLS 握手超时（2026-11-14 实测：TCP 可达但 ClientHello 无响应，三种 TLS
 /// 栈均复现），wttr.in 可达——主源失败时自动切换，恢复后仍优先主源。
 fn fallback_url_for(cfg: &WeatherConfig) -> String {
-    format!("https://wttr.in/{},{}?format=j1", cfg.latitude, cfg.longitude)
+    format!(
+        "https://wttr.in/{},{}?format=j1",
+        cfg.latitude, cfg.longitude
+    )
 }
 
 fn fetch(cfg: &WeatherConfig) -> Result<WeatherSnapshot, String> {
@@ -136,7 +139,11 @@ fn parse_fallback(body: &str) -> Result<WeatherSnapshot, String> {
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
     let is_day = cc.get("isday").and_then(|v| v.as_str()) != Some("no");
-    Ok(WeatherSnapshot { temp_c, code, is_day })
+    Ok(WeatherSnapshot {
+        temp_c,
+        code,
+        is_day,
+    })
 }
 
 #[cfg(test)]
