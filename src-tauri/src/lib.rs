@@ -36,6 +36,24 @@ pub fn run() {
     let data_dir =
         winplat::config::app_data_dir(winplat::IDENTIFIER).unwrap_or_else(std::env::temp_dir);
     let _ = winplat::log::init(&data_dir);
+
+    // panic hook 必须在日志就绪后、任何线程启动前安装：默认 panic 只打到 stderr，
+    // 而窗口应用的 stderr 无人看——2026-11-14 两次静默退出（Event Log 零记录、
+    // 零转储）就是这么失踪的。落进 glasssuite.log 才有破案线索。
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".into());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string payload>".into());
+        winplat::log::log(&format!("PANIC at {loc}: {msg}"));
+    }));
+
     winplat::log::log("== GlassSuite 启动 ==");
 
     let _instance_guard = match winplat::instance::acquire(winplat::instance::NAME) {
@@ -180,8 +198,33 @@ pub fn run() {
             island::ai::spawn(handle.clone(), ai_state, st);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("Tauri 运行失败");
+        .build(tauri::generate_context!())
+        .map(run_with_exit_logging)
+        .unwrap_or_else(|e| {
+            winplat::log::log(&format!("Tauri 构建失败: {e}"));
+            panic!("Tauri 构建失败: {e}");
+        });
+}
+
+/// 事件循环退出原因观测（只记日志，不改变行为）。
+///
+/// `.run()` 不给退出原因；`build().run(callback)` 能看到 `RunEvent::ExitRequested`
+/// （所有窗口关闭/显式退出）与 `RunEvent::Exit`。2026-11-14 两次静默退出时
+/// 日志戛然而止、无任何记录——有了这里，下次失踪至少留一行「死于何因」。
+fn run_with_exit_logging(app: tauri::App) {
+    use tauri::RunEvent;
+    app.run(|app_handle, event| {
+        if let RunEvent::ExitRequested { code, .. } = event {
+            winplat::log::log(&format!(
+                "exit requested: code={code:?} windows_alive={}",
+                app_handle
+                    .webview_windows()
+                    .iter()
+                    .filter(|(_, w)| w.is_visible().unwrap_or(false))
+                    .count()
+            ));
+        }
+    });
 }
 
 /// dock 域初始化（从 glassdesk `lib.rs` setup 移植）。
