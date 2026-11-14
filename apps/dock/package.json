@@ -1,7 +1,7 @@
 {
   "name": "@glasssuite/dock",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "GlassSuite 底部 dock 与开始菜单窗口前端（glassdesk v0.8.1 直移植）。",
   "scripts": {
