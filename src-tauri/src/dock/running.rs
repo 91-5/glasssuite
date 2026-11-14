@@ -30,17 +30,17 @@ use std::sync::{LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND, LPARAM};
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND, LPARAM, RECT};
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EnumWindows, FindWindowExW, GetClassNameW, GetWindowLongPtrW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PeekMessageW, TranslateMessage,
-    EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, GWL_EXSTYLE, MSG, PM_REMOVE, WINDOW_LONG_PTR_INDEX,
-    WINEVENT_OUTOFCONTEXT, WM_QUIT,
+    DispatchMessageW, EnumWindows, FindWindowExW, GetClassNameW, GetWindow, GetWindowLongPtrW,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    PeekMessageW, TranslateMessage, EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, GW_OWNER, GWL_EXSTYLE,
+    MSG, PM_REMOVE, WINDOW_LONG_PTR_INDEX, WINEVENT_OUTOFCONTEXT, WM_QUIT,
 };
 
 const WS_EX_TOOLWINDOW: isize = 0x80;
@@ -279,6 +279,38 @@ pub fn find_window_for_key(key: &str) -> Option<(isize, bool)> {
     payload.hit
 }
 
+/// 同 key 的**全部**可激活顶层窗口（z 序，cloaked 跳过）。
+///
+/// OC-20261115-003 D4：多窗口合并成 dock 一条后，点击要能判「是否全部最小化」，
+/// 才能决定是 restore 还是把某个可见窗口前置。`find_window_for_key` 只给 z 序
+/// 最前那一个，不足以表达这个语义。
+pub fn windows_for_key(key: &str) -> Vec<(isize, bool)> {
+    struct P<'a> {
+        key: &'a str,
+        seen: &'a mut Vec<isize>,
+        out: Vec<(isize, bool)>,
+    }
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        let p = &mut *(lparam.0 as *mut P);
+        if let Some(k) = window_key(hwnd, p.seen) {
+            if k == *p.key && !is_cloaked(hwnd) {
+                p.out.push((hwnd.0 as isize, IsIconic(hwnd).as_bool()));
+            }
+        }
+        true.into()
+    }
+    let mut seen: Vec<isize> = Vec::new();
+    let mut payload = P {
+        key,
+        seen: &mut seen,
+        out: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(collect), LPARAM(&mut payload as *mut P as isize));
+    }
+    payload.out
+}
+
 /// 窗口是否被 DWM 遮罩（虚拟桌面隐藏 / UWP 挂起等）。
 fn is_cloaked(hwnd: HWND) -> bool {
     let mut c: u32 = 0;
@@ -339,7 +371,34 @@ unsafe fn window_key(hwnd: HWND, seen_frames: &mut Vec<isize>) -> Option<String>
     if pid == 0 || pid == std::process::id() {
         return None;
     }
-    if is_skipped_class(hwnd) || is_toolwindow(hwnd) {
+
+    // OC-20261115-003 D2：只认「用户可感知的应用窗口」。
+    // 旧实现只看 IsWindowVisible + 类名黑名单 + TOOLWINDOW，于是 DWM cloaked 的
+    // UWP 影子窗、有 owner 的辅助窗、空标题的外壳窗、0×0 的临时占位窗都会产出
+    // key。这些窗口在两次 500ms 轮询间反复进出快照，正是 transient 条目数 ±1
+    // 抖动的来源（取证见 artifacts/oc20261115-transients/before-window-dump.log）。
+    let mut cls_buf = [0u16; 128];
+    let cn = GetClassNameW(hwnd, &mut cls_buf);
+    let class = String::from_utf16_lossy(&cls_buf[..(cn.max(0) as usize).min(cls_buf.len())]);
+    let mut title_buf = [0u16; 512];
+    let tn = GetWindowTextW(hwnd, &mut title_buf);
+    let title = String::from_utf16_lossy(&title_buf[..(tn.max(0) as usize).min(title_buf.len())]);
+    let mut rect = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut rect);
+    let has_owner = GetWindow(hwnd, GW_OWNER)
+        .map(|h| !h.0.is_null())
+        .unwrap_or(false);
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if !perceptible_window(
+        &class,
+        &title,
+        is_cloaked(hwnd),
+        has_owner,
+        is_toolwindow(hwnd),
+        width,
+        height,
+    ) {
         return None;
     }
 
@@ -440,16 +499,42 @@ unsafe fn exe_path_of(pid: u32) -> Option<String> {
     })
 }
 
-fn is_skipped_class(hwnd: HWND) -> bool {
-    unsafe {
-        let mut buf = [0u16; 64];
-        let n = GetClassNameW(hwnd, &mut buf);
-        let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
-        matches!(
-            class.as_str(),
-            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-        )
-    }
+/// 桌面 / 外壳 / 系统临时占位窗口类名（不是用户可感知应用）。
+///
+/// `Open With Dummy Window Class For Interim Dialog` 是 Windows「打开方式」的临时
+/// 占位窗：本机实测同一时刻有 5 个（4 个在 -32000,-32000，1 个 0×0），系统在
+/// 反复创建/销毁它们。它们的 key 全是 `exe:c:\windows\system32\openwith.exe`，
+/// 一旦可见性在两次轮询间翻转，transient 条目数就 ±1。
+fn is_skipped_class_name(class: &str) -> bool {
+    matches!(
+        class,
+        "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "ThumbnailDeviceHelperWnd"
+            | "XamlExplorerHostIslandWindow_WASDK"
+            | "Open With Dummy Window Class For Interim Dialog"
+    )
+}
+
+/// 「用户可感知应用窗口」判定（OC-20261115-003 D2 的纯函数口径，可单测）。
+pub fn perceptible_window(
+    class: &str,
+    title: &str,
+    cloaked: bool,
+    has_owner: bool,
+    toolwindow: bool,
+    width: i32,
+    height: i32,
+) -> bool {
+    !cloaked
+        && !has_owner
+        && !toolwindow
+        && !title.trim().is_empty()
+        && width > 0
+        && height > 0
+        && !is_skipped_class_name(class)
 }
 
 unsafe fn is_toolwindow(hwnd: HWND) -> bool {
@@ -510,4 +595,46 @@ unsafe extern "system" fn winevent_proc(
     _dwmseventtime: u32,
 ) {
     DIRTY.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod perceptible_tests {
+    use super::*;
+
+    const NORMAL: (&str, &str, bool, bool, bool, i32, i32) =
+        ("Chrome_WidgetWin_1", "Chrome", false, false, false, 1200, 800);
+
+    #[test]
+    fn normal_and_minimized_app_windows_are_perceptible() {
+        let (c, t, cl, o, tw, w, h) = NORMAL;
+        assert!(perceptible_window(c, t, cl, o, tw, w, h));
+        // 最小化窗口 rect 落在 -32000，但宽高仍 >0 —— 与任务栏语义一致，照常算运行。
+        assert!(perceptible_window(c, t, cl, o, tw, 160, 28));
+    }
+
+    #[test]
+    fn cloaked_owner_toolwindow_and_empty_title_are_rejected() {
+        let (c, t, _, o, tw, w, h) = NORMAL;
+        assert!(!perceptible_window(c, t, true, o, tw, w, h), "DWM cloaked");
+        assert!(!perceptible_window(c, t, false, true, tw, w, h), "有 owner");
+        assert!(!perceptible_window(c, t, false, o, true, w, h), "TOOLWINDOW");
+        assert!(!perceptible_window(c, "", false, o, tw, w, h), "空标题");
+        assert!(!perceptible_window(c, "   ", false, o, tw, w, h), "空白标题");
+    }
+
+    #[test]
+    fn shell_placeholder_and_zero_size_windows_are_rejected() {
+        // 取证里 5 个反复创建/销毁的「打开方式」占位窗。
+        assert!(!perceptible_window(
+            "Open With Dummy Window Class For Interim Dialog",
+            "选取应用",
+            false,
+            false,
+            false,
+            160,
+            28
+        ));
+        assert!(!perceptible_window("Chrome_WidgetWin_1", "X", false, false, false, 0, 0));
+        assert!(!perceptible_window("Progman", "Program Manager", false, false, false, 1920, 1080));
+    }
 }

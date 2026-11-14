@@ -129,6 +129,8 @@ export const EVENTS = {
   dockPreviewFallback: "dock-preview-fallback",
   /** 开始菜单开合状态（后端 show/hide 完成后下发）。 */
   dockMenuState: "dock-menu-state",
+  /** OC-20261115-003：临时区超过 TRANSIENT_MAX，payload = 被挤出条目数（前端弹 notice）。 */
+  dockTransientCapped: "dock-transient-capped",
 } as const;
 
 /** `fit_dock` / `fit_island` 入参（CSS 逻辑像素）。 */

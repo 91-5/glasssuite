@@ -10,7 +10,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -1039,7 +1039,7 @@ pub fn cap_transients(keys: Vec<String>) -> (Vec<String>, usize) {
     (keys.into_iter().take(TRANSIENT_MAX).collect(), dropped)
 }
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
 /// 临时图标内存缓存（图标提取最贵 3s COM 超时；key 命中不重复提取）。
@@ -1167,7 +1167,102 @@ fn transient_entry(key: &str) -> TransientApp {
     }
 }
 
-/// 临时条目全集（命令与探针共用）：快照 − dock.json − menu.json，截断到上限。
+// ---------------------------------------------------------------------------
+// OC-20261115-003：差集取证 / 滞回去抖 / 归并去重 / 上限提示
+// ---------------------------------------------------------------------------
+
+/// 进入/退出都要连续几次采样才生效（2 次 × 500ms ≈ 1s，满足 §4-#5 的 ≤2s）。
+pub const HYSTERESIS_SAMPLES: u8 = 2;
+
+/// 滞回状态。`stable` 的元素是 `key|icon_ready` 指纹，图标就绪态抖动同样被去抖。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TransientHysteresis {
+    pub stable: BTreeSet<String>,
+    pub hits: BTreeMap<String, u8>,
+    pub misses: BTreeMap<String, u8>,
+}
+
+impl TransientHysteresis {
+    pub fn is_fresh(&self) -> bool {
+        self.stable.is_empty() && self.hits.is_empty() && self.misses.is_empty()
+    }
+}
+
+/// 纯函数：单次抖动不改变稳定集合；进入需连续 N 次命中，退出需连续 N 次缺失。
+pub fn hysteresis_step(
+    mut st: TransientHysteresis,
+    observed: &BTreeSet<String>,
+) -> TransientHysteresis {
+    // 首帧直接定基：启动时不让所有已运行程序凭空消失 1s（不算「进入」）。
+    if st.is_fresh() {
+        st.stable = observed.clone();
+        return st;
+    }
+    let mut hits = BTreeMap::new();
+    for fp in observed {
+        if st.stable.contains(fp) {
+            continue;
+        }
+        let n = st.hits.get(fp).copied().unwrap_or(0) + 1;
+        if n >= HYSTERESIS_SAMPLES {
+            st.stable.insert(fp.clone());
+        } else {
+            hits.insert(fp.clone(), n);
+        }
+    }
+    st.hits = hits;
+
+    let mut misses = BTreeMap::new();
+    for fp in st.stable.clone() {
+        if observed.contains(&fp) {
+            continue;
+        }
+        let n = st.misses.get(&fp).copied().unwrap_or(0) + 1;
+        if n >= HYSTERESIS_SAMPLES {
+            st.stable.remove(&fp);
+        } else {
+            misses.insert(fp, n);
+        }
+    }
+    st.misses = misses;
+    st
+}
+
+/// 稳定指纹 → 渲染用 key 列表（去掉 `|icon_ready` 后缀）。
+pub fn stable_keys(st: &TransientHysteresis) -> Vec<String> {
+    st.stable
+        .iter()
+        .map(|fp| fp.split_once('|').map_or(fp.clone(), |(k, _)| k.to_string()))
+        .collect()
+}
+
+/// D4 纯函数：AUMID 优先、exe 路径兜底。同一应用若同时产出 `aumid:` 与
+/// `exe:` 两个 key，只保留 AUMID 那条，避免临时区出现重复条目。
+pub fn merge_alias_keys(keys: Vec<String>, aliases: &[(String, String)]) -> Vec<String> {
+    let present: HashSet<&str> = keys.iter().map(String::as_str).collect();
+    let mut shadowed: HashSet<&str> = HashSet::new();
+    for (aumid_key, exe_key) in aliases {
+        if present.contains(aumid_key.as_str()) {
+            shadowed.insert(exe_key.as_str());
+        }
+    }
+    keys.into_iter()
+        .filter(|k| !shadowed.contains(k.as_str()))
+        .collect()
+}
+
+static LAST_OBSERVED: LazyLock<Mutex<Option<BTreeSet<String>>>> =
+    LazyLock::new(|| Mutex::new(None));
+static TRANSIENT_HYST: LazyLock<Mutex<TransientHysteresis>> =
+    LazyLock::new(|| Mutex::new(TransientHysteresis::default()));
+/// 最近一次被上限挤出的条目数（供前端 notice，不再只 eprintln!）。
+static TRANSIENT_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+pub fn transient_dropped() -> usize {
+    TRANSIENT_DROPPED.load(Ordering::Relaxed)
+}
+
+/// 临时条目全集（命令与探针共用）：快照 − dock.json − menu.json → 归并 → 截断 → 滞回。
 /// `menu_paths` 由调用方给（app 进程走 menu::all_pinned_paths；探针直接读 menu.json）。
 pub fn transient_apps(
     snap: &HashSet<String>,
@@ -1177,11 +1272,70 @@ pub fn transient_apps(
     // 目录懒启动：让 friendly name / 图标在首次查询后陆续可用（幂等，同面板线程）
     crate::dock::menu::ensure_catalog_started();
     let owned = owned_keys(dock_cfg, menu_paths);
-    let (keys, dropped) = cap_transients(transient_filter(snap, &owned));
+    let filtered = transient_filter(snap, &owned);
+
+    // D4：AUMID 与 exe 指向同一应用时只留 AUMID 一条。
+    let aliases: Vec<(String, String)> = filtered
+        .iter()
+        .filter_map(|k| {
+            let aumid = k.strip_prefix("aumid:")?;
+            let hit = crate::dock::menu::catalog_lookup_aumid(aumid)?;
+            Some((
+                k.clone(),
+                format!(
+                    "exe:{}",
+                    crate::dock::running::normalize_path(&hit.path)
+                ),
+            ))
+        })
+        .collect();
+    let (keys, dropped) = cap_transients(merge_alias_keys(filtered, &aliases));
+    TRANSIENT_DROPPED.store(dropped, Ordering::Relaxed);
     if dropped > 0 {
-        eprintln!("transient icons over cap: {dropped} hidden (max {TRANSIENT_MAX})");
+        // §5-4：不许只 eprintln!，用户要能看到提示（api.rs 会 emit 给前端 notice）。
+        menu::debug_note(&format!(
+            "dock: transient capped dropped={dropped} max={TRANSIENT_MAX}"
+        ));
     }
-    keys.iter().map(|k| transient_entry(k)).collect()
+
+    // 指纹 = key + 图标就绪态（D3：两者都参与，但单次抖动不改渲染）。
+    let observed: BTreeSet<String> = keys
+        .iter()
+        .map(|k| {
+            let ready = if transient_entry(k).icon.is_some() { 1 } else { 0 };
+            format!("{k}|{ready}")
+        })
+        .collect();
+
+    // D1 差集日志：只在**真的有变化**时打一行。静置零抖动 = 零日志，
+    // 天然满足「验收后降为 debug 级、不许变成噪声源」。
+    if let Ok(mut last) = LAST_OBSERVED.lock() {
+        if let Some(prev) = last.as_ref() {
+            let added: Vec<&String> = observed.difference(prev).collect();
+            let removed: Vec<&String> = prev.difference(&observed).collect();
+            if !added.is_empty() || !removed.is_empty() {
+                menu::debug_note(&format!(
+                    "dock: transient-diff added=[{}] removed=[{}]",
+                    added.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","),
+                    removed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")
+                ));
+            }
+        }
+        *last = Some(observed.clone());
+    }
+
+    // D3 滞回：渲染集合只看 stable，单次 ±1 抖动进不来。
+    let st = if let Ok(mut g) = TRANSIENT_HYST.lock() {
+        let next = hysteresis_step(std::mem::take(&mut *g), &observed);
+        *g = next.clone();
+        next
+    } else {
+        hysteresis_step(TransientHysteresis::default(), &observed)
+    };
+    stable_keys(&st)
+        .iter()
+        .map(|k| transient_entry(k))
+        .collect()
 }
 
 /// 把临时条目固定进 dock.json（卡面 §1.3-3：atomic_write + bump 版本）。
@@ -1219,6 +1373,35 @@ pub fn pin_transient_key(cfg_path: &Path, key: &str) -> Result<Shortcut, String>
 /// 单击临时图标 → 激活该应用（复用 activate_or_launch 的 find_window_for_key 快路径；
 /// 临时条目必然在运行，快路径命中，launch 只是类型完备的兜底）。
 pub fn transient_activate(aumid: &Option<String>, path: &str) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
+    };
+
+    // OC-20261115-003 D4：同一应用多窗口已合并成一条临时图标；
+    // 全部最小化 → 还原最前那一个，否则把最前的可见窗口置前。
+    let key = crate::dock::running::key_for_shortcut(aumid, path);
+    let wins = crate::dock::running::windows_for_key(&key);
+    if !wins.is_empty() {
+        let all_minimized = wins.iter().all(|(_, m)| *m);
+        let target = if all_minimized {
+            wins.first()
+        } else {
+            wins.iter().find(|(_, m)| !*m).or_else(|| wins.first())
+        };
+        if let Some((raw, _)) = target {
+            let hwnd = HWND(*raw as *mut c_void);
+            unsafe {
+                if all_minimized {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                }
+                if !SetForegroundWindow(hwnd).as_bool() {
+                    SwitchToThisWindow(hwnd, true);
+                }
+            }
+            return Ok(());
+        }
+    }
     activate_or_launch(aumid, path)
 }
 
@@ -1489,5 +1672,83 @@ mod transient_tests {
         assert!(!interaction_locked(), "超时必须强制释放");
         assert!(INTERACTION_LOCK.lock().unwrap().is_none());
         assert!(INTERACTION_TIMEOUT.as_millis() <= 600, "兜底不得超过 600ms");
+    }
+
+    // ---- OC-20261115-003 §4-1：滞回去抖 / 归并去重纯函数 ----
+    fn fp_set(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn hysteresis_single_flap_never_changes_rendered_set() {
+        let base = fp_set(&["a|1", "b|1"]);
+        let st = hysteresis_step(TransientHysteresis::default(), &base);
+        assert_eq!(st.stable, base, "首帧直接定基");
+
+        // c 只出现一次：不得进入稳定集合
+        let flap = fp_set(&["a|1", "b|1", "c|1"]);
+        let st = hysteresis_step(st, &flap);
+        assert_eq!(st.stable, base);
+        assert_eq!(st.hits.get("c|1"), Some(&1));
+
+        // 回到只有 a：c 的命中计数被清零，b 只缺失一次也不得退出
+        let back = fp_set(&["a|1"]);
+        let st = hysteresis_step(st, &back);
+        assert_eq!(st.stable, base);
+        assert!(!st.hits.contains_key("c|1"), "单次命中的候选应被清空");
+        assert_eq!(st.misses.get("b|1"), Some(&1));
+    }
+
+    #[test]
+    fn hysteresis_enter_and_exit_need_two_consecutive_samples() {
+        let base = fp_set(&["a|1"]);
+        let mut st = hysteresis_step(TransientHysteresis::default(), &base);
+        let with_b = fp_set(&["a|1", "b|1"]);
+        st = hysteresis_step(st, &with_b);
+        assert!(!st.stable.contains("b|1"), "第一次命中不进入");
+        st = hysteresis_step(st, &with_b);
+        assert!(st.stable.contains("b|1"), "连续第二次命中才进入");
+
+        let only_b = fp_set(&["b|1"]);
+        st = hysteresis_step(st, &only_b);
+        assert!(st.stable.contains("a|1"), "第一次缺失不退出");
+        st = hysteresis_step(st, &only_b);
+        assert!(!st.stable.contains("a|1"), "连续第二次缺失才退出");
+    }
+
+    #[test]
+    fn hysteresis_damps_icon_ready_flapping() {
+        let with_icon = fp_set(&["a|1"]);
+        let st = hysteresis_step(TransientHysteresis::default(), &with_icon);
+        // 图标就绪态在 None↔Some 之间抖一次：渲染集合不变
+        let no_icon = fp_set(&["a|0"]);
+        let st = hysteresis_step(st, &no_icon);
+        assert_eq!(stable_keys(&st), vec!["a".to_string()]);
+        assert!(st.stable.contains("a|1"));
+        // 连续两次才真正换指纹
+        let st = hysteresis_step(st, &no_icon);
+        assert!(st.stable.contains("a|0"));
+        assert!(!st.stable.contains("a|1"));
+        assert_eq!(stable_keys(&st), vec!["a".to_string()], "key 仍只有一条");
+    }
+
+    #[test]
+    fn merge_alias_keys_prefers_aumid_over_exe() {
+        let keys = vec![
+            "aumid:m.calc!app".to_string(),
+            "exe:c:\\program files\\calc.exe".to_string(),
+            "exe:d:\\other\\app.exe".to_string(),
+        ];
+        let aliases = vec![(
+            "aumid:m.calc!app".to_string(),
+            "exe:c:\\program files\\calc.exe".to_string(),
+        )];
+        let got = merge_alias_keys(keys, &aliases);
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&"aumid:m.calc!app".to_string()));
+        assert!(!got.iter().any(|k| k.contains("calc.exe")));
+        // 没有对应 AUMID 时 exe 条目原样保留
+        let plain = merge_alias_keys(vec!["exe:d:\\other\\app.exe".to_string()], &aliases);
+        assert_eq!(plain.len(), 1);
     }
 }

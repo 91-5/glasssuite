@@ -584,6 +584,20 @@ function App() {
       un.then((f) => f());
     };
   }, []);
+
+  // OC-20261115-003 D5：临时区被上限挤出时给前端可见提示（长期功能，不许删）。
+  // Rust 侧 cap_transients 只在真超过 TRANSIENT_MAX 时 emit，静置零噪声。
+  useEffect(() => {
+    const un = listen<number>("dock-transient-capped", (e) => {
+      const n = Number(e.payload) || 0;
+      if (n <= 0) return;
+      setNotice(`已挤出 ${n} 个运行中的应用（临时区上限 10）`);
+      window.setTimeout(() => setNotice(null), 4000);
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
   // 当前让位态：drop = 滞回后的插入位（others 语义），pitch = 快照槽距。
   // null = 没有让位（未起拖 / 已拖出 / 已松手）。
   const [makeWay, setMakeWay] = useState<{ drop: number; pitch: number } | null>(null);

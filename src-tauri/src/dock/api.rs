@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 use super::free;
 use super::menu;
@@ -391,7 +391,13 @@ pub fn get_transient_running(
     let cfg = crate::dock::load_config(&p);
     let menu_paths = menu::all_pinned_paths();
     let snap = running::snapshot();
-    Ok(crate::dock::transient_apps(&snap, &cfg, &menu_paths))
+    let list = crate::dock::transient_apps(&snap, &cfg, &menu_paths);
+    // OC-20261115-003 D5：被上限挤出时不再只 eprintln!，通知前端弹 notice。
+    let dropped = crate::dock::transient_dropped();
+    if dropped > 0 {
+        let _ = app.emit("dock-transient-capped", dropped);
+    }
+    Ok(list)
 }
 
 /// v0.8：右键临时图标 →「固定到 dock」（atomic_write + bump 版本）。
