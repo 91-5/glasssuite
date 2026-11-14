@@ -1,6 +1,8 @@
 //! dock 命令层 —— 从 glassdesk `src-tauri/src/lib.rs` 移植的全部 `#[tauri::command]`。
 //! 只改模块路径（dock:: → crate::dock::、menu:: → crate::dock::menu:: 等），逻辑零改动。
 
+use std::time::{Duration, Instant};
+
 use tauri::Manager;
 
 use super::free;
@@ -77,13 +79,25 @@ pub fn remove_shortcut(
     app: tauri::AppHandle,
     id: String,
 ) -> Result<Vec<crate::dock::Shortcut>, String> {
+    // OC-20261115-002 D5：右键移除此前是「点了没反应也不知道为什么」——
+    // 成功/失败都必须落 menu.log，失败还要让前端弹 notice。
     let Some(p) = crate::dock::config_path(&app) else {
-        return Err("无法定位配置目录".into());
+        let e = "无法定位配置目录".to_string();
+        menu::debug_note(&format!("dock: remove {id} err={e}"));
+        return Err(e);
     };
     let mut cfg = crate::dock::load_config(&p);
     cfg.shortcuts.retain(|s| s.id != id);
-    crate::dock::save_config(&p, &cfg)?;
-    Ok(cfg.shortcuts)
+    match crate::dock::save_config(&p, &cfg) {
+        Ok(()) => {
+            menu::debug_note(&format!("dock: remove {id} ok"));
+            Ok(cfg.shortcuts)
+        }
+        Err(e) => {
+            menu::debug_note(&format!("dock: remove {id} err={e}"));
+            Err(e)
+        }
+    }
 }
 
 /// v0.5.1（sir 反馈）：dock 图标拖动排序——按 path 顺序重排 dock.json 并持久化。
@@ -189,6 +203,22 @@ pub fn debug_note(msg: String) -> Result<(), String> {
     Ok(())
 }
 
+/// OC-20261115-002 D4：一次按压手势开始。锁期间 dock_logic 不定位/不显隐，
+/// fit_dock 请求排队。锁自带 600ms 超时，前端漏发 end 也不会死锁。
+#[tauri::command]
+pub fn dock_interaction_begin() -> Result<(), String> {
+    crate::dock::interaction_begin();
+    Ok(())
+}
+
+/// 一次按压手势结束：解锁并立刻补执行排队的 fit_dock。
+#[tauri::command]
+pub fn dock_interaction_end(app: tauri::AppHandle) -> Result<(), String> {
+    crate::dock::interaction_end();
+    crate::dock::flush_pending_fit(&app);
+    Ok(())
+}
+
 /// v0.5：电源菜单——锁定。
 #[tauri::command]
 pub fn power_lock() -> Result<(), String> {
@@ -222,8 +252,37 @@ pub fn power_shutdown(reboot: bool) -> Result<(), String> {
 /// 宽度，不受缩放比例与多显示器原点偏移影响（`monitor.position().x` 参与计算，
 /// 副屏原点非 0 时不会把 dock 拉回主屏）。y 原样透传物理值，不来回换算。
 #[tauri::command]
-pub fn fit_dock(window: tauri::WebviewWindow, w: f64, h: f64) -> Result<(), String> {
-    use tauri::LogicalSize;
+pub fn fit_dock(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    w: f64,
+    h: f64,
+) -> Result<(), String> {
+    // OC-20261115-002 D4：按压手势期间绝不改窗口几何。请求排队，
+    // 由 dock_interaction_end（松手）或 600ms 超时兜底线程补执行，≤600ms 落地。
+    if crate::dock::interaction_locked() {
+        crate::dock::queue_fit(w, h);
+        menu::debug_note(&format!("dock: fit_dock queued w={w} h={h}"));
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + crate::dock::INTERACTION_TIMEOUT + Duration::from_millis(50);
+            while crate::dock::interaction_locked() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            crate::dock::flush_pending_fit(&handle);
+        });
+        return Ok(());
+    }
+    apply_fit_dock(&window, w, h)
+}
+
+/// 真正的几何写入（主线程执行）。锁期间只允许经 flush 走到这里。
+pub(crate) fn apply_fit_dock(
+    window: &tauri::WebviewWindow,
+    w: f64,
+    h: f64,
+) -> Result<(), String> {
+    use tauri::{LogicalSize, PhysicalPosition};
     let w = w.max(120.0);
     let h = h.max(48.0);
     // 2026-11-16 修复（dock 整体不可见，OC-20261116-001）：旧实现在这里用

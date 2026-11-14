@@ -746,6 +746,14 @@ pub fn dock_logic(app: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
             return;
         }
 
+        // OC-20261115-002 D4：交互锁期间不做 set_position / ShowWindow / 自动隐藏。
+        // 一次按压手势里窗口几何必须纹丝不动，否则 Chromium 不合成 click。
+        // 超时由 interaction_locked() 就地强制释放，不会卡死定位循环。
+        if interaction_locked() {
+            std::thread::sleep(Duration::from_millis(POLL_MS));
+            continue;
+        }
+
         // 首帧就绪跟踪（前端上报 + 超时兜底）
         let ready = is_ready() || boot_at.elapsed() >= Duration::from_millis(FORCE_READY_AFTER_MS);
         if ready {
@@ -1214,6 +1222,97 @@ pub fn transient_activate(aumid: &Option<String>, path: &str) -> Result<(), Stri
     activate_or_launch(aumid, path)
 }
 
+// ---------------------------------------------------------------------------
+// OC-20261115-002：dock 交互锁 + 按压手势口径
+//
+// 背景：transient 集合每 500ms 在 6↔7 之间翻转 → fit_dock 改窗口几何 →
+// Chromium 的 pointer 序列被 resize 打断（mousedown 已派发、mouseup 落在旧坐标系，
+// click 不合成）。交互锁让「一次按压手势」期间 Rust 侧完全不碰 dock 窗口几何，
+// fit_dock 请求排队，松手（或 600ms 兜底）后再补执行。
+// ---------------------------------------------------------------------------
+
+/// 交互锁最长持有时间：前端漏发 end 时强制释放，防死锁。
+pub const INTERACTION_TIMEOUT: Duration = Duration::from_millis(600);
+/// 按压手势：位移上限（逻辑 px）、时长上限（ms）。
+pub const PRESS_MAX_PX: f64 = 4.0;
+pub const PRESS_MAX_MS: u64 = 500;
+/// 真拖动的起拖阈值：超过它才获得 pointer capture。
+pub const DRAG_START_PX: f64 = 6.0;
+
+/// Some(开始时刻) = 交互进行中；超时在 `interaction_locked()` 里就地清掉。
+static INTERACTION_LOCK: Mutex<Option<Instant>> = Mutex::new(None);
+/// 锁期间最后一次 fit_dock 请求（只需最新一条，几何请求可合并）。
+static PENDING_FIT: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+
+pub fn interaction_begin() {
+    let mut slot = INTERACTION_LOCK.lock().unwrap();
+    let renew = slot.is_some();
+    *slot = Some(Instant::now());
+    menu::debug_note(&format!("dock: interaction begin renew={renew}"));
+}
+
+pub fn interaction_end() {
+    let mut slot = INTERACTION_LOCK.lock().unwrap();
+    if slot.take().is_some() {
+        menu::debug_note("dock: interaction end");
+    }
+}
+
+/// 是否处于交互锁中；超过 INTERACTION_TIMEOUT 视为前端失联，强制释放。
+pub fn interaction_locked() -> bool {
+    let mut slot = INTERACTION_LOCK.lock().unwrap();
+    match *slot {
+        Some(start) if start.elapsed() < INTERACTION_TIMEOUT => true,
+        Some(_) => {
+            *slot = None;
+            menu::debug_note("dock: interaction timeout force-released");
+            false
+        }
+        None => false,
+    }
+}
+
+pub fn queue_fit(w: f64, h: f64) {
+    *PENDING_FIT.lock().unwrap() = Some((w, h));
+}
+
+pub fn take_pending_fit() -> Option<(f64, f64)> {
+    PENDING_FIT.lock().unwrap().take()
+}
+
+/// 锁释放后补执行排队的 fit_dock（幂等：与超时兜底线程竞争 take，只有一个拿到）。
+pub fn flush_pending_fit(app: &tauri::AppHandle) {
+    let Some((w, h)) = take_pending_fit() else {
+        return;
+    };
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(win) = handle.get_webview_window("dock") {
+            let _ = crate::dock::api::apply_fit_dock(&win, w, h);
+        }
+    });
+    menu::debug_note(&format!("dock: fit_dock flushed w={w} h={h}"));
+}
+
+/// 一次按压的采样点（Rust 侧口径权威定义；前端 `bindPress` 同构实现）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PressSample {
+    pub pointer_id: i64,
+    pub button: i16,
+    pub x: f64,
+    pub y: f64,
+    pub elapsed_ms: u64,
+}
+
+/// 手势是否构成一次「按压」：pointerId 一致 + 同一按键 + 位移 < 4px + 时长 < 500ms。
+/// 纯函数，单测覆盖；**不依赖浏览器合成 click**。
+pub fn press_hit(start: PressSample, end: PressSample) -> bool {
+    start.pointer_id == end.pointer_id
+        && start.button == end.button
+        && (end.x - start.x).hypot(end.y - start.y) < PRESS_MAX_PX
+        && end.elapsed_ms.saturating_sub(start.elapsed_ms) < PRESS_MAX_MS
+}
+
 #[cfg(test)]
 mod transient_tests {
     use super::*;
@@ -1301,5 +1400,94 @@ mod transient_tests {
         for x in &s {
             assert!(x.icon.w > 0 && x.icon.h > 0, "{} 缺图标", x.name);
         }
+    }
+
+    // ---- OC-20261115-002 §4-1：手势判定纯函数 ----
+    fn press_start() -> PressSample {
+        PressSample {
+            pointer_id: 7,
+            button: 0,
+            x: 100.0,
+            y: 40.0,
+            elapsed_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn press_hit_accepts_clean_tap() {
+        let end = PressSample {
+            x: 102.0,
+            y: 41.0,
+            elapsed_ms: 1_120,
+            ..press_start()
+        };
+        assert!(press_hit(press_start(), end));
+    }
+
+    #[test]
+    fn press_hit_rejects_drag_distance() {
+        let end = PressSample {
+            x: 112.0,
+            elapsed_ms: 1_120,
+            ..press_start()
+        };
+        assert!(!press_hit(press_start(), end));
+    }
+
+    #[test]
+    fn press_hit_rejects_long_press() {
+        let end = PressSample {
+            elapsed_ms: 1_600,
+            ..press_start()
+        };
+        assert!(!press_hit(press_start(), end));
+    }
+
+    #[test]
+    fn press_hit_rejects_pointer_id_mismatch() {
+        let end = PressSample {
+            pointer_id: 8,
+            elapsed_ms: 1_120,
+            ..press_start()
+        };
+        assert!(!press_hit(press_start(), end));
+    }
+
+    #[test]
+    fn press_hit_rejects_button_change() {
+        let end = PressSample {
+            button: 2,
+            elapsed_ms: 1_120,
+            ..press_start()
+        };
+        assert!(!press_hit(press_start(), end));
+        // 右键本身也能构成一次有效按压
+        let right = PressSample {
+            button: 2,
+            ..press_start()
+        };
+        let right_end = PressSample {
+            elapsed_ms: 1_090,
+            ..right
+        };
+        assert!(press_hit(right, right_end));
+    }
+
+    #[test]
+    fn interaction_lock_pair_and_timeout_are_bounded() {
+        // 只在这一条测试里碰全局锁，避免与其他并行测试互相干扰。
+        *INTERACTION_LOCK.lock().unwrap() = None;
+        assert!(!interaction_locked());
+        interaction_begin();
+        assert!(interaction_locked());
+        interaction_end();
+        assert!(!interaction_locked());
+
+        // 前端漏发 end：把开始时刻拨到超时之前，下一次查询就地强制释放。
+        *INTERACTION_LOCK.lock().unwrap() =
+            Some(Instant::now() - INTERACTION_TIMEOUT - Duration::from_millis(10));
+        assert!(!interaction_locked(), "超时必须强制释放");
+        assert!(INTERACTION_LOCK.lock().unwrap().is_none());
+        assert!(INTERACTION_TIMEOUT.as_millis() <= 600, "兜底不得超过 600ms");
     }
 }

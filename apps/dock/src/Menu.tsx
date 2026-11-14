@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { IconCanvas } from "./icons";
+import { bindPress } from "./App";
 
 interface IconData {
   w: number;
@@ -244,18 +245,22 @@ function MenuApp() {
               key={a.id}
               className={`menu-item${addMode && isPinned ? " menu-item-in" : ""}`}
               title={addMode && isPinned ? "已收藏（右键移除）" : a.name}
-              onMouseDown={() => {
-                if (addMode) {
+              {...bindPress<HTMLButtonElement>({
+                tag: `menu:${a.id}`,
+                onPress: () => {
+                  if (addMode) {
+                    if (isPinned) remove(a.path);
+                    else add(a.path);
+                  } else if (isPinned) {
+                    launch(a.path);
+                  }
+                },
+                // OC-20261115-002 D3：开始菜单里的右键移除同样走按压手势，
+                // 不再依赖浏览器合成 contextmenu（与 dock 主栏同一套判定）。
+                onSecondaryPress: () => {
                   if (isPinned) remove(a.path);
-                  else add(a.path);
-                } else if (isPinned) {
-                  launch(a.path);
-                }
-              }}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                if (isPinned) remove(a.path);
-              }}
+                },
+              })}
             >
               {a.icon ? (
                 <IconCanvas icon={a.icon} className="menu-icon" />

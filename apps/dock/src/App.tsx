@@ -3,6 +3,218 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { DragSession, makeWayOffsets, offsetToTransform } from "./dragOrder";
 
+// ---------------------------------------------------------------------------
+// OC-20261115-002：按压手势自愈 + capture 生命周期 + 交互锁 + 取证遥测
+//
+// 第三次复发的根因不是 retarget/闭包，而是「浏览器合成 click」这条链本身会被
+// 窗口 resize 打断（transients 每 500ms 抖一次 → fit_dock 改几何）。这里彻底不
+// 依赖 click：pointerdown/pointerup 自己判手势，命中即执行；pointer capture 只在
+// 真拖动时申请，且任何结束路径都显式释放；Rust 侧交互锁保证手势期间窗口不动。
+// ---------------------------------------------------------------------------
+
+/** 一次性交互遥测（D1 取证）。默认关闭：验收通过后高频行必须降级，
+ *  长期只留 gesture-miss / remove / interaction / capture-held 这几条。 */
+const TELEMETRY_ENABLED = false;
+
+// 与 src-tauri/src/dock/mod.rs 的 PRESS_MAX_PX / PRESS_MAX_MS /
+// DRAG_START_PX / INTERACTION_TIMEOUT 以及 ipc-types 的 PRESS_GESTURE 逐值同步。
+const PRESS_MAX_PX = 4;
+const PRESS_MAX_MS = 500;
+const DRAG_START_PX = 6;
+const INTERACTION_TIMEOUT_MS = 600;
+
+const telemetry = (kind: string, tag: string, extra = "") => {
+  if (!TELEMETRY_ENABLED) return;
+  invoke("debug_note", {
+    msg: `telemetry ${kind} t=${Date.now()} target=${tag} win=${window.innerWidth}x${window.innerHeight}${extra}`,
+  }).catch(() => {});
+};
+
+// ---- Rust 交互锁（模块级状态：window 级 listener 与 JSX handler 共享同一份）----
+let interactionActive = false;
+let interactionTimer = 0;
+
+const beginInteraction = () => {
+  if (interactionActive) return; // 幂等：一次手势只 begin 一次
+  interactionActive = true;
+  invoke("dock_interaction_begin").catch(() => {});
+  window.clearTimeout(interactionTimer);
+  // 前端兜底：pointerup 被 resize 吞掉时也不能让锁挂住（Rust 另有 600ms 兜底）。
+  interactionTimer = window.setTimeout(endInteraction, INTERACTION_TIMEOUT_MS - 50);
+};
+function endInteraction() {
+  if (!interactionActive) return;
+  interactionActive = false;
+  window.clearTimeout(interactionTimer);
+  invoke("dock_interaction_end").catch(() => {});
+}
+
+// ---- pointer capture 生命周期 ----
+let captureEl: HTMLElement | null = null;
+let capturePid = -1;
+let captureSince = 0;
+let dragActive = false; // 起拖标志：拖动中的 pointerleave 不能释放 capture（D6）
+
+const acquireCapture = (el: HTMLElement | null, pid: number) => {
+  if (!el || captureEl) return;
+  try {
+    el.setPointerCapture(pid);
+    captureEl = el;
+    capturePid = pid;
+    captureSince = Date.now();
+    telemetry("capture-acquire", "pill", ` pid=${pid}`);
+    window.setTimeout(() => {
+      if (captureEl && capturePid === pid) {
+        // 长期日志：验收 #6 要统计 capture 悬挂次数（应为 0）。
+        invoke("debug_note", {
+          msg: `dock: capture-held>2000ms pid=${pid} held_ms=${Date.now() - captureSince}`,
+        }).catch(() => {});
+      }
+    }, 2000);
+  } catch (e) {
+    // 不许静默吞：异常必须落日志（D2）。
+    invoke("debug_note", { msg: `dock: capture acquire ERR=${String(e)}` }).catch(() => {});
+  }
+};
+
+const releaseCapture = (reason: string) => {
+  if (!captureEl) return;
+  const el = captureEl;
+  const pid = capturePid;
+  const held = Date.now() - captureSince;
+  captureEl = null;
+  capturePid = -1;
+  try {
+    el.releasePointerCapture(pid);
+  } catch (e) {
+    invoke("debug_note", { msg: `dock: capture release ERR=${String(e)} reason=${reason}` }).catch(
+      () => {},
+    );
+  }
+  telemetry("capture-release", "pill", ` pid=${pid} reason=${reason} held_ms=${held}`);
+};
+
+// ---- 按压手势（纯判定，口径与 Rust press_hit 一致）----
+interface PressSample {
+  pid: number;
+  button: number;
+  x: number;
+  y: number;
+  t: number;
+}
+interface PressState extends PressSample {
+  run: () => void;
+  tag: string;
+}
+const pressStates = new WeakMap<HTMLElement, PressState>();
+
+export const pressHit = (s: PressSample, e: PressSample): boolean =>
+  s.pid === e.pid &&
+  s.button === e.button &&
+  Math.hypot(e.x - s.x, e.y - s.y) < PRESS_MAX_PX &&
+  e.t - s.t < PRESS_MAX_MS;
+
+export interface PressOptions<T extends HTMLElement = HTMLElement> {
+  tag?: string;
+  /** 左键（button 0）按压命中 */
+  onPress?: () => void;
+  /** 右键（button 2）按压命中——移除/固定类动作 */
+  onSecondaryPress?: () => void;
+  /** 按下时的额外处理（拖动快照等） */
+  onStart?: (e: React.PointerEvent<T>) => void;
+  /** 抬起/取消时的额外处理（拖动收尾等），在手势判定之后调用 */
+  onEnd?: (e: React.PointerEvent<T>) => void;
+}
+
+export interface PressBinding<T extends HTMLElement = HTMLElement> {
+  onPointerDown: React.PointerEventHandler<T>;
+  onPointerUp: React.PointerEventHandler<T>;
+  onPointerCancel: React.PointerEventHandler<T>;
+  onLostPointerCapture: React.PointerEventHandler<T>;
+  onPointerLeave: React.PointerEventHandler<T>;
+  onContextMenu: React.MouseEventHandler<T>;
+  onClick: React.MouseEventHandler<T>;
+}
+
+/**
+ * 把元素绑成「按压手势」：不依赖浏览器合成 click / contextmenu 执行动作。
+ * 命中条件：pointerId 一致 + 同一按键 + 位移 <4px + 时长 <500ms。
+ */
+export function bindPress<T extends HTMLElement = HTMLElement>(
+  opts: PressOptions<T>,
+): PressBinding<T> {
+  const tag = opts.tag ?? "press";
+  const sample = (e: React.PointerEvent<T>): PressSample => ({
+    pid: e.pointerId,
+    button: e.button,
+    x: e.clientX,
+    y: e.clientY,
+    t: Date.now(),
+  });
+
+  const start: React.PointerEventHandler<T> = (e) => {
+    const el = e.currentTarget;
+    const run = e.button === 2 ? opts.onSecondaryPress : e.button === 0 ? opts.onPress : undefined;
+    if (!run) return;
+    pressStates.set(el, { ...sample(e), run, tag });
+    telemetry("pointerdown", tag, ` pid=${e.pointerId} x=${e.clientX} y=${e.clientY}`);
+    beginInteraction();
+    opts.onStart?.(e);
+  };
+
+  const finish = (kind: string) => (e: React.PointerEvent<T>) => {
+    const el = e.currentTarget;
+    const s = pressStates.get(el);
+    pressStates.delete(el);
+    telemetry(kind, tag, ` pid=${e.pointerId} x=${e.clientX} y=${e.clientY}`);
+    releaseCapture(kind);
+    if (kind !== "lostpointercapture") endInteraction();
+    if (s) {
+      const end = sample(e);
+      const dist = Math.hypot(end.x - s.x, end.y - s.y);
+      if (pressHit(s, end)) {
+        telemetry("press-hit", tag, "");
+        s.run();
+      } else if (dist <= DRAG_START_PX) {
+        // 长期日志：看起来是点击却没命中（验收 #4 要求连点 20 次里为 0）。
+        // 真拖动（位移 >6px）不算 miss，避免把拖动误记成失败噪声。
+        invoke("debug_note", {
+          msg: `dock: gesture-miss tag=${tag} dist=${dist.toFixed(1)} ms=${end.t - s.t} pid=${s.pid}/${end.pid}`,
+        }).catch(() => {});
+      }
+    }
+    opts.onEnd?.(e);
+  };
+
+  return {
+    onPointerDown: start,
+    onPointerUp: finish("pointerup"),
+    onPointerCancel: finish("pointercancel"),
+    onLostPointerCapture: (e) => {
+      // capture 被系统收走（含我们主动 release 后触发的那一次）：只清状态，
+      // 不调 onEnd —— 否则一次 resize 丢 capture 会把拖动提前掐断（D6）。
+      pressStates.delete(e.currentTarget);
+      releaseCapture("lostpointercapture");
+      telemetry("lostpointercapture", tag, ` pid=${e.pointerId}`);
+    },
+    onPointerLeave: () => {
+      // 起拖后光标离开容器是正常拖出，不能释放 capture（D6 不回归）。
+      if (!dragActive) releaseCapture("pointerleave");
+      telemetry("pointerleave", tag, "");
+    },
+    onContextMenu: (e) => {
+      // 只压掉浏览器菜单：动作由右键按压手势执行，绝不在 contextmenu 里再跑一遍。
+      e.preventDefault();
+      telemetry("contextmenu", tag, "");
+    },
+    onClick: (e) => {
+      // 幂等兜底：动作已由 press 执行，这里绝不重复启动。
+      e.preventDefault();
+      telemetry("click", tag, "");
+    },
+  };
+}
+
 interface IconData {
   w: number;
   h: number;
@@ -254,6 +466,24 @@ function App() {
     return () => window.removeEventListener("contextmenu", handler);
   }, []);
 
+  // OC-20261115-002 D1 取证：窗口几何变化时间线（仅 TELEMETRY_ENABLED 时记录）。
+  // 用于统计「失败样本里 pointerup 前后 16ms 内是否有 resize」。
+  useEffect(() => {
+    if (!TELEMETRY_ENABLED) return;
+    const el = pillRef.current;
+    if (!el) return;
+    let last = "";
+    const ro = new ResizeObserver(() => {
+      const r = el.getBoundingClientRect();
+      const key = `${Math.round(r.width)}x${Math.round(r.height)}`;
+      if (key === last) return;
+      last = key;
+      telemetry("resize", "pill", ` rect=${key}`);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   const launch = (path: string) => {
     invoke("launch_shortcut", { path })
       .catch((e) => {
@@ -296,9 +526,15 @@ function App() {
   };
 
   const remove = async (id: string) => {
+    // OC-20261115-002 D5：成功日志由 Rust remove_shortcut 落（权威），
+    // 前端只补失败日志 + 可见提示，绝不静默吞错。
     try {
       setIcons(await invoke<Shortcut[]>("remove_shortcut", { id }));
     } catch (e) {
+      const msg = typeof e === "string" ? e : String(e);
+      invoke("debug_note", { msg: `dock: remove ${id} err=${msg} (frontend)` }).catch(() => {});
+      setNotice(`移除失败：${msg}`);
+      window.setTimeout(() => setNotice(null), 4000);
       console.error("remove_shortcut failed", e);
     }
   };
@@ -408,12 +644,12 @@ function App() {
       beyondSince: null,
       lastDistY: 0,
     };
-    try {
-      // capture 打在容器：让位时图标自己在动，capture 在图标上会跟丢。
-      pillRef.current?.setPointerCapture(e.pointerId);
-    } catch {
-      /* 老内核无 capture 也不至于崩 */
-    }
+    // OC-20261115-002 D2：pointerdown **不再**申请 capture。
+    // 旧实现每次按下都把 capture 打在容器上：click 的 target 会退化成容器，
+    // 而某次 pointerup 被 resize 吞掉后 capture 永不释放，后续所有 pointer /
+    // contextmenu 都被重定向到容器 —— hover（mouseenter）正常、点击与右键全死。
+    // 现在只在 iconMove 判定「超过 6px 真拖动」时才申请，且所有结束路径显式释放。
+    dragActive = false;
   };
 
   /** 脱离区判定（卡面 P1 三区）：垂直出界 >48px、驻留 ≥200ms、方向向外。 */
@@ -443,8 +679,10 @@ function App() {
     d.lastY = clientY;
     const dx = sx - d.startScreenX;
     if (!d.active) {
-      if (Math.abs(dx) < 6) return;
+      if (Math.abs(dx) < DRAG_START_PX) return;
       d.active = true;
+      dragActive = true;
+      acquireCapture(pillRef.current, d.pid);
       setDragIndex(d.index);
       setMakeWay({ drop: d.index, pitch: d.session?.slotPitch() ?? 0 });
       invoke("debug_note", { msg: `active idx=${d.index} x=${Math.round(sx)}` }).catch(() => {});
@@ -499,13 +737,10 @@ function App() {
     const d = dragRef.current;
     if (!d) return;
     if (pointerId !== undefined && pointerId !== d.pid) return;
-      dragRef.current = null;
+    dragRef.current = null;
     draggingRef.current = false; // 拖动结束，恢复版本轮询校准
-    try {
-      pillRef.current?.releasePointerCapture(d.pid);
-    } catch {
-      /* 已释放 */
-    }
+    dragActive = false;
+    releaseCapture("iconUp");
     setMakeWay(null);
     // 点击救援：用屏幕坐标判净位移——窗口滑动动画会污染 clientX
     // （一次点击内 clientX 可能跳 29px，但 screenX 稳如泰山）。
@@ -514,11 +749,9 @@ function App() {
     if (!d.active || isClick) {
       setDragIndex(-1);
       setDragGhost(null);
-      // 点击（未起拖）：pointer capture 打在容器上，松手时 click 被规范
-      // retarget 到容器，按钮的 onClick 收不到——这里直接启动。
-      // suppressClickUntil 仍守「拖动刚结束 400ms 内不启动」。
-      const sc = d.shortcut;
-      if (sc && Date.now() >= suppressClickUntil.current) launch(sc.path);
+      // OC-20261115-002 D3：启动不再在这里「救援」，也不依赖 onClick。
+      // bindPress 已用 pointerdown/pointerup 自己判手势并执行 launch；
+      // 这里再启动一次会造成双击（两次 launch）。
       return;
     }
     suppressClickUntil.current = Date.now() + 400;
@@ -697,22 +930,20 @@ function App() {
               style={
                 lifted ? { visibility: "hidden" } : way ? { transform: way } : undefined
               }
-              onPointerDown={iconDown(i)}
+              {...bindPress<HTMLButtonElement>({
+                tag: `fixed:${sc.id}`,
+                onPress: () => {
+                  // 真实拖动刚结束的 400ms 内抑制误触（D6 语义保持）。
+                  if (Date.now() < suppressClickUntil.current) return;
+                  launch(sc.path);
+                },
+                onSecondaryPress: () => void remove(sc.id),
+                onStart: (e) => iconDown(i)(e),
+                onEnd: (e) => iconUp(e.pointerId),
+              })}
               onPointerMove={(e) => iconMove(e.clientX, e.clientY, e.pointerId, e.screenX)}
-              onPointerUp={(e) => iconUp(e.pointerId)}
-              onPointerCancel={(e) => iconUp(e.pointerId)}
               onMouseEnter={enterIcon(sc)}
               onMouseLeave={leaveIcon}
-              onClick={() => {
-                // 拖动结束后的短暂时间窗内不触发启动（capture 在容器上时
-                // 松手 click 通常落在容器，这里主要防老内核兼容路径误触）
-                if (Date.now() < suppressClickUntil.current) return;
-                launch(sc.path);
-              }}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                void remove(sc.id);
-              }}
             >
               <IconCanvas icon={sc.icon} />
               {running.has(sc.id) && <RunDot />}
@@ -727,17 +958,21 @@ function App() {
             key={t.key}
             className="dock-icon dock-transient"
             title={`${t.name}（运行中，未固定）`}
-            onClick={() => activateTransient(t)}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              void pinTransient(t);
-            }}
+            {...bindPress<HTMLButtonElement>({
+              tag: `transient:${t.key}`,
+              onPress: () => activateTransient(t),
+              onSecondaryPress: () => void pinTransient(t),
+            })}
           >
             {t.icon ? <IconCanvas icon={t.icon} /> : <span className="dock-transient-ph" />}
             <RunDot />
           </button>
         ))}
-        <button className="dock-icon dock-add" title="添加快捷方式（右键图标为移除）" onClick={add}>
+        <button
+          className="dock-icon dock-add"
+          title="添加快捷方式（右键图标为移除）"
+          {...bindPress<HTMLButtonElement>({ tag: "add", onPress: add })}
+        >
           <span className="dock-add-plus">＋</span>
         </button>
       </div>

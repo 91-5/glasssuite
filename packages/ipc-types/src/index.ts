@@ -73,6 +73,28 @@ export const COMMANDS = {
   dockPreviewShow: "dock_preview_show",
   /** 注销 DWM 缩略图。 */
   dockPreviewHide: "dock_preview_hide",
+  /** OC-20261115-002：一次按压手势开始 → Rust 交互锁（暂停 dock 几何变更）。 */
+  dockInteractionBegin: "dock_interaction_begin",
+  /** 一次按压手势结束 → 解锁并补执行排队的 fit_dock。 */
+  dockInteractionEnd: "dock_interaction_end",
+  /** 前端诊断 / 取证日志（写 menu.log）。 */
+  debugNote: "debug_note",
+} as const;
+
+/**
+ * OC-20261115-002：按压手势与交互锁的**唯一口径**（与
+ * `src-tauri/src/dock/mod.rs` 的 PRESS_MAX_PX / PRESS_MAX_MS /
+ * DRAG_START_PX / INTERACTION_TIMEOUT 逐值同步；Rust 侧有纯函数单测）。
+ */
+export const PRESS_GESTURE = {
+  /** 判定为按压的最大位移（CSS 逻辑像素）。 */
+  maxPx: 4,
+  /** 判定为按压的最大时长（ms）。 */
+  maxMs: 500,
+  /** 超过此位移才算真拖动，才去申请 pointer capture。 */
+  dragStartPx: 6,
+  /** Rust 交互锁超时兜底（ms）。 */
+  interactionTimeoutMs: 600,
 } as const;
 
 /** 后端 → 前端事件名。 */
@@ -521,4 +543,19 @@ export async function logFlip(line: string): Promise<void> {
   await logFrontend(`[flip] ${line}`).catch(() => {
     /* 非 Tauri 环境 */
   });
+}
+
+/** OC-20261115-002：按压手势开始 → Rust 交互锁。 */
+export async function dockInteractionBegin(): Promise<void> {
+  await invoke(COMMANDS.dockInteractionBegin);
+}
+
+/** 一次按压手势结束 → 解锁 + 补执行排队的 fit_dock。 */
+export async function dockInteractionEnd(): Promise<void> {
+  await invoke(COMMANDS.dockInteractionEnd);
+}
+
+/** 前端诊断日志（menu.log）；取证遥测与 gesture-miss / remove 复用同一通道。 */
+export async function debugNote(msg: string): Promise<void> {
+  await invoke(COMMANDS.debugNote, { msg });
 }

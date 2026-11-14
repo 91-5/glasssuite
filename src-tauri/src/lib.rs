@@ -115,6 +115,9 @@ pub fn run() {
             dock::api::menu_remove,
             dock::api::menu_launch,
             dock::api::debug_note,
+            // OC-20261115-002：按压手势交互锁（仅此两行注册，几何逻辑在 dock/api.rs）
+            dock::api::dock_interaction_begin,
+            dock::api::dock_interaction_end,
             dock::api::power_lock,
             dock::api::power_sleep,
             dock::api::power_shutdown,
