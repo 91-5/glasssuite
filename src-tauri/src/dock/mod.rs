@@ -1796,3 +1796,35 @@ mod transient_tests {
         assert_eq!(plain.len(), 1);
     }
 }
+
+#[cfg(test)]
+mod uwp_merge_tests {
+    use super::*;
+
+    /// 006 ③：UWP 归并执行层——同一应用同时出现 AUMID key（宿主解析出的真实
+    /// 身份）与 exe key（ApplicationFrameHost.exe 宿主路径）时，exe 被 AUMID
+    /// 吸收；AUMID 不在场时不归并。
+    /// （宿主→AUMID 的"发现"层需要真实 UWP 窗口，单测覆盖归并执行层。）
+    #[test]
+    fn uwp_alias_merge_drops_shadowed_exe_key() {
+        let keys = vec![
+            "aumid:app.x".to_string(),
+            "exe:c:\\app.exe".to_string(),
+            "exe:c:\\other.exe".to_string(),
+        ];
+        let aliases = vec![("aumid:app.x".to_string(), "exe:c:\\app.exe".to_string())];
+        let merged = merge_alias_keys(keys, &aliases);
+        assert_eq!(
+            merged,
+            vec!["aumid:app.x".to_string(), "exe:c:\\other.exe".to_string()],
+            "宿主 exe key 被 AUMID 归并吸收"
+        );
+
+        let merged2 = merge_alias_keys(vec!["exe:c:\\app.exe".to_string()], &aliases);
+        assert_eq!(
+            merged2,
+            vec!["exe:c:\\app.exe".to_string()],
+            "AUMID 不在场 → 不归并"
+        );
+    }
+}

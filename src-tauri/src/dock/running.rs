@@ -170,6 +170,38 @@ pub fn running_snapshot() -> RunningSnapshot {
     snap
 }
 
+/// 006 ⑤：挂起的待定集（扫描结果, 连续一致次数）。
+static PENDING: Mutex<Option<(HashSet<String>, u32)>> = Mutex::new(None);
+
+/// 006 ⑤ 纯决策（单测口）：连续两次扫描一致才提交翻转。
+/// 返回 `Some(提交集)`；`None` = 继续观察。
+fn debounce_step(
+    current: &HashSet<String>,
+    pending: &mut Option<(HashSet<String>, u32)>,
+    scanned: &HashSet<String>,
+) -> Option<HashSet<String>> {
+    if *scanned == *current {
+        // 回到现值：抖动序列被打断，清待定集
+        *pending = None;
+        return None;
+    }
+    match pending {
+        Some((p, n)) if *p == *scanned => {
+            *n += 1;
+            if *n >= 2 {
+                let committed = scanned.clone();
+                *pending = None;
+                return Some(committed);
+            }
+            None
+        }
+        _ => {
+            *pending = Some((scanned.clone(), 1));
+            None
+        }
+    }
+}
+
 /// 主动推送快照（`dock-running`）。watcher 发现集合变化、配置版本 bump 时调用；
 /// 事件丢失由前端的低频兜底轮询兜住。
 pub fn push_snapshot() {
@@ -690,13 +722,22 @@ unsafe fn watcher() {
         {
             last_scan = now;
             let keys = scan_once();
-            if let Ok(mut w) = RUNNING.write() {
-                let changed = *w != keys;
-                *w = keys;
-                // 006：集合真变了才失效缓存并推送（500ms 兜底扫描通常无变化，
-                // 不 bump epoch 才能让快照缓存命中）。
-                if changed {
+            let current = snapshot();
+            if keys == current {
+                // 与现值一致：清掉挂起的待定集（抖动序列被打断）
+                if let Ok(mut pend) = PENDING.lock() {
+                    *pend = None;
+                }
+            } else if let Ok(mut pend) = PENDING.lock() {
+                // 006 ⑤：连续两次扫描一致才翻转——单帧抖动（窗口瞬隐/瞬现）
+                // 不翻转、不推送（A5：静置时 emit 计数趋零）。
+                if let Some(committed) = debounce_step(&current, &mut pend, &keys) {
+                    if let Ok(mut w) = RUNNING.write() {
+                        *w = committed;
+                    }
                     RUNNING_EPOCH.fetch_add(1, Ordering::Relaxed);
+                    // A5 计数口：watcher 驱动的翻转推送才有这行日志。
+                    winplat::log::log("running: set changed, snapshot pushed");
                     push_snapshot();
                 }
             }
@@ -818,5 +859,67 @@ mod snapshot_tests {
         let s = assemble(43, &cfg, &HashSet::new(), &[]);
         assert!(s.running_ids.is_empty());
         assert_eq!(s.config_version, 43);
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    /// 006 ②：大小写 / 斜杠方向 / `\\?\` 前缀 → 同一规范化结果
+    /// （路径不存在时走确定性 lowercase 分支，不依赖文件系统）。
+    #[test]
+    fn normalize_path_case_slash_prefix_equivalence() {
+        let a = normalize_path("C:\\Apps\\Tool.exe");
+        let b = normalize_path("c:/apps/tool.exe");
+        let c = normalize_path("\\\\?\\C:\\Apps\\Tool.exe");
+        assert_eq!(a, b, "大小写与斜杠方向等价");
+        assert_eq!(a, c, "verbatim 前缀剥离");
+        // key 层等价（exe 分支）
+        let k1 = key_for_shortcut(&None, "C:\\Apps\\Tool.exe");
+        let k2 = key_for_shortcut(&None, "c:/apps/tool.exe");
+        assert_eq!(k1, k2, "同一路径两种写法 → 同一运行 key");
+    }
+
+    /// 006 ②：真实存在的文件——8.3 短名 / 符号链接经 canonicalize /
+    /// GetLongPathNameW 收敛到同一真实路径（TEMP 目录自身作样本）。
+    #[test]
+    fn normalize_path_real_file_variants_converge() {
+        let dir = std::env::temp_dir();
+        let p = dir.to_string_lossy().to_string();
+        let n1 = normalize_path(&p);
+        let n2 = normalize_path(&p.to_uppercase());
+        let n3 = normalize_path(&format!("\\\\?\\{}", p));
+        assert_eq!(n1, n2, "大小写变体");
+        assert_eq!(n1, n3, "verbatim 变体");
+        // 存在性路径必须真的被 canonicalize：尾反斜杠被剥掉（canonicalize
+        // 返回的是规范化长名，不带尾分隔符）
+        assert!(!n1.ends_with('\\'), "canonicalize 不留尾分隔符");
+        assert!(n1.ends_with("temp"), "仍指向同一目录");
+    }
+
+    /// 006 ⑤：连续两次一致才翻转；单帧抖动永不提交；回到现值清待定集。
+    #[test]
+    fn debounce_needs_two_consecutive_scans() {
+        let current: HashSet<String> = ["a".to_string()].into_iter().collect();
+        let next: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+        // 第一次不同：只挂待定，不提交
+        let mut pend = None;
+        assert!(debounce_step(&current, &mut pend, &next).is_none());
+        assert!(pend.is_some(), "待定集已挂起");
+        // 第二次连续一致：提交
+        assert_eq!(
+            debounce_step(&current, &mut pend, &next),
+            Some(next.clone())
+        );
+        assert!(pend.is_none(), "提交后待定集清空");
+        // 单帧抖动（a→b→a→c 交替）：永不提交
+        let mut pend2 = None;
+        assert!(debounce_step(&current, &mut pend2, &next).is_none());
+        let other: HashSet<String> = ["a".to_string(), "c".to_string()].into_iter().collect();
+        assert!(debounce_step(&current, &mut pend2, &other).is_none());
+        // 回到现值：不提交（抖动序列被打断，待定集清空）
+        assert!(debounce_step(&current, &mut pend2, &current).is_none());
+        assert!(pend2.is_none());
     }
 }
