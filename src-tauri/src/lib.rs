@@ -122,7 +122,6 @@ pub fn run() {
             dock::api::power_lock,
             dock::api::power_sleep,
             dock::api::power_shutdown,
-            dock::api::drag_thresholds,
             dock::api::dock_running_snapshot,
             dock::api::pin_transient,
             dock::api::transient_activate,
@@ -278,17 +277,6 @@ fn dock_setup(handle: &tauri::AppHandle) {
     let h = handle.clone();
     std::thread::spawn(move || {
         dock::dock_logic(h, std::sync::Arc::new(AtomicBool::new(false)));
-    });
-
-    // 游离图标：注入 AppHandle → 按现有配置 reconcile → 常驻对账线程。
-    dock::free::set_app_handle(handle);
-    if let Some(p) = dock::config_path(handle) {
-        let cfg = dock::load_config(&p);
-        dock::free::reconcile(handle, &cfg);
-    }
-    let h = handle.clone();
-    std::thread::spawn(move || {
-        dock::free::spawn_reconciler(h, std::sync::Arc::new(AtomicBool::new(false)));
     });
 
     // 运行集合 watcher（dock running 图标与临时图标共用）。

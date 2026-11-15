@@ -3,7 +3,6 @@
 
 use std::time::{Duration, Instant};
 
-use super::free;
 use super::menu;
 use super::preview;
 use super::running;
@@ -354,23 +353,6 @@ pub(crate) fn apply_fit_dock(window: &tauri::WebviewWindow, w: f64, h: f64) -> R
 // ---------------------------------------------------------------------------
 // v0.7 Phase 1（OC-20261102-002）：dock 图标拖出成游离图标
 // ---------------------------------------------------------------------------
-
-/// 拖出阈值（前端与探针共用同一套口径——阈值只在 Rust 定义一处）。
-#[derive(serde::Serialize)]
-pub struct DragThresholds {
-    min_px: f64,
-    min_ms: u64,
-    max_free: usize,
-}
-
-#[tauri::command]
-pub fn drag_thresholds() -> DragThresholds {
-    DragThresholds {
-        min_px: crate::dock::DRAG_OUT_MIN_PX,
-        min_ms: crate::dock::DRAG_OUT_MIN_MS,
-        max_free: free::max_free_icons(),
-    }
-}
 
 // dock_config_version 已并入 dock_running_snapshot（OC-20261115-006 统一快照）。
 // get_transient_running 已并入 dock_running_snapshot（OC-20261115-006 统一快照）；

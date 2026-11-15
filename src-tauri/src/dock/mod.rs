@@ -30,7 +30,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 pub mod desktop;
-pub mod free;
 pub mod menu;
 pub mod preview;
 pub mod running;
@@ -955,43 +954,8 @@ pub fn find_shortcut_by_id<'a>(cfg: &'a DockConfig, id: &str) -> Option<&'a Shor
     cfg.shortcuts.iter().find(|s| s.id == id)
 }
 
-/// 切成游离模式并记下矩形（物理像素虚拟桌面坐标）。
-pub fn set_free_mode(cfg: &mut DockConfig, id: &str, rect: FreeRect) -> bool {
-    match cfg.shortcuts.iter_mut().find(|s| s.id == id) {
-        Some(s) => {
-            s.mode = IconMode::Free;
-            s.free_rect = Some(rect);
-            true
-        }
-        None => false,
-    }
-}
-
 /// 收回 dock 行：`slot` = 行内可见条目的插入序号（None = 末尾）。
 ///
-/// 游离条目在数组里占位但不占行内位置，所以插入点按**dock 模式条目的下标**算。
-pub fn set_dock_mode(cfg: &mut DockConfig, id: &str, slot: Option<usize>) -> bool {
-    let Some(idx) = cfg.shortcuts.iter().position(|s| s.id == id) else {
-        return false;
-    };
-    let mut sc = cfg.shortcuts.remove(idx);
-    sc.mode = IconMode::Dock;
-    sc.free_rect = None;
-    let dock_idxs: Vec<usize> = cfg
-        .shortcuts
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.mode == IconMode::Dock)
-        .map(|(i, _)| i)
-        .collect();
-    let insert = match slot {
-        Some(s) => dock_idxs.get(s).copied().unwrap_or(cfg.shortcuts.len()),
-        None => cfg.shortcuts.len(),
-    };
-    cfg.shortcuts.insert(insert.min(cfg.shortcuts.len()), sc);
-    true
-}
-
 /// dock 窗口客户区原点（物理像素）与缩放系数——CSS px ↔ 物理像素的唯一换算口径。
 pub fn dock_metrics(app: &tauri::AppHandle) -> Option<(i32, i32, f64)> {
     let dock = app.get_webview_window("dock")?;
