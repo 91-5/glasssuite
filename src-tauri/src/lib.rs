@@ -106,6 +106,7 @@ pub fn run() {
             dock::api::launch_shortcut,
             dock::api::fit_dock,
             dock::api::preview_show,
+            dock::api::preview_show_transient,
             dock::api::preview_hide,
             dock::api::menu_toggle,
             dock::api::menu_hide,

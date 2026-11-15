@@ -1150,7 +1150,7 @@ unsafe fn com_aumid_icon(aumid: &str) -> Option<IconData> {
 ///
 /// - `aumid:` 优先反查开始菜单目录（friendly name + 现成图标 + 解析路径）；
 /// - `exe:` 用 exe 路径本身（三路提取图标）。
-fn transient_entry(key: &str) -> TransientApp {
+pub(crate) fn transient_entry(key: &str) -> TransientApp {
     if let Some(aumid) = key.strip_prefix("aumid:") {
         let hit = crate::dock::menu::catalog_lookup_aumid(aumid);
         let name = hit

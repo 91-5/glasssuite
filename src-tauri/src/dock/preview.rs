@@ -25,6 +25,7 @@
 
 use std::ffi::c_void;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -49,11 +50,11 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow,
-    DispatchMessageW, DrawIconEx, GetForegroundWindow, GetWindowRect, LoadCursorW, PeekMessageW,
-    RegisterClassW, SetLayeredWindowAttributes, SetWindowPos, ShowWindow, TranslateMessage,
-    DI_NORMAL, ICONINFO, LWA_COLORKEY, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    DispatchMessageW, DrawIconEx, GetForegroundWindow, GetWindowRect, GetWindowTextW, IsIconic,
+    LoadCursorW, PeekMessageW, RegisterClassW, SetLayeredWindowAttributes, SetWindowPos,
+    ShowWindow, TranslateMessage, DI_NORMAL, ICONINFO, LWA_COLORKEY, MSG, PM_REMOVE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use tauri::Manager;
@@ -67,25 +68,41 @@ const WINDOW_TITLE: PCWSTR = w!("GlassDesk Preview");
 
 // 尺寸基准（96 DPI 物理像素，show 时乘 scale）。220×170 贴近卡面「约 200×150」。
 const BASE_W: f32 = 220.0;
-const BASE_H: f32 = 170.0;
-const BASE_H_DEGRADED: f32 = 40.0;
-const HEADER_H: f32 = 26.0; // 头部带（图标 + 标题）高
+const HEADER_H: f32 = 26.0; // 头部带（应用图标 + 应用名）高
 const PAD: f32 = 10.0; // 缩略图区与窗缘间距
 const GAP_ABOVE: i32 = 6; // 预览窗与图标上缘间距
 const ROUND_R: f32 = 14.0; // 圆角半径（与 dock 药丸 18 略小，同材质语言）
 const WATCHDOG_MS: u64 = 10_000; // 兜底：前端失联时预览最长存活
 
-/// Show 请求（show_for 解析完毕后投递给预览线程）。
-pub struct ShowReq {
-    /// 源窗口（0 = 降级模式：图标 + 标题，无缩略图）
+// 007 多窗口预览：每行 = 缩略图（或降级条）+ 窗口标题条；点击整行激活该窗口。
+// 行背景刻意不透明（品红 colorkey 面上的纯色像素会被系统判为「点击穿透」，
+// 缩略图区的鼠标事件会漏到下层窗口——行底衬不透明才接得住 WM_LBUTTONDOWN）。
+const ROW_H: f32 = 150.0; // 单行高（缩略内容 116 + 标题条 22 + 上下留白 12）
+const ROW_TITLE: f32 = 22.0; // 行内标题条高（不透明可点击）
+const MAX_ROWS: usize = 6; // 行数上限（再多的窗口按 z 序截断，日志注明）
+const ROW_BG: COLORREF = COLORREF(0x00ED_EDE9); // 行底衬（浅色，与头部带同系）
+
+/// 一行预览 = 一个顶层窗口。`src=0` 表示该行降级（最小化/DRM 疑似/注册失败：
+/// 只画应用图标 + 窗口标题，无 DWM 缩略图）。
+#[derive(Debug)]
+pub struct PreviewWin {
     src: isize,
     title: String,
-    icon: IconData,
+    degraded: bool,
+}
+
+/// Show 请求（show_for / show_for_transient 解析完毕后投递给预览线程）。
+pub struct ShowReq {
+    /// 应用名（头部带）。
+    app_title: String,
+    /// 应用图标（RGBA；头部带 + 降级行共用）。
+    app_icon: IconData,
+    /// 窗口行（z 序，最前在前）。
+    windows: Vec<PreviewWin>,
     /// 图标中心 x / 图标上缘 y（物理屏幕坐标，预览窗定位锚点）
     cx: i32,
     top: i32,
     scale: f32,
-    degraded_reason: Option<&'static str>,
 }
 
 enum Cmd {
@@ -124,7 +141,45 @@ pub fn hide() {
     send(Cmd::Hide);
 }
 
-/// 解析悬停的快捷方式 → 源窗口 → 投递 Show。
+/// 单窗口降级判定（卡面 2.4）：最小化 → 图标+标题；DRM 黑块启发式 → 图标+标题。
+fn degrade_reason(src: isize, minimized: bool) -> bool {
+    minimized || is_protected_black(src)
+}
+
+/// 收集该 key 的全部顶层窗口 → 预览行（z 序，最前在前；标题取窗口文本）。
+/// 数量超过 `MAX_ROWS` 按 z 序截断（日志注明）。
+fn collect_rows(key: &str) -> Vec<PreviewWin> {
+    let wins = crate::dock::running::windows_for_key(key);
+    let mut rows: Vec<PreviewWin> = Vec::with_capacity(wins.len());
+    for (src, minimized) in wins {
+        let title = unsafe {
+            let mut buf = [0u16; 256];
+            let n = GetWindowTextW(HWND(src as *mut c_void), &mut buf);
+            String::from_utf16_lossy(&buf[..n as usize])
+        };
+        let title = if title.trim().is_empty() {
+            "(无标题窗口)".to_string()
+        } else {
+            title
+        };
+        rows.push(PreviewWin {
+            src: if degrade_reason(src, minimized) {
+                0
+            } else {
+                src
+            },
+            title,
+            degraded: degrade_reason(src, minimized),
+        });
+    }
+    if rows.len() > MAX_ROWS {
+        log(&format!("rows truncated {} -> {MAX_ROWS}", rows.len()));
+        rows.truncate(MAX_ROWS);
+    }
+    rows
+}
+
+/// 解析悬停的快捷方式 → **全部**匹配窗口 → 投递 Show（007 多窗口预览）。
 /// 由 Tauri 命令调用（lib.rs `preview_show`）。
 /// `x/y/w/h` 为图标按钮矩形（CSS px，前端 getBoundingClientRect）。
 pub fn show_for(
@@ -156,39 +211,83 @@ pub fn show_for(
     let cx = pos.x + ((x + w / 2.0) * scale as f64) as i32;
     let top = pos.y + (y * scale as f64) as i32;
 
-    // 源窗口：z 序最前的可见匹配（复用任务 A 的 key 体系）
+    // 源窗口：全部可见匹配（复用任务 A 的 key 体系），z 序最前在前
     let key = crate::dock::running::key_for_shortcut(&sc.aumid, &sc.path);
-    let Some((src, minimized)) = crate::dock::running::find_window_for_key(&key) else {
+    let rows = collect_rows(&key);
+    if rows.is_empty() {
         log(&format!(
             "show id={id} name='{}' -> no matching window, no preview",
             sc.name
         ));
         return Ok(());
-    };
-
-    // 降级判定（卡面 2.4）：最小化 → 图标+标题；DRM 黑块启发式 → 图标+标题
-    let degraded_reason: Option<&'static str> = if minimized {
-        Some("minimized")
-    } else if is_protected_black(src) {
-        Some("drm-suspect")
-    } else {
-        None
-    };
+    }
 
     log(&format!(
-        "show id={id} name='{}' src={} mode={}",
+        "show id={id} name='{}' windows={} mode={}",
         sc.name,
-        src,
-        degraded_reason.unwrap_or("thumbnail")
+        rows.len(),
+        if rows.iter().all(|r| r.degraded) {
+            "degraded"
+        } else {
+            "thumbnail"
+        }
     ));
     send(Cmd::Show(Box::new(ShowReq {
-        src: if degraded_reason.is_some() { 0 } else { src },
-        title: sc.name.clone(),
-        icon: sc.icon.clone(),
+        app_title: sc.name.clone(),
+        app_icon: sc.icon.clone(),
+        windows: rows,
         cx,
         top,
         scale,
-        degraded_reason,
+    })));
+    Ok(())
+}
+
+/// 悬停**运行中未固定**图标（transient）→ 按 key 收集窗口 → 投递 Show。
+/// 应用名/图标取自 transient 目录缓存（`transient_entry`）。
+pub fn show_for_transient(
+    app: &tauri::AppHandle,
+    key: &str,
+    x: f64,
+    y: f64,
+    w: f64,
+    _h: f64,
+) -> Result<(), String> {
+    let dock = app.get_webview_window("dock").ok_or("dock 窗口缺失")?;
+    if !dock.is_visible().unwrap_or(false) || crate::dock::menu::is_panel_visible(app) {
+        return Ok(());
+    }
+    let scale = dock.scale_factor().unwrap_or(1.0) as f32;
+    let pos = dock
+        .outer_position()
+        .map_err(|e| format!("dock 位置不可得: {e}"))?;
+    let cx = pos.x + ((x + w / 2.0) * scale as f64) as i32;
+    let top = pos.y + (y * scale as f64) as i32;
+
+    let entry = crate::dock::transient_entry(key);
+    let rows = collect_rows(key);
+    if rows.is_empty() {
+        log(&format!(
+            "show-transient key='{key}' -> no matching window, no preview"
+        ));
+        return Ok(());
+    }
+    log(&format!(
+        "show-transient key='{key}' name='{}' windows={}",
+        entry.name,
+        rows.len()
+    ));
+    send(Cmd::Show(Box::new(ShowReq {
+        app_title: entry.name,
+        app_icon: entry.icon.unwrap_or(IconData {
+            w: 1,
+            h: 1,
+            rgba: String::new(),
+        }),
+        windows: rows,
+        cx,
+        top,
+        scale,
     })));
     Ok(())
 }
@@ -199,8 +298,12 @@ pub fn show_for(
 
 struct ThreadState {
     hwnd: HWND,
-    thumb: isize,
-    icon: isize, // HICON raw（DestroyIcon 归还）
+    /// 每行一个 DWM 缩略图句柄（0 = 该行降级未注册）。
+    thumbs: Vec<isize>,
+    /// 可点击的窗口行：`(源窗口, minimized)`——WM_LBUTTONDOWN 按行激活。
+    rows: Vec<(isize, bool)>,
+    /// 悬停行高亮（-1 = 无）。
+    hover_row: i32,
     last_cmd: Instant,
 }
 
@@ -208,8 +311,9 @@ impl Default for ThreadState {
     fn default() -> Self {
         ThreadState {
             hwnd: HWND::default(),
-            thumb: 0,
-            icon: 0,
+            thumbs: Vec::new(),
+            rows: Vec::new(),
+            hover_row: -1,
             last_cmd: Instant::now(),
         }
     }
@@ -217,13 +321,19 @@ impl Default for ThreadState {
 
 /// WM_PAINT 用（wndproc 与线程同体，锁竞争可忽略）。
 struct PaintState {
-    title: String,
-    icon: isize,
-    degraded: bool,
+    app_title: String,
+    app_icon: isize,   // HICON raw
+    rows: Vec<String>, // 每行窗口标题
+    degraded: Vec<bool>,
     scale: f32,
 }
 
 static PAINT: Mutex<Option<PaintState>> = Mutex::new(None);
+/// 可点击窗口行注册表：show_preview 写入 / destroy_preview 清空 / wndproc 点击读取。
+/// `(源窗口, minimized)`，下标 = 行号。
+static ROWS: Mutex<Vec<(isize, bool)>> = Mutex::new(Vec::new());
+/// 悬停行（-1 = 无）。
+static HOVER_ROW: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 fn thread_loop(rx: Receiver<Cmd>) {
     unsafe {
@@ -274,9 +384,11 @@ unsafe fn show_preview(st: &mut ThreadState, req: ShowReq) {
     destroy_preview(st, "replaced");
 
     let sc = req.scale;
-    let degraded = req.degraded_reason.is_some();
+    let n = req.windows.len().max(1);
     let w = (BASE_W * sc) as i32;
-    let h = ((if degraded { BASE_H_DEGRADED } else { BASE_H }) * sc) as i32;
+    // 007：高度 = 头部带 + N 行。单窗口时与旧版 BASE_H 同视觉（150 ≈ 170-头-邻隙，
+    // 行留白已吸收差异）；多窗口逐行加高，显示器装不下时按行截断。
+    let h = ((HEADER_H + n as f32 * ROW_H) * sc) as i32;
 
     // 定位：图标上方居中，夹到图标所在显示器内
     let hmon = MonitorFromPoint(
@@ -344,27 +456,48 @@ unsafe fn show_preview(st: &mut ThreadState, req: ShowReq) {
         let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, Some(rgn), true);
     }
 
-    // 头部图标：RGBA → HICON（一次/show）
-    let icon_raw = icon_from_rgba(&req.icon).map(|h| h.0 as isize).unwrap_or(0);
+    // 头部应用图标：RGBA → HICON（一次/show）
+    let icon_raw = icon_from_rgba(&req.app_icon)
+        .map(|h| h.0 as isize)
+        .unwrap_or(0);
     if let Ok(mut g) = PAINT.lock() {
         *g = Some(PaintState {
-            title: req.title.clone(),
-            icon: icon_raw,
-            degraded,
+            app_title: req.app_title.clone(),
+            app_icon: icon_raw,
+            rows: req.windows.iter().map(|r| r.title.clone()).collect(),
+            degraded: req.windows.iter().map(|r| r.degraded).collect(),
             scale: sc,
         });
     }
 
     st.hwnd = hwnd;
-    st.icon = icon_raw;
+    st.rows = req.windows.iter().map(|r| (r.src, r.degraded)).collect();
+    if let Ok(mut reg) = ROWS.lock() {
+        *reg = st.rows.clone();
+    }
+    st.hover_row = -1;
 
-    // 缩略图注册（降级模式无源窗口，跳过）
-    if req.src != 0 {
-        match DwmRegisterThumbnail(hwnd, HWND(req.src as *mut c_void)) {
+    // 每个非降级窗口注册一行 DWM 缩略图：目的地 = 行内容区（去掉行标题条）。
+    let header = (HEADER_H * sc) as i32;
+    let rh = (ROW_H * sc) as i32;
+    let strip = (ROW_TITLE * sc) as i32;
+    let pad = (PAD * sc) as i32;
+    for (i, r) in req.windows.iter().enumerate() {
+        if r.src == 0 {
+            continue; // 降级行：无缩略图（PaintState.degraded[i] 已置位）
+        }
+        let rr = row_rect(sc, i as i32, w, h);
+        let dest_rect = RECT {
+            left: pad,
+            top: header + i as i32 * rh + 4,
+            right: w - pad,
+            bottom: rr.top + rh - strip - 4,
+        };
+        match DwmRegisterThumbnail(hwnd, HWND(r.src as *mut c_void)) {
             Ok(t) => {
-                let dest = letterbox_dest(&req, w, h);
+                let dest = letterbox_dest(r.src, dest_rect);
                 let mut sr = RECT::default();
-                let _ = GetWindowRect(HWND(req.src as *mut c_void), &mut sr);
+                let _ = GetWindowRect(HWND(r.src as *mut c_void), &mut sr);
                 let props = DWM_THUMBNAIL_PROPERTIES {
                     dwFlags: DWM_TNP_RECTDESTINATION
                         | DWM_TNP_RECTSOURCE
@@ -384,21 +517,19 @@ unsafe fn show_preview(st: &mut ThreadState, req: ShowReq) {
                 if let Err(e) = DwmUpdateThumbnailProperties(t, &props) {
                     log(&format!("thumb props failed: {e}"));
                 }
-                st.thumb = t;
+                st.thumbs.push(t);
             }
             Err(e) => {
-                // 注册失败（罕见）：退化为图标+标题尺寸，不留空玻璃框
-                log(&format!("thumb register failed: {e} -> degrade"));
-                destroy_preview(st, "reg-failed");
-                show_preview(
-                    st,
-                    ShowReq {
-                        src: 0,
-                        degraded_reason: Some("reg-failed"),
-                        ..req
-                    },
-                );
-                return;
+                // 注册失败（罕见）：该行降级为图标+标题，不影响其他行
+                log(&format!("thumb register failed row={i}: {e} -> degrade"));
+                if let Ok(mut g) = PAINT.lock() {
+                    if let Some(p) = g.as_mut() {
+                        if let Some(d) = p.degraded.get_mut(i) {
+                            *d = true;
+                        }
+                    }
+                }
+                st.thumbs.push(0);
             }
         }
     }
@@ -414,29 +545,42 @@ unsafe fn show_preview(st: &mut ThreadState, req: ShowReq) {
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
     );
     let _ = InvalidateRect(Some(hwnd), None, false);
+    let thumb_count = st.thumbs.iter().filter(|&&t| t != 0).count();
     log(&format!(
-        "preview open rect=({x},{y}) {w}x{h} glass={glass} thumb={}",
-        if st.thumb != 0 { "ok" } else { "none" }
+        "preview open rect=({x},{y}) {w}x{h} glass={glass} rows={} thumbs={thumb_count}",
+        st.rows.len(),
     ));
 }
 
-/// 缩略图目的地：源窗口宽高比等比装入内容区（居中 letterbox）。
+/// 行几何（物理 px）：第 i 行的 y 区间。头部带之下逐行排布，底边夹进窗内。
+fn row_rect(scale: f32, index: i32, win_w: i32, win_h: i32) -> RECT {
+    let header = (HEADER_H * scale) as i32;
+    let rh = (ROW_H * scale) as i32;
+    let top = header + index * rh;
+    RECT {
+        left: 0,
+        top,
+        right: win_w,
+        bottom: (top + rh).min(win_h),
+    }
+}
+
+/// 缩略图目的地：源窗口宽高比等比装入 `dest`（居中 letterbox）。
 /// DWM 不自动保比例（rcSource 直接拉伸到 rcDestination），不处理会压扁画面。
-fn letterbox_dest(req: &ShowReq, win_w: i32, win_h: i32) -> RECT {
+fn letterbox_dest(src: isize, dest: RECT) -> RECT {
     let mut sr = RECT::default();
     unsafe {
-        let _ = GetWindowRect(HWND(req.src as *mut c_void), &mut sr);
+        let _ = GetWindowRect(HWND(src as *mut c_void), &mut sr);
     }
     let (sw, sh) = ((sr.right - sr.left).max(1), (sr.bottom - sr.top).max(1));
-    let pad = (PAD * req.scale) as i32;
-    let header = (HEADER_H * req.scale) as i32;
-    // 内容区：左右 PAD，上 header+6，下 PAD
-    let (bx, by) = (pad, header + (6.0 * req.scale) as i32);
-    let (bw, bh) = (win_w - pad * 2, win_h - by - pad);
+    let (bw, bh) = (
+        (dest.right - dest.left).max(1),
+        (dest.bottom - dest.top).max(1),
+    );
     let k = (bw as f32 / sw as f32).min(bh as f32 / sh as f32);
     let (dw, dh) = ((sw as f32 * k) as i32, (sh as f32 * k) as i32);
-    let dx = bx + (bw - dw) / 2;
-    let dy = by + (bh - dh) / 2;
+    let dx = dest.left + (bw - dw) / 2;
+    let dy = dest.top + (bh - dh) / 2;
     RECT {
         left: dx,
         top: dy,
@@ -449,24 +593,25 @@ unsafe fn destroy_preview(st: &mut ThreadState, reason: &str) {
     if st.hwnd.0.is_null() {
         return;
     }
-    if st.thumb != 0 {
-        let _ = DwmUnregisterThumbnail(st.thumb);
-        st.thumb = 0;
+    for t in st.thumbs.drain(..) {
+        if t != 0 {
+            let _ = DwmUnregisterThumbnail(t);
+        }
     }
     let _ = ShowWindow(st.hwnd, SW_HIDE);
     let _ = DestroyWindow(st.hwnd);
     st.hwnd = HWND::default();
-    if st.icon != 0 {
-        let _ = DestroyIcon(windows::Win32::UI::WindowsAndMessaging::HICON(
-            st.icon as *mut c_void,
-        ));
-        st.icon = 0;
+    st.rows.clear();
+    st.hover_row = -1;
+    if let Ok(mut reg) = ROWS.lock() {
+        reg.clear();
     }
+    HOVER_ROW.store(-1, Ordering::Relaxed);
     if let Ok(mut g) = PAINT.lock() {
         if let Some(p) = g.take() {
-            if p.icon != 0 {
+            if p.app_icon != 0 {
                 let _ = DestroyIcon(windows::Win32::UI::WindowsAndMessaging::HICON(
-                    p.icon as *mut c_void,
+                    p.app_icon as *mut c_void,
                 ));
             }
         }
@@ -492,15 +637,11 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                 if let Some(p) = g.as_ref() {
                     let sc = p.scale;
                     let (w, h) = (ps.rcPaint.right, ps.rcPaint.bottom);
-                    // 头部带：不透明浅色条（dock 药丸同系浅色）。
-                    // ⚠ 文字必须落在不透明面上：品红 colorkey 面上的 GDI 文字
-                    // 会与 key 色混合渲染成白团（preview_poc 变体 E 实测，
-                    // ClearType/ANTIALIASED 皆坏）；不透明填充上的文字颜色正确（变体 C）。
-                    let band_h = if p.degraded {
-                        h
-                    } else {
-                        (HEADER_H * sc) as i32
-                    };
+                    // 007：头部带（应用图标 + 应用名）+ N 行（每行 = 底衬 + 行标题条；
+                    // 非降级行的缩略图由 DWM 叠在底衬之上）。
+                    // ⚠ 文字必须落在不透明面上：品红 colorkey 面上的 GDI 文字会与
+                    // key 色混合渲染成白团（preview_poc 变体 E 实测）。
+                    let band_h = (HEADER_H * sc) as i32;
                     let band = CreateSolidBrush(COLORREF(0x00F5_F5F2));
                     let band_rect = RECT {
                         left: 0,
@@ -511,29 +652,23 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                     FillRect(hdc, &band_rect, band);
                     let _ = DeleteObject(HGDIOBJ(band.0));
 
-                    let (ix, iy, isz, tx) = if p.degraded {
-                        // 降级模式：整窗单行（图标 + 标题）
-                        (
-                            (8.0 * sc) as i32,
-                            ((BASE_H_DEGRADED - 24.0) / 2.0 * sc) as i32,
-                            (24.0 * sc) as i32,
-                            8.0 + 24.0 + 8.0,
-                        )
-                    } else {
-                        // 头部带：图标 16 + 标题
-                        (
-                            (PAD * sc) as i32,
-                            ((HEADER_H - 18.0) / 2.0 * sc) as i32,
-                            (18.0 * sc) as i32,
-                            PAD + 18.0 + 6.0,
-                        )
-                    };
-                    if p.icon != 0 {
+                    SetBkMode(hdc, TRANSPARENT);
+                    let font = create_ui_font(sc);
+                    let old = SelectObject(hdc, font.into());
+                    SetTextColor(hdc, COLORREF(0x0018_1818));
+
+                    // 头部：应用图标 + 应用名
+                    let ix = (PAD * sc) as i32;
+                    let iy = ((HEADER_H - 18.0) / 2.0 * sc) as i32;
+                    let isz = (18.0 * sc) as i32;
+                    if p.app_icon != 0 {
                         let _ = DrawIconEx(
                             hdc,
                             ix,
                             iy,
-                            windows::Win32::UI::WindowsAndMessaging::HICON(p.icon as *mut c_void),
+                            windows::Win32::UI::WindowsAndMessaging::HICON(
+                                p.app_icon as *mut c_void,
+                            ),
                             isz,
                             isz,
                             0,
@@ -541,25 +676,86 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                             DI_NORMAL,
                         );
                     }
-                    // 标题：深色主体直接落在浅色带上（无 halo——halo 依赖 colorkey
-                    // 面上的白字，正是坏掉的那条路径）
-                    let mut title: Vec<u16> = p.title.encode_utf16().collect();
-                    let mut r = RECT {
-                        left: (tx * sc) as i32,
+                    let mut head: Vec<u16> = p.app_title.encode_utf16().collect();
+                    let mut hr = RECT {
+                        left: ((PAD + 18.0 + 6.0) * sc) as i32,
                         top: 0,
                         right: w - 4,
                         bottom: band_h,
                     };
-                    SetBkMode(hdc, TRANSPARENT);
-                    let font = create_ui_font(sc);
-                    let old = SelectObject(hdc, font.into());
-                    SetTextColor(hdc, COLORREF(0x0018_1818));
                     DrawTextW(
                         hdc,
-                        &mut title,
-                        &mut r,
+                        &mut head,
+                        &mut hr,
                         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
                     );
+
+                    // 行：底衬（不透明，接住点击）+ 悬停高亮 + 行标题条
+                    for (i, row_title) in p.rows.iter().enumerate() {
+                        let rr = row_rect(sc, i as i32, w, h);
+                        let hover = i as i32 == HOVER_ROW.load(Ordering::Relaxed);
+                        let bg = if hover { COLORREF(0x00E2_F2FC) } else { ROW_BG };
+                        let bgb = CreateSolidBrush(bg);
+                        FillRect(hdc, &rr, bgb);
+                        let _ = DeleteObject(HGDIOBJ(bgb.0));
+
+                        if p.degraded.get(i).copied().unwrap_or(true) {
+                            // 降级行：应用图标 + 窗口标题占满行（无缩略图）
+                            if p.app_icon != 0 {
+                                let _ = DrawIconEx(
+                                    hdc,
+                                    (8.0 * sc) as i32,
+                                    rr.top + ((ROW_H - 24.0) / 2.0 * sc) as i32,
+                                    windows::Win32::UI::WindowsAndMessaging::HICON(
+                                        p.app_icon as *mut c_void,
+                                    ),
+                                    (24.0 * sc) as i32,
+                                    (24.0 * sc) as i32,
+                                    0,
+                                    None,
+                                    DI_NORMAL,
+                                );
+                            }
+                            let mut t: Vec<u16> = row_title.encode_utf16().collect();
+                            let mut tr = RECT {
+                                left: ((8.0 + 24.0 + 8.0) * sc) as i32,
+                                top: rr.top,
+                                right: w - 8,
+                                bottom: rr.bottom,
+                            };
+                            DrawTextW(
+                                hdc,
+                                &mut t,
+                                &mut tr,
+                                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                            );
+                        } else {
+                            // 行标题条：不透明浅条（窗口标题），行内可点击
+                            let strip_y = rr.bottom - (ROW_TITLE * sc) as i32;
+                            let strip = CreateSolidBrush(COLORREF(0x00F5_F5F2));
+                            let strip_rect = RECT {
+                                left: 0,
+                                top: strip_y,
+                                right: w,
+                                bottom: rr.bottom,
+                            };
+                            FillRect(hdc, &strip_rect, strip);
+                            let _ = DeleteObject(HGDIOBJ(strip.0));
+                            let mut t: Vec<u16> = row_title.encode_utf16().collect();
+                            let mut tr = RECT {
+                                left: (8.0 * sc) as i32,
+                                top: strip_y,
+                                right: w - 8,
+                                bottom: rr.bottom,
+                            };
+                            DrawTextW(
+                                hdc,
+                                &mut t,
+                                &mut tr,
+                                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                            );
+                        }
+                    }
                     let _ = SelectObject(hdc, old);
                     let _ = DeleteObject(font.into());
                 }
@@ -568,7 +764,72 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
             LRESULT(0)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => LRESULT(1),
+        windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN => {
+            // 007 点击切换：命中行 → 还原/置前该窗口，销毁预览。
+            // 激活调用发生在预览线程（非 UI 线程）；前台锁按进程判定，
+            // 用户刚点了 dock/预览（本进程持前台权），置前通常直接成功。
+            let y = (lp.0 >> 16) as i16 as i32;
+            let src = preview_src_at(y);
+            if let Some(src) = src {
+                unsafe { activate_window(src) };
+                log(&format!("activate src={src}"));
+            }
+            // 经 Cmd::Hide 让预览线程自行销毁（wndproc 无 ThreadState 上下文）
+            send(Cmd::Hide);
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE => {
+            // 悬停行高亮：变了才重绘
+            let y = (lp.0 >> 16) as i16 as i32;
+            let row = hit_row(y);
+            if HOVER_ROW.swap(row, Ordering::Relaxed) != row && row >= 0 {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// 屏幕客户区 y → 行号（-1 = 头部/窗外）。
+fn hit_row(client_y: i32) -> i32 {
+    if let Ok(g) = PAINT.lock() {
+        if let Some(p) = g.as_ref() {
+            let header = (HEADER_H * p.scale) as i32;
+            let rh = ((ROW_H * p.scale) as i32).max(1);
+            if client_y >= header && !p.rows.is_empty() {
+                return ((client_y - header) / rh).clamp(0, p.rows.len() as i32 - 1);
+            }
+        }
+    }
+    -1
+}
+
+/// 点击激活目标：行注册表按 y 命中 → 源窗口（降级行返回 None）。
+fn preview_src_at(client_y: i32) -> Option<isize> {
+    let row = hit_row(client_y);
+    if row < 0 {
+        return None;
+    }
+    let rows = ROWS.lock().ok()?;
+    let (src, _minimized) = *rows.get(row as usize)?;
+    if src == 0 {
+        return None; // 降级行：无真实源窗口
+    }
+    Some(src)
+}
+
+/// 还原最小化 + 置前（preview 行点击共用；前台锁语义见 activate_or_launch）。
+unsafe fn activate_window(src: isize) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
+    };
+    let hwnd = HWND(src as *mut c_void);
+    if IsIconic(hwnd).as_bool() {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+    }
+    if !SetForegroundWindow(hwnd).as_bool() {
+        SwitchToThisWindow(hwnd, true);
     }
 }
 

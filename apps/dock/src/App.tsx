@@ -297,6 +297,19 @@ function App() {
     }, 300);
   };
 
+  // 007：transient（运行中未固定）悬停 → 按 key 出多窗口预览
+  const enterTransient = (t: TransientApp) => (e: React.MouseEvent<HTMLButtonElement>) => {
+    if (dragRef.current) return;
+    const el = e.currentTarget;
+    window.clearTimeout(hoverTimer.current);
+    hoverTimer.current = window.setTimeout(() => {
+      if (dragRef.current) return;
+      const r = el.getBoundingClientRect();
+      invoke("preview_show_transient", { key: t.key, x: r.left, y: r.top, w: r.width, h: r.height })
+        .catch(() => {});
+    }, 300);
+  };
+
   const leaveIcon = () => {
     window.clearTimeout(hoverTimer.current);
     invoke("preview_hide").catch(() => {});
@@ -949,13 +962,16 @@ function App() {
           );
         })}
         {/* v0.8：未固定的运行中应用（临时图标）。固定条目右侧、同视觉规格、
-            RunDot 常亮（必然在运行）；单击激活、右键固定；**不挂任何拖动手势**，
-            拖出/行内排序/悬停预览对临时图标一律不响应（卡面 §1.3-6）。 */}
+            RunDot 常亮（必然在运行）；单击激活、右键固定；**不挂任何拖动手势**
+            （拖出/行内排序对临时图标不响应，卡面 §1.3-6）。
+            007：悬停预览对临时图标放开——按 key 出多窗口预览。 */}
         {transients.map((t) => (
           <button
             key={t.key}
             className="dock-icon dock-transient"
             title={`${t.name}（运行中，未固定）`}
+            onMouseEnter={enterTransient(t)}
+            onMouseLeave={leaveIcon}
             {...bindPress<HTMLButtonElement>({
               tag: `transient:${t.key}`,
               onPress: () => activateTransient(t),

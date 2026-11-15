@@ -154,6 +154,19 @@ pub fn preview_show(
     preview::show_for(&app, &id, x, y, w, h)
 }
 
+/// 007：悬停**运行中未固定**图标 → 按 key 出多窗口预览（应用名/图标取目录缓存）。
+#[tauri::command]
+pub fn preview_show_transient(
+    app: tauri::AppHandle,
+    key: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> Result<(), String> {
+    preview::show_for_transient(&app, &key, x, y, w, h)
+}
+
 /// 任务 B：销毁预览（鼠标移开 / 点击图标 / dock 隐藏）。
 #[tauri::command]
 pub fn preview_hide() -> Result<(), String> {
