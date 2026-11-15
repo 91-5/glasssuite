@@ -123,17 +123,29 @@ pub fn reorder_shortcuts(
     Ok(cfg.shortcuts)
 }
 
+/// 启动/激活快捷方式。**async + spawn_blocking（OC-20261115-005）**：
+/// 反查 aumid 要读盘解析 dock.json、`find_window_for_key` 要 EnumWindows 全量枚举、
+/// 未运行时 `ShellExecuteW` 可能被 LNK 解析/杀毒扫描挂数百 ms——这些阻塞调用
+/// 此前都在 Tauri 主线程（约束 14 违例，点击期间整条事件循环停摆）。现在整段
+/// 搬到阻塞线程池，主线程只负责 await。
 #[tauri::command]
-pub fn launch_shortcut(app: tauri::AppHandle, path: String) -> Result<(), String> {
+pub async fn launch_shortcut(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || launch_shortcut_blocking(&app, &path))
+        .await
+        .map_err(|e| format!("launch task join failed: {e}"))?
+}
+
+/// launch_shortcut 的阻塞体（独立出来便于将来单测/复用）。
+fn launch_shortcut_blocking(app: &tauri::AppHandle, path: &str) -> Result<(), String> {
     // 已运行应用走激活快路径（同 running 的 key 体系）；未运行才真的启动。
     // v0.6：反查走归一化（小写 + / → \）——前端传回大小写/分隔符不同的 path
     // 时不再把 UWP 应用当 Win32 启动（v0.4-a verdict advisory）。
-    let aumid = crate::dock::config_path(&app)
+    let aumid = crate::dock::config_path(app)
         .map(|p| crate::dock::load_config(&p))
         .and_then(|cfg| {
-            crate::dock::find_shortcut_by_path(&cfg, &path).and_then(|s| s.aumid.clone())
+            crate::dock::find_shortcut_by_path(&cfg, path).and_then(|s| s.aumid.clone())
         });
-    crate::dock::activate_or_launch(&aumid, &path)
+    crate::dock::activate_or_launch(&aumid, path)
 }
 
 /// 任务 B：悬停预览显示（前端悬停图标 ≥300ms 后调用）。
@@ -191,9 +203,12 @@ pub fn menu_remove(path: String) -> Result<Vec<String>, String> {
 }
 
 /// 任务 C（sir 反馈迭代）：面板内启动。失败返回 Err（前端不关面板，日志可见）。
+/// 启动开始菜单快捷方式（点击路径，005 非阻塞化：ShellExecute 在阻塞线程池）。
 #[tauri::command]
-pub fn menu_launch(path: String) -> Result<(), String> {
-    menu::launch_from_menu(&path)
+pub async fn menu_launch(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || menu::launch_from_menu(&path))
+        .await
+        .map_err(|e| format!("menu launch task join failed: {e}"))?
 }
 
 /// 拖拽定位临时通道（前端关键事件 → menu.log）。
@@ -265,7 +280,8 @@ pub fn fit_dock(
         menu::debug_note(&format!("dock: fit_dock queued w={w} h={h}"));
         let handle = app.clone();
         std::thread::spawn(move || {
-            let deadline = Instant::now() + crate::dock::INTERACTION_TIMEOUT + Duration::from_millis(50);
+            let deadline =
+                Instant::now() + crate::dock::INTERACTION_TIMEOUT + Duration::from_millis(50);
             while crate::dock::interaction_locked() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -277,11 +293,7 @@ pub fn fit_dock(
 }
 
 /// 真正的几何写入（主线程执行）。锁期间只允许经 flush 走到这里。
-pub(crate) fn apply_fit_dock(
-    window: &tauri::WebviewWindow,
-    w: f64,
-    h: f64,
-) -> Result<(), String> {
+pub(crate) fn apply_fit_dock(window: &tauri::WebviewWindow, w: f64, h: f64) -> Result<(), String> {
     use tauri::{LogicalSize, PhysicalPosition};
     let w = w.max(120.0);
     let h = h.max(48.0);
@@ -332,9 +344,12 @@ pub fn free_drag_out(app: tauri::AppHandle, id: String, cx: f64, cy: f64) -> Res
 }
 
 /// 游离图标双击/单击 → 启动或激活（复用 dock::activate_or_launch 的快路径）。
+/// 启动/激活游离图标（点击路径，005 非阻塞化同 launch_shortcut）。
 #[tauri::command]
-pub fn free_launch(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    free::launch(&app, &id)
+pub async fn free_launch(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || free::launch(&app, &id))
+        .await
+        .map_err(|e| format!("free launch task join failed: {e}"))?
 }
 
 /// 游离图标右键 → 收回 dock。
@@ -410,8 +425,18 @@ pub fn pin_transient(app: tauri::AppHandle, key: String) -> Result<crate::dock::
 }
 
 /// v0.8：单击临时图标 → 激活该应用（find_window_for_key 快路径）。
+/// 激活运行中未固定应用（点击路径，005 非阻塞化同 launch_shortcut：窗口枚举 +
+/// 前台切换 + 可能的 ShellExecute 兜底，全部在阻塞线程池跑）。
 #[tauri::command]
-pub fn transient_activate(key: String, path: String, aumid: Option<String>) -> Result<(), String> {
-    let _ = key; // key 主要供前端标识；激活走与固定条目同一条 activate_or_launch 通路
-    crate::dock::transient_activate(&aumid, &path)
+pub async fn transient_activate(
+    key: String,
+    path: String,
+    aumid: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = key; // key 主要供前端标识；激活走与固定条目同一条 activate_or_launch 通路
+        crate::dock::transient_activate(&aumid, &path)
+    })
+    .await
+    .map_err(|e| format!("transient activate task join failed: {e}"))?
 }

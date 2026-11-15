@@ -73,9 +73,7 @@ fn release_ready(last_in_ago: Option<Duration>, pending: Duration) -> bool {
     if pending < LEAVE_RELEASE {
         return false;
     }
-    last_in_ago
-        .map(|d| d >= LEAVE_HYSTERESIS)
-        .unwrap_or(true)
+    last_in_ago.map(|d| d >= LEAVE_HYSTERESIS).unwrap_or(true)
 }
 
 static CTX: Mutex<Option<Arc<HookCtx>>> = Mutex::new(None);
@@ -196,18 +194,11 @@ pub fn pre_expand_region(state: &SharedState) {
     let shift = ((PANEL_W - crate::shell::ISLAND_W) * scale / 2.0).round() as i32;
     let now = ScreenRect::from_size((left, top), PANEL_W, PANEL_H, scale);
     let after = ScreenRect::from_size((left - shift, top), PANEL_W, PANEL_H, scale);
-    let island = ScreenRect::from_logical(
-        (left, top),
-        *state.island_hotzone.lock().unwrap(),
-        scale,
-    );
+    let island =
+        ScreenRect::from_logical((left, top), *state.island_hotzone.lock().unwrap(), scale);
     let ball = ScreenRect::from_logical((left, top), *state.ball_hotzone.lock().unwrap(), scale);
     let pad = (REGION_PAD_LOGICAL * scale).round() as i32;
-    let rect = now
-        .union(after)
-        .union(island)
-        .union(ball)
-        .inflate(pad);
+    let rect = now.union(after).union(island).union(ball).inflate(pad);
     write_region(state, rect, "pre-expand");
 }
 

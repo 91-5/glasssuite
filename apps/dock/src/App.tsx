@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { DragSession, makeWayOffsets, offsetToTransform } from "./dragOrder";
+import { orderRunningFirst } from "./rowOrder";
 
 // ---------------------------------------------------------------------------
 // OC-20261115-002：按压手势自愈 + capture 生命周期 + 交互锁 + 取证遥测
@@ -342,6 +343,8 @@ function App() {
   }, []);
 
   // 游离图标原生拖动落在 dock 区 → Rust 问前端要落点槽位（DOM 几何只有前端知道）。
+  // 005：显示序已按「运行中前置」重排，与配置序不再一致——DOM 顺序换到最近图标后
+  // 用 data-id 反查它在**配置序**里的下标，再交给 Rust 插入（Rust 只认配置序）。
   useEffect(() => {
     const pick = (id: string, cssX: number) => {
       const els = Array.from(
@@ -361,7 +364,12 @@ function App() {
           best = i;
         }
       });
-      invoke("free_drop_result", { id, slot: best }).catch(() => {});
+      const pickedId = els[best]?.dataset.id;
+      const configOrder = icons.filter((s) => (s.mode ?? "dock") === "dock");
+      const cfgIdx = pickedId
+        ? configOrder.findIndex((s) => s.id === pickedId)
+        : -1;
+      invoke("free_drop_result", { id, slot: cfgIdx >= 0 ? cfgIdx : best }).catch(() => {});
     };
     (window as unknown as { __gdPickDrop?: (id: string, x: number) => void }).__gdPickDrop =
       pick;
@@ -395,6 +403,9 @@ function App() {
             ids.some((v, i) => v !== prev[i])
           ) {
             lastRunIds = ids;
+            // 005：运行集合变化会触发「运行中前置」重排——拖动进行中先冻结
+            // （旧快照还指着按下时的槽位，中途重排会让落点错位）；松手后下一轮生效。
+            if (draggingRef.current) return;
             setRunning(new Set(ids));
           }
         })
@@ -601,10 +612,17 @@ function App() {
   // 当前让位态：drop = 滞回后的插入位（others 语义），pitch = 快照槽距。
   // null = 没有让位（未起拖 / 已拖出 / 已松手）。
   const [makeWay, setMakeWay] = useState<{ drop: number; pitch: number } | null>(null);
-  // dock 行可见条目（游离图标不在行内）
+  // dock 行可见条目（游离图标不在行内）。
+  // 005「已在运行先前置」：在运行的 pinned 排前面（组内稳定，见 rowOrder.ts）。
+  // 显示序 ≠ 配置序是刻意的：拖拽落位持久化的是**用户看到的那一屏顺序**，
+  // free 回归槽位由 __gdPickDrop 按 data-id 做 display→config 换算（见下）。
   const dockIcons = useMemo(
-    () => icons.filter((s) => (s.mode ?? "dock") === "dock"),
-    [icons]
+    () =>
+      orderRunningFirst(
+        icons.filter((s) => (s.mode ?? "dock") === "dock"),
+        (s) => running.has(s.id)
+      ),
+    [icons, running]
   );
 
   /** pointerdown 快照：剥掉可能残留的 FLIP inline transform 后量自然位中心。 */
@@ -935,6 +953,7 @@ function App() {
             <button
               key={sc.id}
               data-drag
+              data-id={sc.id}
               ref={(el) => {
                 if (el) rowRefs.current.set(sc.id, el);
                 else rowRefs.current.delete(sc.id);

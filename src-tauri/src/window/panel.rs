@@ -36,14 +36,12 @@ pub fn expand_panel(
     // 时序窗口，正是「快甩被误收起」的入口之一。
     cursor::pre_expand_region(state.inner().as_ref());
 
-    let win = app
-        .get_webview_window("island")
-        .ok_or_else(|| {
-            winplat::log::log("panel: expand FAILED - island window not found");
-            state.island_expanded.store(false, Ordering::Relaxed);
-            cursor::refresh_region(state.inner().as_ref(), "expand-rollback");
-            "island 窗口不存在".to_string()
-        })?;
+    let win = app.get_webview_window("island").ok_or_else(|| {
+        winplat::log::log("panel: expand FAILED - island window not found");
+        state.island_expanded.store(false, Ordering::Relaxed);
+        cursor::refresh_region(state.inner().as_ref(), "expand-rollback");
+        "island 窗口不存在".to_string()
+    })?;
     if let Err(e) = shell::place(&win, Anchor::Island, PANEL_W, PANEL_H) {
         winplat::log::log(&format!("panel: expand place FAILED: {e}"));
         state.island_expanded.store(false, Ordering::Relaxed);

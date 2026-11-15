@@ -39,7 +39,7 @@ use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, FindWindowExW, GetClassNameW, GetWindow, GetWindowLongPtrW,
     GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    PeekMessageW, TranslateMessage, EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, GW_OWNER, GWL_EXSTYLE,
+    PeekMessageW, TranslateMessage, EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, GWL_EXSTYLE, GW_OWNER,
     MSG, PM_REMOVE, WINDOW_LONG_PTR_INDEX, WINEVENT_OUTOFCONTEXT, WM_QUIT,
 };
 
@@ -601,8 +601,15 @@ unsafe extern "system" fn winevent_proc(
 mod perceptible_tests {
     use super::*;
 
-    const NORMAL: (&str, &str, bool, bool, bool, i32, i32) =
-        ("Chrome_WidgetWin_1", "Chrome", false, false, false, 1200, 800);
+    const NORMAL: (&str, &str, bool, bool, bool, i32, i32) = (
+        "Chrome_WidgetWin_1",
+        "Chrome",
+        false,
+        false,
+        false,
+        1200,
+        800,
+    );
 
     #[test]
     fn normal_and_minimized_app_windows_are_perceptible() {
@@ -617,9 +624,15 @@ mod perceptible_tests {
         let (c, t, _, o, tw, w, h) = NORMAL;
         assert!(!perceptible_window(c, t, true, o, tw, w, h), "DWM cloaked");
         assert!(!perceptible_window(c, t, false, true, tw, w, h), "有 owner");
-        assert!(!perceptible_window(c, t, false, o, true, w, h), "TOOLWINDOW");
+        assert!(
+            !perceptible_window(c, t, false, o, true, w, h),
+            "TOOLWINDOW"
+        );
         assert!(!perceptible_window(c, "", false, o, tw, w, h), "空标题");
-        assert!(!perceptible_window(c, "   ", false, o, tw, w, h), "空白标题");
+        assert!(
+            !perceptible_window(c, "   ", false, o, tw, w, h),
+            "空白标题"
+        );
     }
 
     #[test]
@@ -634,7 +647,23 @@ mod perceptible_tests {
             160,
             28
         ));
-        assert!(!perceptible_window("Chrome_WidgetWin_1", "X", false, false, false, 0, 0));
-        assert!(!perceptible_window("Progman", "Program Manager", false, false, false, 1920, 1080));
+        assert!(!perceptible_window(
+            "Chrome_WidgetWin_1",
+            "X",
+            false,
+            false,
+            false,
+            0,
+            0
+        ));
+        assert!(!perceptible_window(
+            "Progman",
+            "Program Manager",
+            false,
+            false,
+            false,
+            1920,
+            1080
+        ));
     }
 }

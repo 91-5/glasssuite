@@ -1232,7 +1232,10 @@ pub fn hysteresis_step(
 pub fn stable_keys(st: &TransientHysteresis) -> Vec<String> {
     st.stable
         .iter()
-        .map(|fp| fp.split_once('|').map_or(fp.clone(), |(k, _)| k.to_string()))
+        .map(|fp| {
+            fp.split_once('|')
+                .map_or(fp.clone(), |(k, _)| k.to_string())
+        })
         .collect()
 }
 
@@ -1282,10 +1285,7 @@ pub fn transient_apps(
             let hit = crate::dock::menu::catalog_lookup_aumid(aumid)?;
             Some((
                 k.clone(),
-                format!(
-                    "exe:{}",
-                    crate::dock::running::normalize_path(&hit.path)
-                ),
+                format!("exe:{}", crate::dock::running::normalize_path(&hit.path)),
             ))
         })
         .collect();
@@ -1302,7 +1302,11 @@ pub fn transient_apps(
     let observed: BTreeSet<String> = keys
         .iter()
         .map(|k| {
-            let ready = if transient_entry(k).icon.is_some() { 1 } else { 0 };
+            let ready = if transient_entry(k).icon.is_some() {
+                1
+            } else {
+                0
+            };
             format!("{k}|{ready}")
         })
         .collect();
@@ -1316,8 +1320,16 @@ pub fn transient_apps(
             if !added.is_empty() || !removed.is_empty() {
                 menu::debug_note(&format!(
                     "dock: transient-diff added=[{}] removed=[{}]",
-                    added.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","),
-                    removed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")
+                    added
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    removed
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 ));
             }
         }
