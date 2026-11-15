@@ -330,6 +330,16 @@ static CELLS: Mutex<Vec<RECT>> = Mutex::new(Vec::new());
 /// 悬停行（-1 = 无）。
 static HOVER_ROW: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// 预览窗屏幕 rect（007 断桥修复）：show_preview 写入 / destroy 清空，
+/// dock 显隐循环经 current_rect() 读取——鼠标在预览窗内视同在 dock 内。
+static PREVIEW_RECT: std::sync::RwLock<Option<RECT>> = std::sync::RwLock::new(None);
+
+/// 预览窗当前屏幕 rect（物理 px）。`None` = 预览未显示。
+/// dock 显隐循环用它把「鼠标在预览窗内」并入 hover 判定（007 返工补丁）。
+pub fn current_rect() -> Option<RECT> {
+    PREVIEW_RECT.read().ok().and_then(|g| *g)
+}
+
 fn thread_loop(rx: Receiver<Cmd>) {
     unsafe {
         let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
@@ -482,6 +492,10 @@ unsafe fn show_preview(st: &mut ThreadState, req: ShowReq) {
     }
     if let Ok(mut cells) = CELLS.lock() {
         *cells = layout.cells.clone();
+    }
+    // 007 断桥修复：登记预览窗屏幕 rect，供 dock 显隐循环并入 hover 判定
+    if let Ok(mut pr) = PREVIEW_RECT.write() {
+        *pr = Some(RECT { left: x, top: y, right: x + w, bottom: y + h });
     }
     st.hover_row = -1;
 
@@ -669,6 +683,9 @@ unsafe fn destroy_preview(st: &mut ThreadState, reason: &str) {
     }
     if let Ok(mut cells) = CELLS.lock() {
         cells.clear();
+    }
+    if let Ok(mut pr) = PREVIEW_RECT.write() {
+        *pr = None;
     }
     HOVER_ROW.store(-1, Ordering::Relaxed);
     if let Ok(mut g) = PAINT.lock() {

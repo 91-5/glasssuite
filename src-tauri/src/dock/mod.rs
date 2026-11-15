@@ -850,7 +850,18 @@ pub fn dock_logic(app: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
             let (cx, cy) = cursor_pos();
             let near_edge = cy >= tr.bottom as i64 - REVEAL_EDGE_PX;
             let in_dock = dock_rect_contains(x, y, size, cx, cy);
-            if near_edge || in_dock {
+            // 007 断桥修复：鼠标在多窗预览窗内视同在 dock 内——否则光标离开
+            // dock 矩形进入预览窗的瞬间 want_visible 翻 false，dock 隐藏并
+            // 连带 preview::hide()，预览窗永远点不到（2026-11-16 实测复现）。
+            let in_preview = crate::dock::preview::current_rect()
+                .map(|r| {
+                    cx >= r.left as i64
+                        && cx <= r.right as i64
+                        && cy >= r.top as i64
+                        && cy <= r.bottom as i64
+                })
+                .unwrap_or(false);
+            if near_edge || in_dock || in_preview {
                 last_active = Instant::now();
                 true
             } else {
@@ -1790,5 +1801,61 @@ mod uwp_merge_tests {
             vec!["exe:c:\\app.exe".to_string()],
             "AUMID 不在场 → 不归并"
         );
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    /// 008 步骤 4：旧 dock.json 里 mode:"free" 的条目在 load_config 时**原位**
+    /// 收敛回 dock 行（free_rect 剥离，配置相对顺序不变）；纯 dock 文件零改动。
+    #[test]
+    fn load_config_migrates_free_entries_back_to_dock() {
+        let dir = std::env::temp_dir().join("gs-dock-migration");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("dock.json");
+        std::fs::write(
+            &file,
+            r#"{
+                "auto_hide": false,
+                "shortcuts": [
+                    {"id":"a","name":"A","path":"C:\\a.exe","icon":{"w":1,"h":1,"rgba":""}},
+                    {"id":"f1","name":"F1","path":"C:\\f1.exe","icon":{"w":1,"h":1,"rgba":""},
+                     "mode":"free","free_rect":{"x":10,"y":20,"w":64,"h":64}},
+                    {"id":"b","name":"B","path":"C:\\b.exe","icon":{"w":1,"h":1,"rgba":""}}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let cfg = load_config(&file);
+        assert!(
+            cfg.shortcuts.iter().all(|s| s.mode == IconMode::Dock),
+            "迁移后不允许再有 free 条目"
+        );
+        assert_eq!(
+            cfg.shortcuts
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "f1", "b"],
+            "free 条目原位收敛（配置相对顺序不变，视觉扰动最小）"
+        );
+        assert!(cfg.shortcuts.iter().all(|s| s.free_rect.is_none()));
+
+        // 纯 dock 文件：零改动往返
+        let file2 = dir.join("dock2.json");
+        std::fs::write(
+            &file2,
+            r#"{"auto_hide":false,"shortcuts":[{"id":"a","name":"A","path":"C:\\a.exe","icon":{"w":1,"h":1,"rgba":""}}]}"#,
+        )
+        .unwrap();
+        let cfg2 = load_config(&file2);
+        assert_eq!(cfg2.shortcuts.len(), 1);
+        assert_eq!(cfg2.shortcuts[0].id, "a");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

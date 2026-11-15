@@ -3,6 +3,8 @@
 
 use std::time::{Duration, Instant};
 
+use tauri::Manager;
+
 use super::menu;
 use super::preview;
 use super::running;
