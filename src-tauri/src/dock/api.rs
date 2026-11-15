@@ -3,8 +3,6 @@
 
 use std::time::{Duration, Instant};
 
-use tauri::Manager;
-
 use super::free;
 use super::menu;
 use super::preview;
@@ -375,66 +373,9 @@ pub fn drag_thresholds() -> DragThresholds {
 }
 
 // dock_config_version 已并入 dock_running_snapshot（OC-20261115-006 统一快照）。
-
-/// 拖出成游离图标：cx/cy = dock 客户区 CSS 坐标（落点）。
-#[tauri::command]
-pub fn free_drag_out(app: tauri::AppHandle, id: String, cx: f64, cy: f64) -> Result<(), String> {
-    free::drag_out(&app, &id, cx, cy)
-}
-
-/// 游离图标双击/单击 → 启动或激活（复用 dock::activate_or_launch 的快路径）。
-/// 启动/激活游离图标（点击路径，005 非阻塞化同 launch_shortcut）。
-#[tauri::command]
-pub async fn free_launch(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || free::launch(&app, &id))
-        .await
-        .map_err(|e| format!("free launch task join failed: {e}"))?
-}
-
-/// 游离图标右键 → 收回 dock。
-#[tauri::command]
-pub fn free_return(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    free::return_to_dock(&app, &id, None)
-}
-
-/// 游离图标拖动结束、落在 dock 区 → 前端回调（带落点槽位）。
-#[tauri::command]
-pub fn free_drop_result(
-    app: tauri::AppHandle,
-    id: String,
-    slot: Option<usize>,
-) -> Result<(), String> {
-    free::return_to_dock(&app, &id, slot)
-}
-
-/// 游离窗口首帧就绪 → 显示（避免 WebView2 未画完的黑闪）。
-#[tauri::command]
-pub fn free_ready(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    free::show_free(&app, &free::label_for(&id));
-    Ok(())
-}
-
-/// 游离图标拖动：**交接给系统原生拖动**（WM_NCLBUTTONDOWN/HTCAPTION）。
-///
-/// 前端只负责「越过 4px 阈值时交接一次」，窗口移动全程由系统的模态移动循环接管
-/// （卡面 §1.3-1：不许用前端 pointer capture 拖窗口）。
-#[tauri::command]
-pub fn free_begin_drag(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let label = free::label_for(&id);
-    let win = app
-        .get_webview_window(&label)
-        .ok_or_else(|| "游离窗口不存在".to_string())?;
-    win.start_dragging().map_err(|e| e.to_string())
-}
-
-/// 游离窗口清单（自检/探针用）。
-#[tauri::command]
-pub fn free_status() -> Vec<free::FreeStatus> {
-    free::status()
-}
-
 // get_transient_running 已并入 dock_running_snapshot（OC-20261115-006 统一快照）；
 // dock-transient-capped 提示随快照推送并去重（见 running.rs push_snapshot）。
+// 008：free_* 七条命令已删除（游离图标功能退役，见 008 各步骤提交）。
 
 /// v0.8：右键临时图标 →「固定到 dock」（atomic_write + bump 版本）。
 #[tauri::command]
