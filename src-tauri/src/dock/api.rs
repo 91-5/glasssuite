@@ -135,7 +135,7 @@ pub async fn launch_shortcut(app: tauri::AppHandle, path: String) -> Result<(), 
         .map_err(|e| format!("launch task join failed: {e}"))?
 }
 
-/// launch_shortcut 的阻塞体（独立出来便于将来单测/复用）。
+/// launch_shortcut 的阻塞体（独立出来便于复用）。
 fn launch_shortcut_blocking(app: &tauri::AppHandle, path: &str) -> Result<(), String> {
     // 已运行应用走激活快路径（同 running 的 key 体系）；未运行才真的启动。
     // v0.6：反查走归一化（小写 + / → \）——前端传回大小写/分隔符不同的 path
@@ -439,4 +439,51 @@ pub async fn transient_activate(
     })
     .await
     .map_err(|e| format!("transient activate task join failed: {e}"))?
+}
+
+#[cfg(test)]
+mod launch_tests {
+    // 刻意不用 `use super::*`：本模块全部走全路径，避免引入未消费的导入。
+
+    /// A1：无效路径 → `Err` 不 panic（ShellExecuteW 失败被转换，不弹不炸）。
+    /// 刻意不经过 AppHandle：launch() 是纯 Win32 调用，lib 测试二进制里
+    /// 不引入 mock runtime（与 wry/tray 同链接会触发 DLL 入口点问题）。
+    #[test]
+    fn invalid_path_returns_err_not_panic() {
+        let r = crate::dock::launch("C:\\__gs_missing__\\none.exe");
+        assert!(r.is_err(), "无效路径应返回 Err");
+    }
+
+    /// A1：已在运行 → 走激活分支，**不再启新实例**（决策层注入：found=Some 时
+    /// launch 闭包一次都不该被调）。
+    #[test]
+    fn already_running_activates_without_launch() {
+        static LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let r =
+            crate::dock::activate_or_launch_decide(Some((1234, false)), "C:\\anything.exe", |_| {
+                LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            });
+        assert!(r.is_ok());
+        assert_eq!(
+            LAUNCHES.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "已在运行不得再启新实例"
+        );
+    }
+
+    /// A1：阻塞路径不触碰主线程状态——在任意工作线程直接完成（无 Tauri
+    /// 主线程/事件循环依赖；这就是把它搬进 spawn_blocking 的可测形态）。
+    #[test]
+    fn blocking_path_completes_off_main_thread() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = crate::dock::launch("C:\\__gs_missing__\\none.exe");
+            let _ = tx.send(r.is_err());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            "工作线程上应返回 Err 而非挂死"
+        );
+    }
 }

@@ -631,6 +631,17 @@ unsafe fn com_resolve_target(path: &str) -> Option<String> {
 
 /// 启动快捷方式（.exe / .lnk 通用）。
 pub fn launch(path: &str) -> Result<(), String> {
+    // 005 A5 注入点：`GLASSSUITE_LAUNCH_STUB=slow:<ms>` → 不真的 ShellExecute，
+    // 睡 <ms> 后返回 Ok（模拟慢启动），让「点击路径非阻塞 + 启动耗时」可机器验证。
+    // 上限 10s 防误设死等；真实启动路径不受该变量影响。
+    if let Ok(stub) = std::env::var("GLASSSUITE_LAUNCH_STUB") {
+        if let Some(ms) = stub.trim().strip_prefix("slow:") {
+            if let Ok(ms) = ms.trim().parse::<u64>() {
+                std::thread::sleep(Duration::from_millis(ms.min(10_000)));
+                return Ok(());
+            }
+        }
+    }
     let wide = to_wide(path);
     let hinst = unsafe {
         ShellExecuteW(
@@ -657,28 +668,46 @@ pub fn launch(path: &str) -> Result<(), String> {
 /// 这里复用运行指示已有的 `running::find_window_for_key`（同一套 key 体系），
 /// 命中就直接还原并置前；未命中才回退 `launch`。
 pub fn activate_or_launch(aumid: &Option<String>, path: &str) -> Result<(), String> {
+    let key = crate::dock::running::key_for_shortcut(aumid, path);
+    let found = crate::dock::running::find_window_for_key(&key);
+    activate_or_launch_decide(found, path, launch)
+}
+
+/// 决策与执行分离（005 A1 注入点）：`found` 由调用方给（生产 = EnumWindows 匹配，
+/// 测试 = 直接构造），启动动作用闭包注入（生产 = ShellExecuteW，测试 = 计数器）。
+/// 已在运行（found=Some）→ 只激活、**不启新实例**。
+fn activate_or_launch_decide(
+    found: Option<(isize, bool)>,
+    path: &str,
+    do_launch: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    match found {
+        Some((src, minimized)) => {
+            activate_window(src, minimized);
+            Ok(())
+        }
+        None => do_launch(path),
+    }
+}
+
+/// 还原最小化 + 置前（activate_or_launch 专用；preview 行点击有自己的副本）。
+fn activate_window(src: isize, minimized: bool) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
     };
-
-    let key = crate::dock::running::key_for_shortcut(aumid, path);
-    if let Some((src, minimized)) = crate::dock::running::find_window_for_key(&key) {
-        let hwnd = HWND(src as *mut c_void);
-        unsafe {
-            if minimized {
-                let _ = ShowWindow(hwnd, SW_RESTORE);
-            }
-            // 前台锁：用户刚点了 dock（本进程即前台），一次 SetForegroundWindow 通常够；
-            // 被系统拒绝（返回 0）时退回 SwitchToThisWindow（无需 AttachThreadInput 的
-            // 额外 feature，也不改动目标线程输入队列）。
-            if !SetForegroundWindow(hwnd).as_bool() {
-                SwitchToThisWindow(hwnd, true);
-            }
+    let hwnd = HWND(src as *mut c_void);
+    unsafe {
+        if minimized {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
         }
-        return Ok(());
+        // 前台锁：用户刚点了 dock（本进程即前台），一次 SetForegroundWindow 通常够；
+        // 被系统拒绝（返回 0）时退回 SwitchToThisWindow（无需 AttachThreadInput 的
+        // 额外 feature，也不改动目标线程输入队列）。
+        if !SetForegroundWindow(hwnd).as_bool() {
+            SwitchToThisWindow(hwnd, true);
+        }
     }
-    launch(path)
 }
 
 /// 文件对话框选程序。

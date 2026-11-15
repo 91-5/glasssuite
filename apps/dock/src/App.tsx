@@ -2,7 +2,6 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { DragSession, makeWayOffsets, offsetToTransform } from "./dragOrder";
-import { orderRunningFirst } from "./rowOrder";
 
 // ---------------------------------------------------------------------------
 // OC-20261115-002：按压手势自愈 + capture 生命周期 + 交互锁 + 取证遥测
@@ -613,16 +612,11 @@ function App() {
   // null = 没有让位（未起拖 / 已拖出 / 已松手）。
   const [makeWay, setMakeWay] = useState<{ drop: number; pitch: number } | null>(null);
   // dock 行可见条目（游离图标不在行内）。
-  // 005「已在运行先前置」：在运行的 pinned 排前面（组内稳定，见 rowOrder.ts）。
-  // 显示序 ≠ 配置序是刻意的：拖拽落位持久化的是**用户看到的那一屏顺序**，
-  // free 回归槽位由 __gdPickDrop 按 data-id 做 display→config 换算（见下）。
+  // 005 返工（sir 裁定撤回「运行中前置」）：顺序回到**纯配置序**，
+  // 运行集合只驱动 RunDot，不再参与排序。
   const dockIcons = useMemo(
-    () =>
-      orderRunningFirst(
-        icons.filter((s) => (s.mode ?? "dock") === "dock"),
-        (s) => running.has(s.id)
-      ),
-    [icons, running]
+    () => icons.filter((s) => (s.mode ?? "dock") === "dock"),
+    [icons]
   );
 
   /** pointerdown 快照：剥掉可能残留的 FLIP inline transform 后量自然位中心。 */
