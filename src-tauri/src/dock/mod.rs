@@ -65,7 +65,7 @@ pub fn is_ready() -> bool {
     DOCK_READY.load(Ordering::SeqCst)
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IconData {
     pub w: u32,
     pub h: u32,
@@ -188,6 +188,9 @@ pub fn config_version() -> u64 {
 
 pub fn bump_config_version() {
     CONFIG_VERSION.fetch_add(1, Ordering::SeqCst);
+    // 006：配置版本变化 → transients/运行标识随之变 → 主动推统一快照
+    // （前端据此重拉 list_shortcuts；事件丢失由低频兜底轮询兜住）。
+    crate::dock::running::push_snapshot();
 }
 
 /// 路径归一化（v0.6 反查兜底，v0.4-a verdict advisory）：小写 + `/`→`\`。
@@ -1018,7 +1021,7 @@ pub fn css_to_physical(app: &tauri::AppHandle, cx: f64, cy: f64) -> Option<(i32,
 pub const TRANSIENT_MAX: usize = 10;
 
 /// 临时运行条目（前端渲染 + 探针断言共用）。
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 pub struct TransientApp {
     /// 运行 key（`exe:<路径>` / `aumid:<小写 AUMID>`），与 running.rs 同一体系
     pub key: String,

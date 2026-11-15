@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 use super::free;
 use super::menu;
@@ -17,22 +17,13 @@ pub fn dock_ready() {
     crate::dock::mark_ready();
 }
 
-/// 任务 A：与 dock 快捷方式匹配的「运行中」图标 id 列表（前端 ~1s 轮询）。
-/// 匹配在 Rust 侧完成：运行 key 集合（exe 路径 / AUMID）对 shortcut 逐条判，
-/// 添加/移除图标不涉及 watcher 状态，天然不串位。
+/// 运行标识统一快照（OC-20261115-006：Rust 单一事实源）。
+/// 事件 `dock-running` 推同一结构；本命令是前端的低频兜底轮询口。
+/// （取代旧 `get_running_ids` + `get_transient_running` + `dock_config_version`
+/// 三条轮询——缓存命中时纯内存，不再每 500ms 读盘两遍。）
 #[tauri::command]
-pub fn get_running_ids(app: tauri::AppHandle) -> Result<Vec<String>, String> {
-    let Some(p) = crate::dock::config_path(&app) else {
-        return Err("无法定位配置目录".into());
-    };
-    let cfg = crate::dock::load_config(&p);
-    let snap = running::snapshot();
-    Ok(cfg
-        .shortcuts
-        .iter()
-        .filter(|s| running::is_running(&snap, &s.aumid, &s.path))
-        .map(|s| s.id.clone())
-        .collect())
+pub fn dock_running_snapshot() -> crate::dock::running::RunningSnapshot {
+    running::running_snapshot()
 }
 
 #[tauri::command]
@@ -331,11 +322,7 @@ pub fn drag_thresholds() -> DragThresholds {
     }
 }
 
-/// 配置版本号——前端据此判断「列表变了」并重拉（拖出/拖回都会 bump）。
-#[tauri::command]
-pub fn dock_config_version() -> u64 {
-    crate::dock::config_version()
-}
+// dock_config_version 已并入 dock_running_snapshot（OC-20261115-006 统一快照）。
 
 /// 拖出成游离图标：cx/cy = dock 客户区 CSS 坐标（落点）。
 #[tauri::command]
@@ -394,26 +381,8 @@ pub fn free_status() -> Vec<free::FreeStatus> {
     free::status()
 }
 
-/// v0.8（OC-20261104-001）：未固定的运行中应用（临时图标）。
-/// 复用 running.rs watcher 快照（无新轮询线程）；dock.json/menu.json 已固定的排除。
-#[tauri::command]
-pub fn get_transient_running(
-    app: tauri::AppHandle,
-) -> Result<Vec<crate::dock::TransientApp>, String> {
-    let Some(p) = crate::dock::config_path(&app) else {
-        return Err("无法定位配置目录".into());
-    };
-    let cfg = crate::dock::load_config(&p);
-    let menu_paths = menu::all_pinned_paths();
-    let snap = running::snapshot();
-    let list = crate::dock::transient_apps(&snap, &cfg, &menu_paths);
-    // OC-20261115-003 D5：被上限挤出时不再只 eprintln!，通知前端弹 notice。
-    let dropped = crate::dock::transient_dropped();
-    if dropped > 0 {
-        let _ = app.emit("dock-transient-capped", dropped);
-    }
-    Ok(list)
-}
+// get_transient_running 已并入 dock_running_snapshot（OC-20261115-006 统一快照）；
+// dock-transient-capped 提示随快照推送并去重（见 running.rs push_snapshot）。
 
 /// v0.8：右键临时图标 →「固定到 dock」（atomic_write + bump 版本）。
 #[tauri::command]

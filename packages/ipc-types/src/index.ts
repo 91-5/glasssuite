@@ -32,6 +32,10 @@ export const COMMANDS = {
   aiTestConnection: "ai_test_connection",
   /** 前端诊断日志。 */
   logFrontend: "log_frontend",
+  /** 运行标识统一快照（006：事件 dock-running 的兜底轮询口）。 */
+  dockRunningSnapshot: "dock_running_snapshot",
+  /** dock 全部快捷方式列表（首启写默认模板）。 */
+  dockListShortcuts: "list_shortcuts",
   /** 媒体控制：play | pause | play_pause | next | prev | seek。 */
   mediaControl: "media_control",
   /** 取最近一次 SMTC 快照（窗口重建 / 首帧补齐）。 */
@@ -99,7 +103,7 @@ export const PRESS_GESTURE = {
 
 /** 后端 → 前端事件名。 */
 export const EVENTS = {
-  /** 运行中应用集合变化（增量或全量由 payload 的 `full` 标记）。 */
+  /** 运行标识统一快照推送（OC-20261115-006：watcher 变化 / 配置 bump 时全量下发）。 */
   runningChanged: "dock-running",
   /** 系统指标（1s 一次）。 */
   sysMetrics: "sys-metrics",
@@ -139,12 +143,27 @@ export interface FitRequest {
   h: number;
 }
 
-/** 运行状态快照：固定图标集合 + 临时（未固定但正在运行）图标集合。 */
-export interface RunningState {
-  /** 已固定的稳定 key 列表。 */
-  pinned: string[];
-  /** 临时图标 key 列表（退出即消失）。 */
-  transients: string[];
+/** dock 里一枚运行中未固定的临时条目（与 Rust `TransientApp` 逐字段对应）。 */
+export interface TransientApp {
+  key: string;
+  name: string;
+  path: string;
+  aumid: string | null;
+  /** RGBA 图标（base64），异步就绪后随下一次快照带上。 */
+  icon: { w: number; h: number; rgba: string } | null;
+}
+
+/**
+ * 运行标识统一快照（OC-20261115-006：Rust 单一事实源）。
+ * 事件 `dock-running` 与命令 `dock_running_snapshot` 下发同一结构：
+ * - `runningIds`：pinned 中在运行的条目 id（RunDot + 「已在运行先前置」排序）；
+ * - `transients`：运行中未固定条目全集（上限挤出时后端另发 `dock-transient-capped`）；
+ * - `configVersion`：dock.json 版本，变化即需重拉 `list_shortcuts`。
+ */
+export interface DockRunningSnapshot {
+  configVersion: number;
+  runningIds: string[];
+  transients: TransientApp[];
 }
 
 /** 一条可启动项（开始菜单 / dock 图标共用）。 */
@@ -242,6 +261,11 @@ export async function aiTestConnection(): Promise<AiTestResult> {
 }
 
 /** 前端诊断日志（进 Rust 侧日志文件，便于排查「后端有数据但界面没反应」）。 */
+/** 拉一次运行标识统一快照（兜底轮询口；事件 dock-running 推同一结构）。 */
+export async function getDockRunningSnapshot(): Promise<DockRunningSnapshot> {
+  return invoke<DockRunningSnapshot>(COMMANDS.dockRunningSnapshot);
+}
+
 export async function logFrontend(msg: string): Promise<void> {
   await invoke(COMMANDS.logFrontend, { msg });
 }

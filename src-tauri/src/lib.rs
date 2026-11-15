@@ -105,7 +105,6 @@ pub fn run() {
             dock::api::reorder_shortcuts,
             dock::api::launch_shortcut,
             dock::api::fit_dock,
-            dock::api::get_running_ids,
             dock::api::preview_show,
             dock::api::preview_hide,
             dock::api::menu_toggle,
@@ -122,7 +121,6 @@ pub fn run() {
             dock::api::power_sleep,
             dock::api::power_shutdown,
             dock::api::drag_thresholds,
-            dock::api::dock_config_version,
             dock::api::free_drag_out,
             dock::api::free_launch,
             dock::api::free_return,
@@ -130,7 +128,7 @@ pub fn run() {
             dock::api::free_ready,
             dock::api::free_begin_drag,
             dock::api::free_status,
-            dock::api::get_transient_running,
+            dock::api::dock_running_snapshot,
             dock::api::pin_transient,
             dock::api::transient_activate,
         ])
@@ -299,6 +297,8 @@ fn dock_setup(handle: &tauri::AppHandle) {
     });
 
     // 运行集合 watcher（dock running 图标与临时图标共用）。
+    // 006：先注入句柄——watcher 发现运行集合变化时主动推统一快照事件。
+    dock::running::set_app_handle(handle.clone());
     dock::running::spawn_watcher();
 
     // 预览渲染进程：读 dock.json 同级目录的图标缓存。

@@ -1,6 +1,12 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  EVENTS,
+  getDockRunningSnapshot,
+  subscribe,
+  type DockRunningSnapshot,
+} from "@glasssuite/ipc-types";
 import { DragSession, makeWayOffsets, offsetToTransform } from "./dragOrder";
 
 // ---------------------------------------------------------------------------
@@ -308,37 +314,56 @@ function App() {
   // 整表重拉会覆盖本地让位动画的状态，图标在两个位置间横跳（频闪）。
   // 松手后 dragRef 已清 null，下一轮 tick 自然恢复校准。
   const draggingRef = useRef(false);
-  useEffect(() => {
-    let stopped = false;
-    let timer = 0;
-    let lastV = -1;
-    const tick = () => {
-      if (draggingRef.current) {
-        timer = window.setTimeout(tick, 400);
-        return;
+  // 006 统一快照：三条轮询（400ms 版本 + 500ms running + 500ms transients）收敛为
+  // 「`dock-running` 事件推送 + 单条低频兜底轮询」。快照携带 configVersion——变了
+  // 就重拉 list_shortcuts；runningIds/transients 的 diff 语义原样保留。
+  const lastConfigV = useRef(-1);
+  const lastRunIdsRef = useRef<string[] | null>(null);
+  const lastTransientFpRef = useRef<string | null>(null);
+  const transientLenRef = useRef(-1); // 诊断日志只在数量变化时打一条
+  const applyRunningSnapshot = (s: DockRunningSnapshot) => {
+    if (draggingRef.current) return; // 拖动期冻结（见 v0.7.1 注 + 005 前置排序冻结）
+    // 配置版本变化 → 重拉列表（游离图标进出 dock 行也靠它刷新）
+    if (s.configVersion !== lastConfigV.current) {
+      lastConfigV.current = s.configVersion;
+      invoke<Shortcut[]>("list_shortcuts")
+        .then(setIcons)
+        .catch(() => {});
+    }
+    // RunDot + 005 前置排序的运行集合（内容真变才 setState，防 FLIP 自激振荡）
+    const ids = s.runningIds;
+    const prev = lastRunIdsRef.current;
+    if (prev === null || prev.length !== ids.length || ids.some((v, i) => v !== prev[i])) {
+      lastRunIdsRef.current = ids;
+      setRunning(new Set(ids));
+    }
+    // 临时条目：指纹 = key 序列 + 图标就绪态；不变就不 setState
+    const fp = s.transients.map((t) => `${t.key}|${t.icon ? 1 : 0}`).join(";");
+    if (fp !== lastTransientFpRef.current) {
+      lastTransientFpRef.current = fp;
+      if (s.transients.length !== transientLenRef.current) {
+        transientLenRef.current = s.transients.length;
+        invoke("debug_note", { msg: `transients n=${s.transients.length}` }).catch(() => {});
       }
-      invoke<number>("dock_config_version")
-        .then((v) => {
-          if (stopped) return;
-          if (v !== lastV) {
-            lastV = v;
-            invoke<Shortcut[]>("list_shortcuts")
-              .then((list) => {
-                if (!stopped) setIcons(list);
-              })
-              .catch(() => {});
-          }
-        })
-        .catch(() => {})
-        .finally(() => {
-          if (!stopped) timer = window.setTimeout(tick, 400);
-        });
+      setTransients(s.transients);
+    }
+  };
+  useEffect(
+    () => subscribe<DockRunningSnapshot>(EVENTS.runningChanged, applyRunningSnapshot),
+    [],
+  );
+  // 兜底轮询：事件丢失（webview 重建/早期事件）时 2s 一拍兜住；命中缓存时
+  // Rust 侧纯内存 clone，无旧实现的两遍读盘。
+  useEffect(() => {
+    const tick = () => {
+      getDockRunningSnapshot()
+        .then(applyRunningSnapshot)
+        .catch(() => {});
     };
     tick();
-    return () => {
-      stopped = true;
-      window.clearTimeout(timer);
-    };
+    const timer = window.setInterval(tick, 2000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // 游离图标原生拖动落在 dock 区 → Rust 问前端要落点槽位（DOM 几何只有前端知道）。
@@ -378,61 +403,7 @@ function App() {
     };
   }, [icons]);
 
-  // 运行状态轮询：Rust 侧 watcher（事件驱动 + 500ms 兜底）维护缓存，
-  // 这里只取一次轻量结果，不产生高频轮询压力。
-  // 运行状态轮询：Rust 侧 watcher（事件驱动 + 500ms 兜底）维护缓存，
-  // 这里只取一次轻量结果，不产生高频轮询压力。
-  // v0.8.1（sir 2026-11-08 反馈「图标一连串跳动」）：只在内容真变时 setState。
-  // 旧实现每 500ms 无条件 new Set / 新数组引用 → 每 500ms 一次无谓 re-render，
-  // 而 FLIP 补位 effect 无依赖数组会随之重跑（自激振荡的一环，见 FLIP 注释）。
-  const transientLenRef = useRef(-1); // [TEMP-EVIDENCE]
-  useEffect(() => {
-    let stopped = false;
-    let timer = 0;
-    let lastRunIds: string[] | null = null;
-    let lastTransientFp: string | null = null;
-    const tick = () => {
-      invoke<string[]>("get_running_ids")
-        .then((ids) => {
-          if (stopped) return;
-          const prev = lastRunIds;
-          if (
-            prev === null ||
-            prev.length !== ids.length ||
-            ids.some((v, i) => v !== prev[i])
-          ) {
-            lastRunIds = ids;
-            // 005：运行集合变化会触发「运行中前置」重排——拖动进行中先冻结
-            // （旧快照还指着按下时的槽位，中途重排会让落点错位）；松手后下一轮生效。
-            if (draggingRef.current) return;
-            setRunning(new Set(ids));
-          }
-        })
-        .catch(() => {});
-      // v0.8：同一 500ms 节奏取临时条目（Rust 侧复用 watcher 快照，无额外轮询线程）
-      invoke<TransientApp[]>("get_transient_running")
-        .then((list) => {
-          if (stopped) return;
-          // 指纹 = key 序列 + 图标就绪态；不变就不 setState
-          const fp = list.map((t) => `${t.key}|${t.icon ? 1 : 0}`).join(";");
-          if (fp !== lastTransientFp) {
-            lastTransientFp = fp;
-            if (list.length !== transientLenRef.current) {
-              transientLenRef.current = list.length;
-              invoke("debug_note", { msg: `transients n=${list.length}` }).catch(() => {});
-            }
-            setTransients(list);
-          }
-        })
-        .catch(() => {});
-      timer = window.setTimeout(tick, 500);
-    };
-    tick();
-    return () => {
-      stopped = true;
-      window.clearTimeout(timer);
-    };
-  }, []);
+  // （旧「运行状态轮询」双 invoke 循环已并入上面的统一快照——OC-20261115-006。）
 
   // 首帧就绪上报：WebView2 完成首次绘制后通知 Rust。
   // Rust 在收到之前不显示 dock —— 首帧黑闪的根因修复点。

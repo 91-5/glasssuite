@@ -72,6 +72,119 @@ pub fn snapshot() -> HashSet<String> {
     RUNNING.read().map(|s| s.clone()).unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// 统一快照（OC-20261115-006：运行标识的 Rust 单一事实源）
+//
+// 此前前端用三条轮询拼运行态：`get_running_ids` + `get_transient_running`
+// （每 500ms 一次，各自读盘解析 dock.json + 扫 menu pinned）+ 400ms 的
+// `dock_config_version`。现在收敛为一个缓存快照：
+// - key = (config_version, running_epoch)：任何一方没变 → 命中缓存，纯内存；
+// - 变化由 Rust 主动 `dock-running` 事件推送（watcher 发现集合变化 / 配置版本
+//   bump），前端另留一条低频兜底轮询防事件丢失；
+// - transient 上限挤出的提示（dock-transient-capped）随快照推送，且只在数值
+//   变化时发一次（旧实现每次轮询都重复 emit）。
+// ---------------------------------------------------------------------------
+
+/// 运行标识统一快照。`running_ids` = pinned 里在运行的条目 id（RunDot + 前置排序），
+/// `transients` = 运行中未固定条目（含异步就绪的图标），`config_version` 供前端
+/// 判断是否需要重拉 `list_shortcuts`。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunningSnapshot {
+    pub config_version: u64,
+    pub running_ids: Vec<String>,
+    pub transients: Vec<crate::dock::TransientApp>,
+}
+
+static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+/// dock_setup 里注入句柄（事件推送需要；测试/探针路径无句柄时快照退化为空集）。
+pub fn set_app_handle(h: tauri::AppHandle) {
+    let _ = APP_HANDLE.set(h);
+}
+
+/// RUNNING 每次内容变化 +1（watcher 写入点）；缓存失效键的一半。
+static RUNNING_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 快照缓存：`(config_version, running_epoch, snapshot)`。
+static SNAPSHOT_CACHE: LazyLock<Mutex<Option<(u64, u64, RunningSnapshot)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// 「dock-transient-capped」提示去重：只在数值变化时 emit。
+static LAST_CAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 纯装配（单测口）：给定配置、运行 key 集、menu pinned 路径 → 统一快照。
+fn assemble(
+    version: u64,
+    cfg: &crate::dock::DockConfig,
+    snap: &HashSet<String>,
+    menu_paths: &[String],
+) -> RunningSnapshot {
+    let running_ids = cfg
+        .shortcuts
+        .iter()
+        .filter(|s| is_running(snap, &s.aumid, &s.path))
+        .map(|s| s.id.clone())
+        .collect();
+    let transients = crate::dock::transient_apps(snap, cfg, menu_paths);
+    RunningSnapshot {
+        config_version: version,
+        running_ids,
+        transients,
+    }
+}
+
+/// 统一快照（带缓存）。命中 = 纯内存 clone；miss 才读盘装配。
+pub fn running_snapshot() -> RunningSnapshot {
+    let ver = crate::dock::config_version();
+    let epoch = RUNNING_EPOCH.load(Ordering::Relaxed);
+    if let Ok(c) = SNAPSHOT_CACHE.lock() {
+        if let Some((v, e, snap)) = c.as_ref() {
+            if *v == ver && *e == epoch {
+                return snap.clone();
+            }
+        }
+    }
+    let Some(h) = APP_HANDLE.get() else {
+        // 句柄未注入（探针/极早期）：返回带版本号的空快照，绝不 panic。
+        return RunningSnapshot {
+            config_version: ver,
+            running_ids: Vec::new(),
+            transients: Vec::new(),
+        };
+    };
+    let snap = crate::dock::config_path(h)
+        .map(|p| crate::dock::load_config(&p))
+        .map(|cfg| {
+            let menu_paths = crate::dock::menu::all_pinned_paths();
+            assemble(ver, &cfg, &snapshot(), &menu_paths)
+        })
+        .unwrap_or_else(|| RunningSnapshot {
+            config_version: ver,
+            running_ids: Vec::new(),
+            transients: Vec::new(),
+        });
+    if let Ok(mut c) = SNAPSHOT_CACHE.lock() {
+        *c = Some((ver, epoch, snap.clone()));
+    }
+    snap
+}
+
+/// 主动推送快照（`dock-running`）。watcher 发现集合变化、配置版本 bump 时调用；
+/// 事件丢失由前端的低频兜底轮询兜住。
+pub fn push_snapshot() {
+    let Some(h) = APP_HANDLE.get() else {
+        return;
+    };
+    let snap = running_snapshot();
+    let _ = tauri::Emitter::emit(h, "dock-running", &snap);
+    // transient 被上限挤出的用户提示：数值变化才发（旧实现每轮轮询重复发）。
+    let dropped = crate::dock::transient_dropped() as u64;
+    if dropped > 0 && LAST_CAPPED.swap(dropped, Ordering::Relaxed) != dropped {
+        let _ = tauri::Emitter::emit(h, "dock-transient-capped", dropped);
+    }
+}
+
 /// 快捷方式对应的运行 key。
 /// 匹配优先级：显式 `aumid` → **应用执行别名解析**（`system32\notepad.exe` 这类
 /// 0 字节 reparse point，v0.3 之前的旧配置靠它自动补齐）→ exe 路径。
@@ -578,7 +691,14 @@ unsafe fn watcher() {
             last_scan = now;
             let keys = scan_once();
             if let Ok(mut w) = RUNNING.write() {
+                let changed = *w != keys;
                 *w = keys;
+                // 006：集合真变了才失效缓存并推送（500ms 兜底扫描通常无变化，
+                // 不 bump epoch 才能让快照缓存命中）。
+                if changed {
+                    RUNNING_EPOCH.fetch_add(1, Ordering::Relaxed);
+                    push_snapshot();
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -665,5 +785,38 @@ mod perceptible_tests {
             1920,
             1080
         ));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    /// assemble（006 纯装配）：running_ids 按配置匹配、transients 透传给
+    /// transient_apps、config_version 原样带出。
+    #[test]
+    fn assemble_matches_running_ids_and_passthrough_version() {
+        let cfg: crate::dock::DockConfig = serde_json::from_str(
+            r#"{
+                "auto_hide": false,
+                "shortcuts": [
+                    {"id":"a","name":"A","path":"C:\\apps\\alpha.exe","icon":{"w":1,"h":1,"rgba":""}},
+                    {"id":"b","name":"B","path":"C:\\apps\\beta.exe","icon":{"w":1,"h":1,"rgba":""}}
+                ]
+            }"#,
+        )
+        .expect("配置可反序列化");
+        let mut snap = HashSet::new();
+        snap.insert(format!("exe:{}", normalize_path("C:\\apps\\alpha.exe")));
+
+        let s = assemble(42, &cfg, &snap, &[]);
+        assert_eq!(s.config_version, 42, "版本原样透传");
+        assert_eq!(s.running_ids, vec!["a".to_string()], "只有运行中的条目入选");
+        assert!(s.transients.is_empty(), "空运行全集 → 无临时条目");
+
+        // 空运行集：全部不在运行
+        let s = assemble(43, &cfg, &HashSet::new(), &[]);
+        assert!(s.running_ids.is_empty());
+        assert_eq!(s.config_version, 43);
     }
 }

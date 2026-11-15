@@ -14,6 +14,9 @@ importers:
 
   apps/dock:
     dependencies:
+      '@glasssuite/ipc-types':
+        specifier: workspace:*
+        version: link:../../packages/ipc-types
       '@tauri-apps/api':
         specifier: ^2.0.0
         version: 2.12.4
