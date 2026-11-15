@@ -405,42 +405,6 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 游离图标原生拖动落在 dock 区 → Rust 问前端要落点槽位（DOM 几何只有前端知道）。
-  // 005：显示序已按「运行中前置」重排，与配置序不再一致——DOM 顺序换到最近图标后
-  // 用 data-id 反查它在**配置序**里的下标，再交给 Rust 插入（Rust 只认配置序）。
-  useEffect(() => {
-    const pick = (id: string, cssX: number) => {
-      const els = Array.from(
-        document.querySelectorAll<HTMLElement>(".dock-icons [data-drag]")
-      );
-      const row = pillRef.current?.getBoundingClientRect();
-      // 落点离药丸太远 → 不算拖回，保持游离
-      if (!row || !els.length) return;
-      if (cssX < row.left - 24 || cssX > row.right + 24) return;
-      let best = 0;
-      let bestD = Infinity;
-      els.forEach((el, i) => {
-        const r = el.getBoundingClientRect();
-        const d = Math.abs(r.left + r.width / 2 - cssX);
-        if (d < bestD) {
-          bestD = d;
-          best = i;
-        }
-      });
-      const pickedId = els[best]?.dataset.id;
-      const configOrder = icons.filter((s) => (s.mode ?? "dock") === "dock");
-      const cfgIdx = pickedId
-        ? configOrder.findIndex((s) => s.id === pickedId)
-        : -1;
-      invoke("free_drop_result", { id, slot: cfgIdx >= 0 ? cfgIdx : best }).catch(() => {});
-    };
-    (window as unknown as { __gdPickDrop?: (id: string, x: number) => void }).__gdPickDrop =
-      pick;
-    return () => {
-      delete (window as unknown as { __gdPickDrop?: (id: string, x: number) => void })
-        .__gdPickDrop;
-    };
-  }, [icons]);
 
   // （旧「运行状态轮询」双 invoke 循环已并入上面的统一快照——OC-20261115-006。）
 
@@ -579,7 +543,6 @@ function App() {
     lastX: number; // 最近一次指针位置（拖出落点用）
     lastY: number;
     active: boolean;
-    out: boolean; // 已判定「拖出」（脱离区：垂直 >48px + 驻留 ≥200ms + 方向向外）
     pid: number;
     offset: number; // 按下点相对被拖图标左缘的偏移（幽灵 x 跟随用）
     grabDy: number; // 按下点相对被拖图标上缘的偏移（幽灵 y 跟随用）
@@ -588,8 +551,6 @@ function App() {
     startScreenX: number; // 屏幕坐标基准（不受窗口平移影响）
     lastScreenX: number;
     session: DragSession | null; // pointerdown 快照 + 滞回状态机
-    beyondSince: number | null; // 进入脱离区 (>48px) 的时刻（驻留判定）
-    lastDistY: number; // 上一帧的行外垂直距离（「方向向外」判定）
   } | null>(null);
   // 拖动结束后的短暂点击抑制：capture 在容器上时，松手那次 click 不会落到
   // 图标上（老内核无 capture 的兼容路径仍会落到）——改用时间窗双兼容。
@@ -665,7 +626,6 @@ function App() {
       lastX: e.clientX,
       lastY: e.clientY,
       active: false,
-      out: false,
       pid: e.pointerId,
       offset: e.clientX - r.left,
       grabDy: e.clientY - r.top,
@@ -677,8 +637,6 @@ function App() {
       startScreenX: e.screenX,
       lastScreenX: e.screenX,
       session: new DragSession(snapshotCenters(), i),
-      beyondSince: null,
-      lastDistY: 0,
     };
     // OC-20261115-002 D2：pointerdown **不再**申请 capture。
     // 旧实现每次按下都把 capture 打在容器上：click 的 target 会退化成容器，
@@ -687,10 +645,6 @@ function App() {
     // 现在只在 iconMove 判定「超过 6px 真拖动」时才申请，且所有结束路径显式释放。
     dragActive = false;
   };
-
-  /** 脱离区判定（卡面 P1 三区）：垂直出界 >48px、驻留 ≥200ms、方向向外。 */
-  const DETACH_DIST = 48;
-  const DETACH_DWELL_MS = 200;
 
   const iconMove = (clientX: number, clientY: number, pointerId?: number, screenX?: number) => {
     const d = dragRef.current;
@@ -724,36 +678,10 @@ function App() {
       invoke("debug_note", { msg: `active idx=${d.index} x=${Math.round(sx)}` }).catch(() => {});
     }
 
-    // 三区判定：重排区/灰区（clamp 不脱离）只在行内让位；只有「垂直出界
-    // >48px 且驻留 ≥200ms 且没有在往回走」才转拖出意图。
-    if (!d.out) {
-      const row = pillRef.current?.getBoundingClientRect();
-      if (row) {
-        const dy =
-          clientY < row.top
-            ? row.top - clientY
-            : clientY > row.bottom
-              ? clientY - row.bottom
-              : 0;
-        const now = Date.now();
-        if (dy > DETACH_DIST) {
-          const outward = dy >= d.lastDistY - 1; // 没有明显在往回走
-          if (d.beyondSince === null) d.beyondSince = now;
-          if (outward && now - d.beyondSince >= DETACH_DWELL_MS) {
-            d.out = true;
-            setMakeWay(null); // 图标「离开」dock 行：让位复位，幽灵消失
-            setDragGhost(null);
-            invoke("debug_note", { msg: `detach dy=${Math.round(dy)}` }).catch(() => {});
-          }
-        } else {
-          d.beyondSince = null; // 回到行附近：重新计驻留
-        }
-        d.lastDistY = dy;
-      }
-    }
-
-    if (!d.out) {
-      // 幽灵完全跟手（x/y 都跟随光标，垂直微调不再读作「黏」）
+    // 008：拖出成游离图标的入口已移除——拖动永远保持行内排序语义
+    // （越界由落点 clamp 到两端兜住，不再有「脱离区」）。
+    // 幽灵完全跟手（x/y 都跟随光标，垂直微调不再读作「黏」）
+    {
       setDragGhost({ x: clientX - d.offset, y: clientY - d.grabDy });
       // 让位 + 滞回：被跨过的图标立即平移，落点在死区内不抖。
       const s = d.session;
@@ -781,7 +709,7 @@ function App() {
     // 点击救援：用屏幕坐标判净位移——窗口滑动动画会污染 clientX
     // （一次点击内 clientX 可能跳 29px，但 screenX 稳如泰山）。
     const netX = Math.abs(d.lastScreenX - d.startScreenX);
-    const isClick = !d.out && netX < 10;
+    const isClick = netX < 10;
     if (!d.active || isClick) {
       setDragIndex(-1);
       setDragGhost(null);
@@ -793,22 +721,6 @@ function App() {
     suppressClickUntil.current = Date.now() + 400;
     setDragIndex(-1);
     setDragGhost(null);
-    // v0.7：拖出成游离图标（落点 = 松手位置；Rust 换算成物理像素虚拟桌面坐标）
-    if (d.out) {
-      const sc = d.shortcut;
-      if (!sc) return;
-      invoke("free_drag_out", { id: sc.id, cx: d.lastX, cy: d.lastY })
-        .then(() => {
-          // 本地立即移除 → dock 行立刻补位（Rust 侧写完 dock.json 后版本轮询再校准）
-          setIcons((prev) => prev.filter((s) => s.id !== sc.id));
-        })
-        .catch((e) => {
-          const msg = typeof e === "string" ? e : String(e);
-          setNotice(msg);
-          window.setTimeout(() => setNotice(null), 4000);
-        });
-      return;
-    }
     // 落点 = 滞回状态机当前的插入位（others 语义），不再从幽灵坐标反推——
     // 快照中心扫描对 DPI/图标尺寸/间距变化天然免疫，也没有 Math.round 边界抖动。
     const drop = d.session?.drop ?? d.index;
