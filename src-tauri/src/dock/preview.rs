@@ -67,20 +67,24 @@ const CLASS_NAME: PCWSTR = w!("GlassDesk_Preview");
 const WINDOW_TITLE: PCWSTR = w!("GlassDesk Preview");
 
 // 尺寸基准（96 DPI 物理像素，show 时乘 scale）。220×170 贴近卡面「约 200×150」。
-const BASE_W: f32 = 220.0;
 const HEADER_H: f32 = 26.0; // 头部带（应用图标 + 应用名）高
 const PAD: f32 = 10.0; // 缩略图区与窗缘间距
 const GAP_ABOVE: i32 = 6; // 预览窗与图标上缘间距
 const ROUND_R: f32 = 14.0; // 圆角半径（与 dock 药丸 18 略小，同材质语言）
 const WATCHDOG_MS: u64 = 10_000; // 兜底：前端失联时预览最长存活
 
-// 007 多窗口预览：每行 = 缩略图（或降级条）+ 窗口标题条；点击整行激活该窗口。
-// 行背景刻意不透明（品红 colorkey 面上的纯色像素会被系统判为「点击穿透」，
-// 缩略图区的鼠标事件会漏到下层窗口——行底衬不透明才接得住 WM_LBUTTONDOWN）。
-const ROW_H: f32 = 150.0; // 单行高（缩略内容 116 + 标题条 22 + 上下留白 12）
-const ROW_TITLE: f32 = 22.0; // 行内标题条高（不透明可点击）
-const MAX_ROWS: usize = 6; // 行数上限（再多的窗口按 z 序截断，日志注明）
-const ROW_BG: COLORREF = COLORREF(0x00ED_EDE9); // 行底衬（浅色，与头部带同系）
+// 007 多窗口预览（返工：sir 裁定**横排**，Win11 任务栏样式）：
+// 每格 = 缩略图（或降级条）+ 格内标题条（不透明可点击）；格间 ≥4px 间隙
+// 不响应点击；宽度不足换行、总宽 clamp 到显示器工作区（先缩格宽再换行）。
+// 格底衬刻意不透明：品红 colorkey 面上的纯色像素会被系统判「点击穿透」，
+// 缩略图区的鼠标事件会漏到下层窗口——底衬不透明才接得住 WM_LBUTTONDOWN。
+const ROW_H: f32 = 150.0; // 单格高（缩略内容 116 + 标题条 22 + 上下留白 12）
+const CELL_W: f32 = 200.0; // 单格宽（96dpi 基准）
+const ROW_TITLE: f32 = 22.0; // 格内标题条高（不透明可点击）
+const MAX_ROWS: usize = 6; // 格数上限（再多的窗口按 z 序截断，日志注明）
+const GUTTER: f32 = 6.0; // 格间距（≥4px 不响应间隙）
+const CELL_MIN_W: f32 = 120.0; // 格宽下限（工作区太窄时收缩下限）
+const ROW_BG: COLORREF = COLORREF(0x00ED_EDE9); // 格底衬（浅色，与头部带同系）
 
 /// 一行预览 = 一个顶层窗口。`src=0` 表示该行降级（最小化/DRM 疑似/注册失败：
 /// 只画应用图标 + 窗口标题，无 DWM 缩略图）。
@@ -172,11 +176,7 @@ fn collect_rows(key: &str) -> Vec<PreviewWin> {
             degraded: degrade_reason(src, minimized),
         });
     }
-    if rows.len() > MAX_ROWS {
-        log(&format!("rows truncated {} -> {MAX_ROWS}", rows.len()));
-        rows.truncate(MAX_ROWS);
-    }
-    rows
+    truncate_rows(rows)
 }
 
 /// 解析悬停的快捷方式 → **全部**匹配窗口 → 投递 Show（007 多窗口预览）。
@@ -332,6 +332,8 @@ static PAINT: Mutex<Option<PaintState>> = Mutex::new(None);
 /// 可点击窗口行注册表：show_preview 写入 / destroy_preview 清空 / wndproc 点击读取。
 /// `(源窗口, minimized)`，下标 = 行号。
 static ROWS: Mutex<Vec<(isize, bool)>> = Mutex::new(Vec::new());
+/// 格几何表（007 横排）：show_preview 写入 / destroy 清空 / paint 与 hit_cell 读。
+static CELLS: Mutex<Vec<RECT>> = Mutex::new(Vec::new());
 /// 悬停行（-1 = 无）。
 static HOVER_ROW: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
@@ -385,12 +387,10 @@ unsafe fn show_preview(st: &mut ThreadState, req: ShowReq) {
 
     let sc = req.scale;
     let n = req.windows.len().max(1);
-    let w = (BASE_W * sc) as i32;
-    // 007：高度 = 头部带 + N 行。单窗口时与旧版 BASE_H 同视觉（150 ≈ 170-头-邻隙，
-    // 行留白已吸收差异）；多窗口逐行加高，显示器装不下时按行截断。
-    let h = ((HEADER_H + n as f32 * ROW_H) * sc) as i32;
 
-    // 定位：图标上方居中，夹到图标所在显示器内
+    // 定位：图标上方居中，夹到图标所在显示器内。
+    // 007 返工（横排）：总宽 clamp 到**工作区**（rcWork）——超出先缩格宽再换行，
+    // 禁止横向溢出；窗口尺寸由 CellLayout 给出。
     let hmon = MonitorFromPoint(
         POINT {
             x: req.cx,
@@ -404,6 +404,18 @@ unsafe fn show_preview(st: &mut ThreadState, req: ShowReq) {
     };
     let _ = GetMonitorInfoW(hmon, &mut mi);
     let m = mi.rcMonitor;
+    let work_w = mi.rcWork.right - mi.rcWork.left;
+    let layout = layout_cells(
+        n,
+        CELL_W * sc,
+        ROW_H * sc,
+        GUTTER * sc,
+        PAD * sc,
+        HEADER_H * sc,
+        work_w,
+    );
+    let w = layout.window_w;
+    let h = layout.window_h;
     let x = (req.cx - w / 2).max(m.left + 4).min(m.right - w - 4);
     let y = (req.top - h - GAP_ABOVE).max(m.top + 4);
 
@@ -475,23 +487,23 @@ unsafe fn show_preview(st: &mut ThreadState, req: ShowReq) {
     if let Ok(mut reg) = ROWS.lock() {
         *reg = st.rows.clone();
     }
+    if let Ok(mut cells) = CELLS.lock() {
+        *cells = layout.cells.clone();
+    }
     st.hover_row = -1;
 
-    // 每个非降级窗口注册一行 DWM 缩略图：目的地 = 行内容区（去掉行标题条）。
-    let header = (HEADER_H * sc) as i32;
-    let rh = (ROW_H * sc) as i32;
+    // 每个非降级窗口注册一格 DWM 缩略图：目的地 = 格内容区（去掉格内标题条）。
     let strip = (ROW_TITLE * sc) as i32;
-    let pad = (PAD * sc) as i32;
     for (i, r) in req.windows.iter().enumerate() {
         if r.src == 0 {
-            continue; // 降级行：无缩略图（PaintState.degraded[i] 已置位）
+            continue; // 降级格：无缩略图（PaintState.degraded[i] 已置位）
         }
-        let rr = row_rect(sc, i as i32, w, h);
+        let cr = layout.cells[i];
         let dest_rect = RECT {
-            left: pad,
-            top: header + i as i32 * rh + 4,
-            right: w - pad,
-            bottom: rr.top + rh - strip - 4,
+            left: cr.left + 4,
+            top: cr.top + 4,
+            right: cr.right - 4,
+            bottom: cr.bottom - strip - 4,
         };
         match DwmRegisterThumbnail(hwnd, HWND(r.src as *mut c_void)) {
             Ok(t) => {
@@ -520,8 +532,8 @@ unsafe fn show_preview(st: &mut ThreadState, req: ShowReq) {
                 st.thumbs.push(t);
             }
             Err(e) => {
-                // 注册失败（罕见）：该行降级为图标+标题，不影响其他行
-                log(&format!("thumb register failed row={i}: {e} -> degrade"));
+                // 注册失败（罕见）：该格降级为图标+标题，不影响其他格
+                log(&format!("thumb register failed cell={i}: {e} -> degrade"));
                 if let Ok(mut g) = PAINT.lock() {
                     if let Some(p) = g.as_mut() {
                         if let Some(d) = p.degraded.get_mut(i) {
@@ -552,19 +564,75 @@ unsafe fn show_preview(st: &mut ThreadState, req: ShowReq) {
     ));
 }
 
-/// 行几何（物理 px）：第 i 行的 y 区间。头部带之下逐行排布，底边夹进窗内。
-fn row_rect(scale: f32, index: i32, win_w: i32, win_h: i32) -> RECT {
-    let header = (HEADER_H * scale) as i32;
-    let rh = (ROW_H * scale) as i32;
-    let top = header + index * rh;
-    RECT {
-        left: 0,
-        top,
-        right: win_w,
-        bottom: (top + rh).min(win_h),
+/// 横排格布局的纯函数入口（007 返工单测口）。
+/// - `count`：格数（≤MAX_ROWS，截断在 collect_rows 已做）；
+/// - `cell_w/cell_h/gutter/pad/header`：物理 px；
+/// - `work_w`：显示器工作区宽度（总宽必须 clamp 进去）。
+///
+/// 算法：先按标准格宽算一行能放几格；一格都放不下 → 收缩格宽（下限
+/// CELL_MIN_W，仍超就贴工作区宽）；`换行行数 = ceil(count / 每行格数)`；
+/// 总宽 = 每行格数 × 格宽 + 间隙 + 左右 pad，永不超 `work_w`。
+/// 返回窗口尺寸与每格客户区矩形（行主序：先横向后纵向）。
+pub(crate) struct CellLayout {
+    pub window_w: i32,
+    pub window_h: i32,
+    pub cells: Vec<RECT>,
+}
+
+fn layout_cells(
+    count: usize,
+    cell_w: f32,
+    cell_h: f32,
+    gutter: f32,
+    pad: f32,
+    header: f32,
+    work_w: i32,
+) -> CellLayout {
+    let count = count.max(1);
+    let avail = (work_w as f32 - 2.0 * pad).max(0.0);
+    // 单格上限：标准格宽与工作区可容宽取小
+    let cw = cell_w.min((avail - gutter).max(CELL_MIN_W));
+    // 一行最多几格（含间隙；先按标准格宽，放不下时已收缩过一次）
+    let per_row = (((avail + gutter) / (cw + gutter)).floor() as usize).clamp(1, count);
+    let rows = count.div_ceil(per_row);
+    let used_w = per_row as f32 * cw + (per_row as f32 - 1.0) * gutter + 2.0 * pad;
+    let window_w = (used_w.min(work_w as f32)) as i32;
+    let window_h = (header + rows as f32 * cell_h) as i32;
+
+    let mut cells = Vec::with_capacity(count);
+    for i in 0..count {
+        let row = i / per_row;
+        let col = i % per_row;
+        let x = pad + col as f32 * (cw + gutter);
+        let y = header + row as f32 * cell_h;
+        let w = cw.min((window_w as f32 - x - pad).max(CELL_MIN_W));
+        cells.push(RECT {
+            left: x as i32,
+            top: y as i32,
+            right: (x + w) as i32,
+            bottom: (y + cell_h) as i32,
+        });
+    }
+    CellLayout {
+        window_w,
+        window_h,
+        cells,
     }
 }
 
+/// 行/格截断（纯函数，单测口）：>MAX_ROWS 按 z 序截断。
+fn truncate_rows(rows: Vec<PreviewWin>) -> Vec<PreviewWin> {
+    let n = rows.len();
+    if n > MAX_ROWS {
+        log(&format!("rows truncated {n} -> {MAX_ROWS}"));
+        rows.into_iter().take(MAX_ROWS).collect()
+    } else {
+        rows
+    }
+}
+
+/// 缩略图目的地：源窗口宽高比等比装入 `dest`（居中 letterbox）。
+/// DWM 不自动保比例（rcSource 直接拉伸到 rcDestination），不处理会压扁画面。
 /// 缩略图目的地：源窗口宽高比等比装入 `dest`（居中 letterbox）。
 /// DWM 不自动保比例（rcSource 直接拉伸到 rcDestination），不处理会压扁画面。
 fn letterbox_dest(src: isize, dest: RECT) -> RECT {
@@ -606,6 +674,9 @@ unsafe fn destroy_preview(st: &mut ThreadState, reason: &str) {
     if let Ok(mut reg) = ROWS.lock() {
         reg.clear();
     }
+    if let Ok(mut cells) = CELLS.lock() {
+        cells.clear();
+    }
     HOVER_ROW.store(-1, Ordering::Relaxed);
     if let Ok(mut g) = PAINT.lock() {
         if let Some(p) = g.take() {
@@ -636,9 +707,9 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
             if let Ok(g) = PAINT.lock() {
                 if let Some(p) = g.as_ref() {
                     let sc = p.scale;
-                    let (w, h) = (ps.rcPaint.right, ps.rcPaint.bottom);
-                    // 007：头部带（应用图标 + 应用名）+ N 行（每行 = 底衬 + 行标题条；
-                    // 非降级行的缩略图由 DWM 叠在底衬之上）。
+                    let (w, _h) = (ps.rcPaint.right, ps.rcPaint.bottom);
+                    // 007 返工横排：头部带（应用图标 + 应用名）+ N 格横排
+                    // （每格 = 底衬 + 格内标题条；非降级格的缩略图由 DWM 叠在其上）。
                     // ⚠ 文字必须落在不透明面上：品红 colorkey 面上的 GDI 文字会与
                     // key 色混合渲染成白团（preview_poc 变体 E 实测）。
                     let band_h = (HEADER_H * sc) as i32;
@@ -690,9 +761,13 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
                     );
 
-                    // 行：底衬（不透明，接住点击）+ 悬停高亮 + 行标题条
+                    // 格（007 返工横排）：底衬（不透明，接住点击）+ 悬停高亮 +
+                    // 格内标题条（宽度随格宽）。几何来自 CELLS 静态表。
+                    let cells = CELLS.lock().unwrap();
                     for (i, row_title) in p.rows.iter().enumerate() {
-                        let rr = row_rect(sc, i as i32, w, h);
+                        let Some(rr) = cells.get(i).copied() else {
+                            continue;
+                        };
                         let hover = i as i32 == HOVER_ROW.load(Ordering::Relaxed);
                         let bg = if hover { COLORREF(0x00E2_F2FC) } else { ROW_BG };
                         let bgb = CreateSolidBrush(bg);
@@ -700,11 +775,11 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                         let _ = DeleteObject(HGDIOBJ(bgb.0));
 
                         if p.degraded.get(i).copied().unwrap_or(true) {
-                            // 降级行：应用图标 + 窗口标题占满行（无缩略图）
+                            // 降级格：应用图标 + 窗口标题占满格（无缩略图）
                             if p.app_icon != 0 {
                                 let _ = DrawIconEx(
                                     hdc,
-                                    (8.0 * sc) as i32,
+                                    rr.left + (8.0 * sc) as i32,
                                     rr.top + ((ROW_H - 24.0) / 2.0 * sc) as i32,
                                     windows::Win32::UI::WindowsAndMessaging::HICON(
                                         p.app_icon as *mut c_void,
@@ -718,9 +793,9 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                             }
                             let mut t: Vec<u16> = row_title.encode_utf16().collect();
                             let mut tr = RECT {
-                                left: ((8.0 + 24.0 + 8.0) * sc) as i32,
+                                left: rr.left + ((8.0 + 24.0 + 4.0) * sc) as i32,
                                 top: rr.top,
-                                right: w - 8,
+                                right: rr.right - 8,
                                 bottom: rr.bottom,
                             };
                             DrawTextW(
@@ -730,22 +805,22 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
                             );
                         } else {
-                            // 行标题条：不透明浅条（窗口标题），行内可点击
+                            // 格内标题条：不透明浅条（窗口标题），随格宽
                             let strip_y = rr.bottom - (ROW_TITLE * sc) as i32;
                             let strip = CreateSolidBrush(COLORREF(0x00F5_F5F2));
                             let strip_rect = RECT {
-                                left: 0,
+                                left: rr.left,
                                 top: strip_y,
-                                right: w,
+                                right: rr.right,
                                 bottom: rr.bottom,
                             };
                             FillRect(hdc, &strip_rect, strip);
                             let _ = DeleteObject(HGDIOBJ(strip.0));
                             let mut t: Vec<u16> = row_title.encode_utf16().collect();
                             let mut tr = RECT {
-                                left: (8.0 * sc) as i32,
+                                left: rr.left + (6.0 * sc) as i32,
                                 top: strip_y,
-                                right: w - 8,
+                                right: rr.right - 6,
                                 bottom: rr.bottom,
                             };
                             DrawTextW(
@@ -756,6 +831,7 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                             );
                         }
                     }
+                    drop(cells);
                     let _ = SelectObject(hdc, old);
                     let _ = DeleteObject(font.into());
                 }
@@ -768,8 +844,9 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
             // 007 点击切换：命中行 → 还原/置前该窗口，销毁预览。
             // 激活调用发生在预览线程（非 UI 线程）；前台锁按进程判定，
             // 用户刚点了 dock/预览（本进程持前台权），置前通常直接成功。
+            let x = (lp.0 & 0xFFFF) as i16 as i32;
             let y = (lp.0 >> 16) as i16 as i32;
-            let src = preview_src_at(y);
+            let src = preview_src_at(x, y);
             if let Some(src) = src {
                 unsafe { activate_window(src) };
                 log(&format!("activate src={src}"));
@@ -779,9 +856,10 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
             LRESULT(0)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE => {
-            // 悬停行高亮：变了才重绘
+            // 悬停格高亮：变了才重绘（格间隙/头部带 → -1 不高亮）
+            let x = (lp.0 & 0xFFFF) as i16 as i32;
             let y = (lp.0 >> 16) as i16 as i32;
-            let row = hit_row(y);
+            let row = hit_cell(x, y).map(|i| i as i32).unwrap_or(-1);
             if HOVER_ROW.swap(row, Ordering::Relaxed) != row && row >= 0 {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
@@ -791,30 +869,27 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
     }
 }
 
-/// 屏幕客户区 y → 行号（-1 = 头部/窗外）。
-fn hit_row(client_y: i32) -> i32 {
-    if let Ok(g) = PAINT.lock() {
-        if let Some(p) = g.as_ref() {
-            let header = (HEADER_H * p.scale) as i32;
-            let rh = ((ROW_H * p.scale) as i32).max(1);
-            if client_y >= header && !p.rows.is_empty() {
-                return ((client_y - header) / rh).clamp(0, p.rows.len() as i32 - 1);
-            }
-        }
-    }
-    -1
+/// 点 → 格号（纯函数，单测口）：落在格矩形内（半开区间）才命中——
+/// 格间 ≥4px 间隙与头部带天然不在任何矩形内 → None。
+fn hit_cell_in(client_x: i32, client_y: i32, cells: &[RECT]) -> Option<usize> {
+    cells.iter().position(|r| {
+        client_x >= r.left && client_x < r.right && client_y >= r.top && client_y < r.bottom
+    })
 }
 
-/// 点击激活目标：行注册表按 y 命中 → 源窗口（降级行返回 None）。
-fn preview_src_at(client_y: i32) -> Option<isize> {
-    let row = hit_row(client_y);
-    if row < 0 {
-        return None;
-    }
+/// 运行时壳：读 CELLS 静态表（show_preview 写入的同一几何）。
+fn hit_cell(client_x: i32, client_y: i32) -> Option<usize> {
+    let cells = CELLS.lock().unwrap();
+    hit_cell_in(client_x, client_y, &cells)
+}
+
+/// 点击激活目标：格注册表按坐标命中 → 源窗口（降级格返回 None）。
+fn preview_src_at(client_x: i32, client_y: i32) -> Option<isize> {
+    let cell = hit_cell(client_x, client_y)?;
     let rows = ROWS.lock().ok()?;
-    let (src, _minimized) = *rows.get(row as usize)?;
+    let (src, _minimized) = *rows.get(cell)?;
     if src == 0 {
-        return None; // 降级行：无真实源窗口
+        return None; // 降级格：无真实源窗口
     }
     Some(src)
 }
@@ -1055,5 +1130,115 @@ fn log(line: &str) {
             "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}] {}",
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line
         );
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    const H: f32 = 26.0; // 头部带（与生产常量同值，测试固定口径）
+
+    /// 006 ②③⑤ 之外的 007 ①：1/2/3/5/6 窗的格数、换行行数与总宽。
+    /// work_w=1920（不收缩）：1/2/3 行内单行；5/6 单行（200+6 间距远小于 1920）。
+    #[test]
+    fn layout_counts_and_widths_single_row() {
+        for n in [1usize, 2, 3, 5, 6] {
+            let l = layout_cells(n, 200.0, 150.0, 6.0, 10.0, H, 1920);
+            assert_eq!(l.cells.len(), n, "n={n} 格数");
+            let rows: std::collections::HashSet<i32> = l.cells.iter().map(|r| r.top).collect();
+            assert_eq!(rows.len(), 1, "n={n} 应单行");
+            let need = n as f32 * 200.0 + (n as f32 - 1.0) * 6.0 + 20.0;
+            assert!(l.window_w as f32 >= need.min(1920.0) - 1.0, "n={n} 总宽");
+            assert!(l.window_w <= 1920, "n={n} 不得超工作区");
+        }
+    }
+
+    /// 007 ①：窄工作区强制换行——3 窗在 450px 宽（单格+间隙只够 2 格/行）
+    /// → 2 行（2+1）；9 窗超 MAX_ROWS 上限，截断到 6 后换行。
+    #[test]
+    fn layout_wraps_when_narrow() {
+        let l = layout_cells(3, 200.0, 150.0, 6.0, 10.0, H, 450);
+        assert_eq!(l.cells.len(), 3);
+        let rows: std::collections::HashSet<i32> = l.cells.iter().map(|r| r.top).collect();
+        assert_eq!(rows.len(), 2, "450px 宽 → 3 窗换 2 行");
+        // 截断到 6 后的 9 窗场景（collect_rows 先截，layout 收 6）
+        let l6 = layout_cells(6, 200.0, 150.0, 6.0, 10.0, H, 450);
+        let rows6: std::collections::HashSet<i32> = l6.cells.iter().map(|r| r.top).collect();
+        assert_eq!(l6.cells.len(), 6);
+        assert_eq!(rows6.len(), 3, "6 窗 2 格/行 → 3 行");
+    }
+
+    /// 007 ②：hit_cell_in 边界与间隙——格内四角命中、右边界半开、
+    /// 格间间隙与头部带不命中。
+    #[test]
+    fn hit_cell_boundaries_and_gutters() {
+        let l = layout_cells(3, 200.0, 150.0, 6.0, 10.0, H, 1000);
+        let cells = &l.cells;
+        // 格 0 中心命中
+        let c0 = &cells[0];
+        assert_eq!(
+            hit_cell_in((c0.left + c0.right) / 2, (c0.top + c0.bottom) / 2, cells),
+            Some(0)
+        );
+        // 右边界半开：right-1 命中格 0，right 命中下一格（或 None）
+        assert_eq!(
+            hit_cell_in(c0.right - 1, (c0.top + c0.bottom) / 2, cells),
+            Some(0)
+        );
+        // 格间间隙：cell0.right .. cell1.left 之间（≥4px）不命中
+        if cells.len() >= 2 {
+            let gap_x = cells[0].right + (cells[1].left - cells[0].right) / 2;
+            if gap_x < cells[1].left {
+                assert_eq!(
+                    hit_cell_in(gap_x, (cells[0].top + cells[0].bottom) / 2, cells),
+                    None,
+                    "间隙不响应"
+                );
+            }
+        }
+        // 头部带（第一格 top 之上）不命中
+        assert_eq!(hit_cell_in(cells[0].left + 10, (H as i32) - 5, cells), None);
+    }
+
+    /// 007 ④：总宽 clamp——work_w=300 时单格收缩（≥CELL_MIN_W）且窗口宽 ≤300；
+    /// work_w 小于格宽下限时贴工作区宽。
+    #[test]
+    fn layout_clamps_window_width_to_work_area() {
+        let l = layout_cells(4, 200.0, 150.0, 6.0, 10.0, H, 300);
+        assert!(l.window_w <= 300, "总宽 clamp 进工作区");
+        for r in &l.cells {
+            assert!(r.right <= l.window_w, "每格右缘不出窗");
+        }
+        // 极窄：不 panic，宽 ≥1
+        let l2 = layout_cells(2, 200.0, 150.0, 6.0, 10.0, H, 60);
+        assert!(l2.window_w >= 1 && l2.window_w <= 60);
+        assert_eq!(l2.cells.len(), 2);
+    }
+
+    /// 007 ③：>MAX_ROWS 截断（9 → 6，保留 z 序最前的 6 个）。
+    #[test]
+    fn truncate_rows_caps_at_max() {
+        let rows: Vec<PreviewWin> = (0..9usize)
+            .map(|i| PreviewWin {
+                src: 1000 + i as isize,
+                title: format!("w{i}"),
+                degraded: false,
+            })
+            .collect();
+        let t = truncate_rows(rows);
+        assert_eq!(t.len(), MAX_ROWS);
+        assert_eq!(t[0].title, "w0", "保留 z 序最前");
+        assert_eq!(t[MAX_ROWS - 1].title, "w5");
+        // 不超限：原样返回
+        let rows6: Vec<PreviewWin> = (0..6usize)
+            .map(|i| PreviewWin {
+                src: i as isize,
+                title: format!("w{i}"),
+                degraded: false,
+            })
+            .collect();
+        let t2 = truncate_rows(rows6);
+        assert_eq!(t2.len(), 6);
     }
 }
