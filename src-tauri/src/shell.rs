@@ -215,15 +215,27 @@ fn compute_geometry(
     w_logical: f64,
     h_logical: f64,
 ) -> Result<(PhysicalPosition<i32>, PhysicalSize<u32>), String> {
-    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    // 目标显示器：**固定主屏**。
+    //
+    // 2026-11-16 修复（dock 整体不可见）：旧实现用 `window.current_monitor()`。
+    // 新建窗口的初始位置由 Windows 决定（跟随鼠标所在屏），于是光标停在
+    // 150% 的副屏上时，dock 从诞生起就挂在副屏的 DPI 上下文里
+    // （GetDpiForWindow=144），尺寸被放大 1.5 倍（800 逻辑 → 1200 物理），
+    // 而 dock/mod.rs 的水平居中又按**主屏宽**算 → x 与 y 分属两块屏，
+    // 窗口被摆到 (360,1478)——两块显示器之间的无人区，没有任何显示表面，
+    // 于是 dock 完全不渲染（PrintWindow 仍能截到内容，因为 DComp 表面是好的）。
+    //
+    // 现在：目标屏 = 主屏，且尺寸换算用**目标屏自己的 scale_factor()**，
+    // 不用窗口当前上下文的（那是上一块屏遗留的 DPI）。
+    let monitor = window
+        .primary_monitor()
+        .map_err(|e| e.to_string())?
+        .or_else(|| window.current_monitor().ok().flatten())
+        .ok_or_else(|| "找不到主显示器".to_string())?;
+
+    let scale = monitor.scale_factor();
     let pw = (w_logical * scale).round().max(1.0) as i32;
     let ph = (h_logical * scale).round().max(1.0) as i32;
-
-    let monitor = window
-        .current_monitor()
-        .map_err(|e| e.to_string())?
-        .or_else(|| window.primary_monitor().ok().flatten())
-        .ok_or_else(|| "找不到当前显示器".to_string())?;
 
     let pos = monitor.position();
     let size = monitor.size();
