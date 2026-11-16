@@ -18,8 +18,8 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
-    GetWindowThreadProcessId, IsWindowVisible, IsZoomed, SM_CXSCREEN, SM_CYSCREEN,
+    FindWindowExW, FindWindowW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
+    IsWindowVisible, IsZoomed,
 };
 
 /// 给任意窗口（含 dock 的 tao 窗口）开遗留 DWM 玻璃模糊。
@@ -104,40 +104,80 @@ fn visually_shown(hwnd: HWND) -> bool {
 /// 本函数返回 None → dock 轮询进「找不到任务栏 → 永久隐藏」分支。找不到可见
 /// 任务栏时回退读隐藏任务栏窗口自身的 rect（auto-hide 停泊位，几何与隐藏前一致）。
 pub fn primary_taskbar_rect() -> Option<RECT> {
-    if let Some((_, r)) = taskbars().into_iter().next() {
-        return Some(r);
-    }
     unsafe {
-        let h = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok()?;
-        if h.0.is_null() {
-            return None;
-        }
-        let mut r = window_rect(h)?;
         let (sw, sh) = primary_screen();
-        // 2026-11-07 热修（sir 实测：剪映全屏 → 任务栏弹出 → 退出全屏后 dock 上移 ~46px）：
-        // 全屏应用唤出过自动隐藏任务栏后，Shell_TrayWnd 的 GetWindowRect 会停在
-        // 「可见位置」rect（top=1032, bottom=1080），而 IsWindowVisible=false（已收回）。
-        // 旧热修信任该 rect → dock 定位在 962，比贴底位置高一个任务栏高度（46px）。
-        // 判定：任务栏隐藏时停泊矩形 bottom 必然超出屏幕（如 top≈1078, bottom=1126）；
-        // bottom ≤ sh 说明 rect 是失效的可见位置 → 按屏幕底边重建停泊矩形。
-        let bar_h = r.bottom - r.top;
-        if r.bottom <= sh {
-            r.top = sh - 2;
-            r.bottom = r.top + bar_h;
+        let h = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok()?;
+        let primary_raw = if h.0.is_null() {
+            None
+        } else {
+            window_rect(h).map(|r| (r, IsWindowVisible(h).as_bool()))
+        };
+        let visible: Vec<RECT> = taskbars().into_iter().map(|(_, r)| r).collect();
+        resolve_primary_taskbar_rect(primary_raw, &visible, sw, sh)
+    }
+}
+
+/// 纯逻辑：从「主屏任务栏本体」与「可见任务栏列表」推导主屏任务栏停泊矩形。
+///
+/// 拆成纯函数是为了能单测——Win32 查询本身没法在测试里复现。
+///
+/// # 2026-11-16 事故复盘（dock 整体不可见，实测坐标 (360,1478)-(1560,1592)）
+///
+/// 旧实现先取 `taskbars().into_iter().next()`——那是「任意一条**可见**任务栏」。
+/// 外部守卫 tb_guard.ps1 把**主屏** Shell_TrayWnd 藏起来（vis=false），
+/// 而副屏 Shell_SecondaryTrayWnd 仍是可见的 → 列表里只剩副屏那条 →
+/// dock 用**副屏**任务栏的 top 定位。调用方（dock/mod.rs）却用
+/// `primary_screen()` 的**主屏**宽做水平居中 → x 来自主屏、y 来自副屏，
+/// 窗口被摆到两块显示器之间的无人区（主屏 x 带内、副屏 y 带内），
+/// 那里没有任何显示表面 → dock 完全不渲染（PrintWindow 却能截到内容，
+/// 因为 DComp 表面本身是好的）。
+///
+/// 旧守卫每 250ms 硬藏**两条**任务栏 → 可见列表恒空 → 一直走「隐藏态重建」
+/// 分支贴主屏，所以这个潜伏缺陷一直没暴露；新守卫改成「仅状态切换才动作」
+/// 后 explorer 把副屏任务栏弹了回来，才第一次踩中。
+///
+/// 正确语义：这里要的是**主屏**任务栏的停泊矩形，与它当前可见与否无关。
+///
+/// - `primary_raw` = Shell_TrayWnd 本体的 rect 与其可见状态；
+/// - `visible` = 当前视觉可见的全部任务栏 rect（仅在主屏任务栏窗口不存在时兜底）；
+/// - 返回值已按主屏边界裁剪，`top` 即 dock 的贴靠基准。
+pub(crate) fn resolve_primary_taskbar_rect(
+    primary_raw: Option<(RECT, bool)>,
+    visible: &[RECT],
+    sw: i32,
+    sh: i32,
+) -> Option<RECT> {
+    if let Some((mut r, is_visible)) = primary_raw {
+        if !is_visible {
+            // 2026-11-07 热修（sir 实测：剪映全屏 → 任务栏弹出 → 退出全屏后 dock 上移 ~46px）：
+            // 全屏应用唤出过自动隐藏任务栏后，Shell_TrayWnd 的 GetWindowRect 会停在
+            // 「可见位置」rect（top=1032, bottom=1080），而 IsWindowVisible=false（已收回）。
+            // 旧热修信任该 rect → dock 定位在 962，比贴底位置高一个任务栏高度（46px）。
+            // 判定：任务栏隐藏时停泊矩形 bottom 必然超出屏幕（如 top≈1078, bottom=1126）；
+            // bottom ≤ sh 说明 rect 是失效的可见位置 → 按屏幕底边重建停泊矩形。
+            let bar_h = r.bottom - r.top;
+            if r.bottom <= sh {
+                r.top = sh - 2;
+                r.bottom = r.top + bar_h;
+            }
         }
         // 隐藏任务栏的停泊矩形 bottom 在屏幕外（如 (0,1078,1920,1126)，屏高 1080）。
-        // 直接返回会让 dock.rs 的贴边唤出阈值（tr.bottom - REVEAL_EDGE_PX = 1122）
+        // 直接返回会让 dock.rs 的贴边唤出阈值（tr.bottom - REVEAL_EDGE_PX）
         // 超出光标物理上限（1079），dock 永远唤不出。按主屏边界裁剪。
         r.left = r.left.max(0);
         r.top = r.top.max(0);
         r.right = r.right.min(sw);
         r.bottom = r.bottom.min(sh);
         if r.right > r.left && r.bottom > r.top {
-            Some(r)
-        } else {
-            None
+            return Some(r);
         }
     }
+    // 极端情况：主屏任务栏窗口不存在（explorer 重启窗口期）。
+    // 此时才退回可见列表，但必须挑**与主屏相交**的那条，不能拿副屏的。
+    visible
+        .iter()
+        .copied()
+        .find(|r| r.left < sw && r.right > 0 && r.bottom > 0 && r.top < sh)
 }
 
 fn window_rect(hwnd: HWND) -> Option<RECT> {
@@ -242,6 +282,17 @@ pub fn is_foreground_maximized() -> bool {
 }
 
 /// 主屏尺寸（物理像素，dock 定位用）。
+///
+/// 用 `winplat::screen::primary_screen()`（MonitorFromPoint + GetMonitorInfoW）而不是
+/// `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)`：后者返回的是**系统 DPI 上下文**下的
+/// 主屏尺寸，跨屏不同缩放时不是主屏的真实物理像素。2026-11-16 dock 不可见事故里，
+/// 主屏 1920×1080@96dpi 与副屏 2560×1600@144dpi 并存，逻辑坐标与物理坐标一旦混用
+/// 就会把窗口摆到无人区。
 pub fn primary_screen() -> (i32, i32) {
-    unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+    let r = winplat::screen::primary_screen();
+    (r.width(), r.height())
 }
+
+#[cfg(test)]
+#[path = "desktop_taskbar_tests.rs"]
+mod taskbar_tests;

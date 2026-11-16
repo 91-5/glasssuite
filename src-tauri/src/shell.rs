@@ -215,15 +215,27 @@ fn compute_geometry(
     w_logical: f64,
     h_logical: f64,
 ) -> Result<(PhysicalPosition<i32>, PhysicalSize<u32>), String> {
-    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    // 目标显示器：**固定主屏**。
+    //
+    // 2026-11-16 修复（dock 整体不可见）：旧实现用 `window.current_monitor()`。
+    // 新建窗口的初始位置由 Windows 决定（跟随鼠标所在屏），于是光标停在
+    // 150% 的副屏上时，dock 从诞生起就挂在副屏的 DPI 上下文里
+    // （GetDpiForWindow=144），尺寸被放大 1.5 倍（800 逻辑 → 1200 物理），
+    // 而 dock/mod.rs 的水平居中又按**主屏宽**算 → x 与 y 分属两块屏，
+    // 窗口被摆到 (360,1478)——两块显示器之间的无人区，没有任何显示表面，
+    // 于是 dock 完全不渲染（PrintWindow 仍能截到内容，因为 DComp 表面是好的）。
+    //
+    // 现在：目标屏 = 主屏，且尺寸换算用**目标屏自己的 scale_factor()**，
+    // 不用窗口当前上下文的（那是上一块屏遗留的 DPI）。
+    let monitor = window
+        .primary_monitor()
+        .map_err(|e| e.to_string())?
+        .or_else(|| window.current_monitor().ok().flatten())
+        .ok_or_else(|| "找不到主显示器".to_string())?;
+
+    let scale = monitor.scale_factor();
     let pw = (w_logical * scale).round().max(1.0) as i32;
     let ph = (h_logical * scale).round().max(1.0) as i32;
-
-    let monitor = window
-        .current_monitor()
-        .map_err(|e| e.to_string())?
-        .or_else(|| window.primary_monitor().ok().flatten())
-        .ok_or_else(|| "找不到当前显示器".to_string())?;
 
     let pos = monitor.position();
     let size = monitor.size();
@@ -278,52 +290,20 @@ pub fn place(
     Ok(())
 }
 
-/// 按绝对屏幕坐标摆放辅助窗口（开始菜单 / 游离图标）。
-///
-/// 与 `place` 的区别：这两个窗口不是「贴屏幕上沿 / 贴任务栏」，位置由内容决定，
-/// 所以不接受 `Anchor`。仍然保持「先定位后改尺寸」的同步顺序。
-pub fn place_at(
-    window: &WebviewWindow,
-    x_logical: f64,
-    y_logical: f64,
-    w_logical: f64,
-    h_logical: f64,
-) -> Result<(), String> {
-    let scale = window.scale_factor().map_err(|e| e.to_string())?;
-    window
-        .set_position(PhysicalPosition::new(
-            (x_logical * scale).round() as i32,
-            (y_logical * scale).round() as i32,
-        ))
-        .map_err(|e| e.to_string())?;
-    window
-        .set_size(PhysicalSize::new(
-            (w_logical * scale).round().max(1.0) as u32,
-            (h_logical * scale).round().max(1.0) as u32,
-        ))
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// 开始菜单面板：在 dock 正上方居中摆放（物理像素偏移按当前缩放换算）。
-///
-/// 不引入固定尺寸热区窗：面板本身尺寸固定，但窗口尺寸就等于面板尺寸，
-/// 与 island 展开面板同一套 resize 模型。
-pub fn place_above_dock(
-    window: &WebviewWindow,
-    w_logical: f64,
-    h_logical: f64,
-    dock_h_logical: f64,
-) -> Result<(), String> {
-    let scale = window.scale_factor().map_err(|e| e.to_string())?;
-    let (pos, size) = compute_geometry(window, Anchor::Dock, w_logical, h_logical)?;
-    let y = pos.y - (dock_h_logical * scale).round() as i32;
-    window
-        .set_position(PhysicalPosition::new(pos.x, y))
-        .map_err(|e| e.to_string())?;
-    window.set_size(size).map_err(|e| e.to_string())?;
-    Ok(())
-}
+// 2026-11-16 移除（OC-20261116-002，死代码清理）：
+//
+// 原 `place_at()` 与 `place_above_dock()` 两个函数已删除。
+// 理由（AgnesCode 对 OC-20261116-001 的 merge_condition 2 裁定）：
+// ① 全仓零调用点——grep `place_at` / `place_above_dock` 只命中定义本身，
+//    是货真价实的死函数；
+// ② 二者内部都用 `window.scale_factor()` 做逻辑→物理换算，而窗口的「当前屏」
+//    上下文会随窗口被摆到哪块屏而变——这正是 OC-20261116-001 事故的同源风险
+//    （dock 摆到副屏 → 继承 144 DPI → 尺寸放大 1.5 倍 → 落进无人区）。
+//    留着不补防护 = 埋雷；补防护 = 给没人用的代码写维护成本。
+//
+// 保留而非补防护的理由：将来若真需要「按绝对坐标摆放辅助窗口」，
+// 应重新按 `compute_geometry` 的口径实现（目标屏固定 + 用目标屏自己的 scale），
+// 而不是复活这两个用窗口上下文的旧函数。
 
 /// 按需创建辅助窗口（第三个及以后的窗口）。重复调用返回既有窗口，不新建。
 ///

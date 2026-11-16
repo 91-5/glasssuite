@@ -16,7 +16,7 @@ use crate::island::media::MediaMsg;
 
 /// 前端上报的交互热区，CSS 逻辑像素，相对窗口客户区原点。
 ///
-/// 热区**随内容尺寸动态上报**（`useFitWindow` 测量后调 `set_hotzone`），不是固定矩形：
+/// 热区**随内容尺寸动态上报**（前端测量内容包围盒后调 `set_hotzone`），不是固定矩形：
 /// 窗口尺寸 = 内容尺寸，宽度一变热区就得跟着变，否则透明区会吃掉桌面点击。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Hotzone {

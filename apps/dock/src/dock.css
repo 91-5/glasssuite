@@ -41,6 +41,14 @@ body,
   align-items: center;
   gap: 6px;
   padding: 5px 12px;
+  /* OC-20261115-004：必须 flex: 0 0 auto（禁止收缩）。
+     父 .dock 是 flex 容器，默认 flex-shrink:1 —— 当窗口比内容窄时药丸被压到
+     「窗口宽 - 12px」，其 offsetWidth 于是恒等于窗口宽，fit_dock 上报的尺寸
+     永远等于旧尺寸，ResizeObserver 再也测不到「内容其实更宽」→ 窗口永久卡在
+     某个曾经的小尺寸，右侧图标被 overflow:hidden 裁掉（2026-11-15 实测：
+     detach 一个图标后窗口缩到 800，之后内容长回来也再没长回去）。
+     island-pill 早已有 flex: 0 0 auto，dock 这里一直漏了。 */
+  flex: 0 0 auto;
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.34);
   border: 1px solid rgba(255, 255, 255, 0.55);

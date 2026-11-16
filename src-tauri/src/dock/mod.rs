@@ -775,12 +775,20 @@ pub fn dock_logic(app: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
             continue;
         };
 
-        // 定位：主屏水平居中，任务栏上方留 DOCK_MARGIN
+        // 定位：水平居中 + 任务栏上方留 DOCK_MARGIN。
+        //
+        // 2026-11-16 修复（dock 整体不可见，OC-20261116-001）：旧代码 x 用
+        // `primary_screen()` 的宽、y 用 `tr.top`，两者来源不同屏 —— 主屏任务栏被
+        // 外部守卫 tb_guard.ps1 藏住时 `tr` 拿到的是**副屏**任务栏 →
+        // x=(1920-1200)/2=360 落在主屏 x 带内、y=1598-114-6=1478 落在副屏 y 带内
+        // → 窗口被摆到两块显示器之间的**无人区** → 完全不渲染。
+        //
+        // 现在 x 与 y 同源：都用主屏任务栏 `tr` 的左右边界。tr 本身就是主屏任务栏，
+        // 它的 left/right 就是主屏的 x 范围，top 就是贴靠基准。
         let size = dock
             .outer_size()
             .unwrap_or(tauri::PhysicalSize::new(780, 76));
-        let (sw, _sh) = crate::dock::desktop::primary_screen();
-        let x = (sw - size.width as i32) / 2;
+        let x = (tr.left + tr.right - size.width as i32) / 2;
         let y = tr.top - size.height as i32 - DOCK_MARGIN;
         if last_pos != Some((x, y)) {
             let _ = dock.set_position(PhysicalPosition::new(x, y));

@@ -223,20 +223,17 @@ pub fn power_shutdown(reboot: bool) -> Result<(), String> {
 /// 副屏原点非 0 时不会把 dock 拉回主屏）。y 原样透传物理值，不来回换算。
 #[tauri::command]
 pub fn fit_dock(window: tauri::WebviewWindow, w: f64, h: f64) -> Result<(), String> {
-    use tauri::{LogicalSize, PhysicalPosition};
+    use tauri::LogicalSize;
     let w = w.max(120.0);
     let h = h.max(48.0);
-    let scale = window.scale_factor().unwrap_or(1.0);
-    if let Ok(Some(monitor)) = window.current_monitor() {
-        let mw = monitor.size().width as f64;
-        let w_phys = w * scale;
-        if mw > w_phys {
-            let x = monitor.position().x as f64 + (mw - w_phys) / 2.0;
-            if let Ok(pos) = window.outer_position() {
-                let _ = window.set_position(PhysicalPosition::new(x, pos.y as f64));
-            }
-        }
-    }
+    // 2026-11-16 修复（dock 整体不可见，OC-20261116-001）：旧实现在这里用
+    // `window.current_monitor()` 算水平居中 x，而窗口的「当前显示器」取决于它此刻
+    // 挂在哪块屏上——主屏任务栏被外部守卫藏住时 dock 被摆到两块屏之间的无人区，
+    // `current_monitor()` 报 DISPLAY2，于是这里又把 x 拉到副屏，与 dock/mod.rs 的
+    // 定位循环互相拉扯。
+    //
+    // 现在：**位置只由 dock/mod.rs 的定位循环拥有**（单一真相源，见该文件定位段），
+    // 本函数只负责尺寸——内容变了多大就写多大。
     window
         .set_size(LogicalSize::new(w, h))
         .map_err(|e| e.to_string())
