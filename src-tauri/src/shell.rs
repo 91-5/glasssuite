@@ -290,52 +290,20 @@ pub fn place(
     Ok(())
 }
 
-/// 按绝对屏幕坐标摆放辅助窗口（开始菜单 / 游离图标）。
-///
-/// 与 `place` 的区别：这两个窗口不是「贴屏幕上沿 / 贴任务栏」，位置由内容决定，
-/// 所以不接受 `Anchor`。仍然保持「先定位后改尺寸」的同步顺序。
-pub fn place_at(
-    window: &WebviewWindow,
-    x_logical: f64,
-    y_logical: f64,
-    w_logical: f64,
-    h_logical: f64,
-) -> Result<(), String> {
-    let scale = window.scale_factor().map_err(|e| e.to_string())?;
-    window
-        .set_position(PhysicalPosition::new(
-            (x_logical * scale).round() as i32,
-            (y_logical * scale).round() as i32,
-        ))
-        .map_err(|e| e.to_string())?;
-    window
-        .set_size(PhysicalSize::new(
-            (w_logical * scale).round().max(1.0) as u32,
-            (h_logical * scale).round().max(1.0) as u32,
-        ))
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// 开始菜单面板：在 dock 正上方居中摆放（物理像素偏移按当前缩放换算）。
-///
-/// 不引入固定尺寸热区窗：面板本身尺寸固定，但窗口尺寸就等于面板尺寸，
-/// 与 island 展开面板同一套 resize 模型。
-pub fn place_above_dock(
-    window: &WebviewWindow,
-    w_logical: f64,
-    h_logical: f64,
-    dock_h_logical: f64,
-) -> Result<(), String> {
-    let scale = window.scale_factor().map_err(|e| e.to_string())?;
-    let (pos, size) = compute_geometry(window, Anchor::Dock, w_logical, h_logical)?;
-    let y = pos.y - (dock_h_logical * scale).round() as i32;
-    window
-        .set_position(PhysicalPosition::new(pos.x, y))
-        .map_err(|e| e.to_string())?;
-    window.set_size(size).map_err(|e| e.to_string())?;
-    Ok(())
-}
+// 2026-11-16 移除（OC-20261116-002，死代码清理）：
+//
+// 原 `place_at()` 与 `place_above_dock()` 两个函数已删除。
+// 理由（AgnesCode 对 OC-20261116-001 的 merge_condition 2 裁定）：
+// ① 全仓零调用点——grep `place_at` / `place_above_dock` 只命中定义本身，
+//    是货真价实的死函数；
+// ② 二者内部都用 `window.scale_factor()` 做逻辑→物理换算，而窗口的「当前屏」
+//    上下文会随窗口被摆到哪块屏而变——这正是 OC-20261116-001 事故的同源风险
+//    （dock 摆到副屏 → 继承 144 DPI → 尺寸放大 1.5 倍 → 落进无人区）。
+//    留着不补防护 = 埋雷；补防护 = 给没人用的代码写维护成本。
+//
+// 保留而非补防护的理由：将来若真需要「按绝对坐标摆放辅助窗口」，
+// 应重新按 `compute_geometry` 的口径实现（目标屏固定 + 用目标屏自己的 scale），
+// 而不是复活这两个用窗口上下文的旧函数。
 
 /// 按需创建辅助窗口（第三个及以后的窗口）。重复调用返回既有窗口，不新建。
 ///
