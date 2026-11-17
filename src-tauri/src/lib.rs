@@ -108,6 +108,7 @@ pub fn run() {
             dock::api::preview_show,
             dock::api::preview_show_transient,
             dock::api::preview_hide,
+            dock::api::preview_cursor_inside,
             dock::api::menu_toggle,
             dock::api::menu_hide,
             dock::api::get_menu_apps,

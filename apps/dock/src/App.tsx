@@ -281,14 +281,36 @@ function App() {
   // 提示条（例：游离图标达上限被拒 —— 不许静默失败）
   const [notice, setNotice] = useState<string | null>(null);
   // 任务 B：悬停预览。300ms 定时（卡面：悬停 300~500ms 弹出），
-  // 到点把图标按钮的真实 rect（CSS px）交给 Rust 定位预览窗；
-  // 移开/点击立即销毁（Rust 侧 DestroyWindow，不残留句柄）。
+  // 007 链 A/B 修复：预览窗是独立顶层窗，浮在 dock 上方（6px 间隙）。
+  // 鼠标移向预览窗时图标必然 mouseleave，旧语义「一律 preview_hide」会让预览
+  // 当场销毁、鼠标落到后面的窗口；running-snapshot 推送导致图标重挂载时旧元素
+  // 补发 mouseleave，鼠标完全不动时预览也会被销毁。
+  // 现在：mouseleave 只**安排**一次 150ms 后的隐藏判定，判定时询问 Rust
+  // （光标还在预览窗/ dock 内吗）——在则继续等，否则才真正销毁预览。
+  // 拖动图标（拖动开始）等场景仍立即销毁：用 hidePreviewNow()。
   const hoverTimer = useRef<number | undefined>(undefined);
+  const previewHideTimer = useRef<number | undefined>(undefined);
+
+  const cancelPreviewHide = () => { window.clearTimeout(previewHideTimer.current); };
+
+  const schedulePreviewHide = () => {
+    cancelPreviewHide();
+    window.clearTimeout(hoverTimer.current);
+    previewHideTimer.current = window.setTimeout(() => {
+      invoke<boolean>("preview_cursor_inside")
+        .then((inside) => {
+          if (inside) { schedulePreviewHide(); return; } // 光标还在预览窗/ dock 内：继续等
+          invoke("preview_hide").catch(() => {});
+        })
+        .catch(() => invoke("preview_hide").catch(() => {}));
+    }, 150);
+  };
 
   const enterIcon = (sc: Shortcut) => (e: React.MouseEvent<HTMLButtonElement>) => {
     if (dragRef.current) return; // 已按下（含未起拖）不弹预览——预览窗 TOPMOST 会吃掉拖动事件
     const el = e.currentTarget;
     window.clearTimeout(hoverTimer.current);
+    cancelPreviewHide(); // 重新进入图标 → 取消待执行的隐藏
     hoverTimer.current = window.setTimeout(() => {
       if (dragRef.current) return;
       const r = el.getBoundingClientRect();
@@ -302,6 +324,7 @@ function App() {
     if (dragRef.current) return;
     const el = e.currentTarget;
     window.clearTimeout(hoverTimer.current);
+    cancelPreviewHide();
     hoverTimer.current = window.setTimeout(() => {
       if (dragRef.current) return;
       const r = el.getBoundingClientRect();
@@ -310,7 +333,10 @@ function App() {
     }, 300);
   };
 
-  const leaveIcon = () => {
+  const leaveIcon = () => { schedulePreviewHide(); };
+
+  const hidePreviewNow = () => {
+    cancelPreviewHide();
     window.clearTimeout(hoverTimer.current);
     invoke("preview_hide").catch(() => {});
   };
@@ -624,8 +650,8 @@ function App() {
     if (e.button !== 0) return;
     e.preventDefault(); // 压掉原生选择/拖拽语义
     draggingRef.current = true; // 拖动期间暂停版本轮询校准（防频闪）
-    // 按下即收预览（预览窗 TOPMOST 悬在图标上方，会吃掉拖动的移动事件）
-    leaveIcon();
+    // 按下即收预览（预览窗 TOPMOST 悬在图标上方，会吃掉拖动的移动事件）。立即销毁，不走 150ms 去重。
+    hidePreviewNow();
     const r = e.currentTarget.getBoundingClientRect();
     // window 级 pointerup 监听器是 mount 时注册的（useEffect[]），捕获的是
     // 首次渲染的闭包——那时 icons 还没从 Rust 异步加载，dockIcons=[] 永远

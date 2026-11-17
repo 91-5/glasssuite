@@ -167,6 +167,45 @@ pub fn preview_show_transient(
     preview::show_for_transient(&app, &key, x, y, w, h)
 }
 
+/// 007 链 A/B 修复：前端 mouseleave 去重计时（150ms）后询问「光标还在预览窗
+/// 或 dock 内吗」——在则继续等，否则才真正销毁预览。
+///
+/// 背景：预览窗是独立顶层窗，浮在 dock 上方（6px 间隙）。鼠标从图标往预览窗移动时，
+/// 图标必然先触发 mouseleave → 前端无条件 preview_hide → 预览当场销毁，
+/// 鼠标落到预览窗后面的窗口上（007 链 A）。另外 running-snapshot 推送导致图标元素
+/// 重挂载时，旧元素会补发 mouseleave，鼠标完全不动时预览也会在 ~2.6s 后被销毁
+/// （链 B）。本命令把「销毁预览」改为「延迟确认 + 光标实况裁决」。
+#[tauri::command]
+pub fn preview_cursor_inside(app: tauri::AppHandle) -> bool {
+    let pt = unsafe {
+        use windows::Win32::Foundation::POINT;
+        let mut pt = POINT { x: 0, y: 0 };
+        if windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt).is_err() {
+            return true; // 查询失败：保守保留预览（dock 隐藏时有自己的级联销毁）
+        }
+        pt
+    };
+    // 1) 光标在预览窗内 → 保留
+    if let Some(r) = preview::current_rect() {
+        if pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom {
+            return true;
+        }
+    }
+    // 2) 光标在 dock 窗口内 → 保留（链 B 的重挂载 mouseleave 场景）
+    if let Some(dock) = app.get_webview_window("dock") {
+        if let (Ok(pos), Ok(size)) = (dock.outer_position(), dock.outer_size()) {
+            if pt.x >= pos.x
+                && pt.x < pos.x + size.width as i32
+                && pt.y >= pos.y
+                && pt.y < pos.y + size.height as i32
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// 任务 B：销毁预览（鼠标移开 / 点击图标 / dock 隐藏）。
 #[tauri::command]
 pub fn preview_hide() -> Result<(), String> {
