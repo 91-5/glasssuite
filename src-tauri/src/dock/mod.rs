@@ -161,11 +161,84 @@ pub fn config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     Some(dir.join("dock.json"))
 }
 
-pub fn load_config(path: &Path) -> DockConfig {
-    let cfg: DockConfig = std::fs::read(path)
+/// `dock.json` 的备份文件（`<name>.bak`）——「最近一次可解析版本」的快照。
+/// 写法：原子写之前先拷贝一份当前文件；解析不了就不备份，不会拿坏配置污染 .bak。
+fn bak_path_for(path: &Path) -> std::path::PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    match path.file_name() {
+        Some(n) => parent.join(format!("{}.bak", n.to_string_lossy())),
+        None => parent.join("dock.json.bak"),
+    }
+}
+
+/// 保存前刷新 .bak（最近一次好配置）。
+fn snapshot_bak(path: &Path) -> bool {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    if serde_json::from_slice::<DockConfig>(&bytes).is_err() {
+        return false; // 坏配置不进 .bak
+    }
+    std::fs::write(bak_path_for(path), &bytes).is_ok()
+}
+
+/// .bak 里救回来的配置。
+fn try_load_bak(path: &Path) -> Option<DockConfig> {
+    std::fs::read(bak_path_for(path))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+}
+
+pub fn load_config(path: &Path) -> DockConfig {
+    let cfg: DockConfig = match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<DockConfig>(&bytes) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                // 绝不静默吞数据：原文件改名保留（dock.corrupt-<ts>.json），
+                // 然后从 .bak 恢复最近一次好配置；.bak 不可用才回退默认。
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let corrupt = path.with_file_name(format!("dock.corrupt-{stamp}.json"));
+                if std::fs::rename(path, &corrupt).is_ok() {
+                    winplat::log::log(&format!(
+                        "dock: dock.json 解析失败（{e}），原文件已保留为 {}",
+                        corrupt.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                    ));
+                } else {
+                    winplat::log::log(&format!(
+                        "dock: dock.json 解析失败（{e}），原文件保留原位（改名失败）"
+                    ));
+                }
+                match try_load_bak(path) {
+                    Some(cfg) => {
+                        winplat::log::log("dock: 已从 dock.json.bak 恢复配置");
+                        // 立刻回写主文件——否则本会话内后续 load_config
+                        // 会读到「缺失」而回退默认，把恢复成果打回原形。
+                        // （此刻主文件已被改名保留，save_config 不会触发
+                        //  「拒绝覆盖无法解析」的护栏）
+                        if let Err(e) = save_config(path, &cfg) {
+                            winplat::log::log(&format!(
+                                "dock: 回写恢复后的 dock.json 失败：{e}（内存中已恢复，本会话仍有效）"
+                            ));
+                        }
+                        cfg
+                    }
+                    None => {
+                        winplat::log::log("dock: dock.json.bak 不可用，回退默认配置");
+                        DockConfig::default()
+                    }
+                }
+            }
+        },
+        Err(_) => {
+            // 文件缺失/不可读 → 干净重来（不复活过时的 .bak——
+            // 用户主动删 dock.json 重置是常见用法，不该悄悄回来）。
+            DockConfig::default()
+        }
+    };
     // 008 步骤 4（配置兼容）：游离图标功能已退役——旧 dock.json 里的
     // mode:"free" 条目**原位**收敛回 dock 行（free_rect 剥离，相对顺序不变），
     // 读盘即迁移；写回任何配置时落盘的就是收敛后的形态。
@@ -192,6 +265,14 @@ pub fn load_config(path: &Path) -> DockConfig {
 }
 
 pub fn save_config(path: &Path, cfg: &DockConfig) -> Result<(), String> {
+    // 拒绝覆盖一个无法解析的文件——那样就把用户数据永远抹掉了。
+    // （正常流程里 load_config 已把它改名保留，这里是最后一道闸门）
+    if let Ok(bytes) = std::fs::read(path) {
+        if serde_json::from_slice::<DockConfig>(&bytes).is_err() {
+            return Err("拒绝覆盖无法解析的 dock.json（已保留原文件）".to_string());
+        }
+    }
+    let _ = snapshot_bak(path);
     let json = serde_json::to_vec_pretty(cfg).map_err(|e| e.to_string())?;
     atomic_write(path, &json)?;
     bump_config_version();
@@ -1880,5 +1961,112 @@ mod migration_tests {
         assert_eq!(cfg2.shortcuts[0].id, "a");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod config_resilience_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// dock.json 损坏 + .bak 可用 → 恢复 .bak 内容，原文件被改名保留，主文件已恢复。
+    #[test]
+    fn corrupt_main_recovers_from_bak() {
+        let dir = temp_dir("gs-dock-resilience-bak");
+        let file = dir.join("dock.json");
+        std::fs::write(&file, b"{ this is not valid json }").unwrap();
+        std::fs::write(
+            dir.join("dock.json.bak"),
+            r#"{"auto_hide":false,"shortcuts":[{"id":"a","name":"FromBak","path":"C:\\a.exe","icon":{"w":1,"h":1,"rgba":""}}]}"#,
+        )
+        .unwrap();
+
+        let cfg = load_config(&file);
+        assert_eq!(cfg.shortcuts.len(), 1, "应恢复 .bak 的配置");
+        assert_eq!(cfg.shortcuts[0].name, "FromBak");
+
+        // 主文件已恢复：再次读盘必须是可解析的 .bak 内容
+        let restored = std::fs::read(&file).unwrap();
+        let parsed: DockConfig = serde_json::from_slice(&restored).unwrap();
+        assert_eq!(parsed.shortcuts.len(), 1);
+        assert_eq!(parsed.shortcuts[0].name, "FromBak");
+
+        // 原坏文件被保留（不抹用户数据）
+        let corrupt = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .find(|n| n.starts_with("dock.corrupt-"));
+        assert!(corrupt.is_some(), "损坏文件应以 dock.corrupt-* 保留");
+    }
+
+    /// dock.json 损坏且无 .bak → 回退默认，但原文件不被覆盖、被改名保留。
+    #[test]
+    fn corrupt_main_without_bak_falls_back_to_default_but_preserves_file() {
+        let dir = temp_dir("gs-dock-resilience-default");
+        let file = dir.join("dock.json");
+        std::fs::write(&file, b"%%% not json %%%").unwrap();
+
+        let cfg = load_config(&file);
+        assert!(cfg.shortcuts.is_empty(), "默认配置出厂值无固定图标");
+
+        let corrupt = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .find(|n| n.starts_with("dock.corrupt-"));
+        assert!(corrupt.is_some(), "原文必须保留为 dock.corrupt-*.json");
+        let bak_exists = file.with_file_name("dock.json.bak").exists();
+        assert!(!bak_exists, "没有 .bak，不应凭空生成");
+    }
+
+    /// save_config 落盘前先快照当前可解析版本为 .bak。
+    #[test]
+    fn save_config_writes_bak_snapshot_first() {
+        let dir = temp_dir("gs-dock-resilience-savebak");
+        let file = dir.join("dock.json");
+        // 先写一份合法配置，模拟"上次的好配置"
+        std::fs::write(
+            &file,
+            r#"{"auto_hide":false,"shortcuts":[{"id":"x","name":"Good","path":"C:\\good.exe","icon":{"w":1,"h":1,"rgba":""}}]}"#,
+        )
+        .unwrap();
+
+        let mut cfg = DockConfig::default();
+        cfg.shortcuts.push(Shortcut {
+            id: "y".to_string(),
+            name: "New".to_string(),
+            path: "C:\\new.exe".to_string(),
+            icon: IconData { w: 1, h: 1, rgba: String::new() },
+            aumid: None,
+            mode: IconMode::Dock,
+            free_rect: None,
+        });
+        save_config(&file, &cfg).unwrap();
+
+        let bak = std::fs::read(dir.join("dock.json.bak")).unwrap();
+        let bak_cfg: DockConfig = serde_json::from_slice(&bak).unwrap();
+        assert_eq!(bak_cfg.shortcuts[0].name, "Good", ".bak 必须是写前的好配置");
+        let cur = std::fs::read(&file).unwrap();
+        let cur_cfg: DockConfig = serde_json::from_slice(&cur).unwrap();
+        assert_eq!(cur_cfg.shortcuts[0].name, "New", "主文件写入了新配置");
+    }
+
+    /// save_config 拒绝覆盖无法解析的 dock.json（最后闸门）。
+    #[test]
+    fn save_config_refuses_to_overwrite_unparseable() {
+        let dir = temp_dir("gs-dock-resilience-refuse");
+        let file = dir.join("dock.json");
+        let bad_bytes = b"this is not json at all";
+        std::fs::write(&file, bad_bytes).unwrap();
+
+        let result = save_config(&file, &DockConfig::default());
+        assert!(result.is_err(), "必须拒绝覆盖坏文件");
+        let after = std::fs::read(&file).unwrap();
+        assert_eq!(after, bad_bytes, "坏文件字节必须原样保留");
     }
 }
