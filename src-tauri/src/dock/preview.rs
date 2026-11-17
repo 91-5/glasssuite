@@ -86,8 +86,8 @@ const GUTTER: f32 = 6.0; // 格间距（≥4px 不响应间隙）
 const CELL_MIN_W: f32 = 120.0; // 格宽下限（工作区太窄时收缩下限）
 const ROW_BG: COLORREF = COLORREF(0x00ED_EDE9); // 格底衬（浅色，与头部带同系）
 
-/// 一行预览 = 一个顶层窗口。`src=0` 表示该行降级（最小化/DRM 疑似/注册失败：
-/// 只画应用图标 + 窗口标题，无 DWM 缩略图）。
+/// 一行预览 = 一个顶层窗口。降级仅影响显示（`PaintState.degraded`），
+/// `src` 保留真实源窗口句柄——降级格点击照样还原/置前。
 #[derive(Debug)]
 pub struct PreviewWin {
     src: isize,
@@ -166,15 +166,8 @@ fn collect_rows(key: &str) -> Vec<PreviewWin> {
         } else {
             title
         };
-        rows.push(PreviewWin {
-            src: if degrade_reason(src, minimized) {
-                0
-            } else {
-                src
-            },
-            title,
-            degraded: degrade_reason(src, minimized),
-        });
+        let degraded = degrade_reason(src, minimized);
+        rows.push(PreviewWin { src, title, degraded });
     }
     truncate_rows(rows)
 }
@@ -495,7 +488,7 @@ unsafe fn show_preview(st: &mut ThreadState, req: ShowReq) {
     // 每个非降级窗口注册一格 DWM 缩略图：目的地 = 格内容区（去掉格内标题条）。
     let strip = (ROW_TITLE * sc) as i32;
     for (i, r) in req.windows.iter().enumerate() {
-        if r.src == 0 {
+        if r.degraded {
             continue; // 降级格：无缩略图（PaintState.degraded[i] 已置位）
         }
         let cr = layout.cells[i];
@@ -847,9 +840,15 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
             let x = (lp.0 & 0xFFFF) as i16 as i32;
             let y = (lp.0 >> 16) as i16 as i32;
             let src = preview_src_at(x, y);
+            log(&format!(
+                "LBUTTONDOWN client=({},{}) src={}",
+                x,
+                y,
+                src.map(|s| format!("0x{:x}", s)).unwrap_or_else(|| "NONE".into())
+            ));
             if let Some(src) = src {
                 unsafe { activate_window(src) };
-                log(&format!("activate src={src}"));
+                log(&format!("activate called src=0x{:x}", src));
             }
             // 经 Cmd::Hide 让预览线程自行销毁（wndproc 无 ThreadState 上下文）
             send(Cmd::Hide);
@@ -883,28 +882,38 @@ fn hit_cell(client_x: i32, client_y: i32) -> Option<usize> {
     hit_cell_in(client_x, client_y, &cells)
 }
 
-/// 点击激活目标：格注册表按坐标命中 → 源窗口（降级格返回 None）。
+/// 点击激活目标：格注册表按坐标命中 → 源窗口（降级格保留真实句柄，仍返回 Some）。
 fn preview_src_at(client_x: i32, client_y: i32) -> Option<isize> {
     let cell = hit_cell(client_x, client_y)?;
     let rows = ROWS.lock().ok()?;
     let (src, _minimized) = *rows.get(cell)?;
-    if src == 0 {
-        return None; // 降级格：无真实源窗口
-    }
     Some(src)
 }
 
 /// 还原最小化 + 置前（preview 行点击共用；前台锁语义见 activate_or_launch）。
 unsafe fn activate_window(src: isize) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
+        GetForegroundWindow, SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
     };
     let hwnd = HWND(src as *mut c_void);
-    if IsIconic(hwnd).as_bool() {
+    let iconic = IsIconic(hwnd).as_bool();
+    if iconic {
         let _ = ShowWindow(hwnd, SW_RESTORE);
+        log(&format!("src=0x{:x} was minimized → SW_RESTORE", src));
     }
-    if !SetForegroundWindow(hwnd).as_bool() {
+    let set_ok = SetForegroundWindow(hwnd).as_bool();
+    let fg1 = GetForegroundWindow();
+    log(&format!(
+        "SetForegroundWindow -> {} (fg now 0x{:x})",
+        set_ok, fg1.0 as isize
+    ));
+    if !set_ok {
         SwitchToThisWindow(hwnd, true);
+        let fg2 = GetForegroundWindow();
+        log(&format!(
+            "SwitchToThisWindow fallback -> fg now 0x{:x}",
+            fg2.0 as isize
+        ));
     }
 }
 
