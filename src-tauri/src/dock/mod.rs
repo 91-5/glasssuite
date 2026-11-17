@@ -162,10 +162,33 @@ pub fn config_path(app: &tauri::AppHandle) -> Option<PathBuf> {
 }
 
 pub fn load_config(path: &Path) -> DockConfig {
-    std::fs::read(path)
+    let cfg: DockConfig = std::fs::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // 008 步骤 4（配置兼容）：游离图标功能已退役——旧 dock.json 里的
+    // mode:"free" 条目**原位**收敛回 dock 行（free_rect 剥离，相对顺序不变），
+    // 读盘即迁移；写回任何配置时落盘的就是收敛后的形态。
+    let had_free = cfg.shortcuts.iter().any(|s| s.mode == IconMode::Free);
+    if had_free {
+        let mut cfg = cfg;
+        let n = cfg
+            .shortcuts
+            .iter()
+            .filter(|s| s.mode == IconMode::Free)
+            .count();
+        for s in &mut cfg.shortcuts {
+            if s.mode == IconMode::Free {
+                s.mode = IconMode::Dock;
+                s.free_rect = None;
+            }
+        }
+        winplat::log::log(&format!(
+            "dock: 自由图标已退役，{n} 条 free 条目收敛回 dock 行"
+        ));
+        return cfg;
+    }
+    cfg
 }
 
 pub fn save_config(path: &Path, cfg: &DockConfig) -> Result<(), String> {
