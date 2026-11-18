@@ -21,6 +21,8 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 # 公钥在 tauri.conf.json；私钥只从 TAURI_SIGNING_PRIVATE_KEY（CI secrets）读，绝不入库。
 tauri-plugin-updater = "2"
+# OC-20261118-001：二次启动唤起控制页（替代自研命名锁）。必须是 builder 链首个插件。
+tauri-plugin-single-instance = "2"
 winplat = { path = "../crates/winplat" }
 serde = { workspace = true }
 serde_json = { workspace = true }

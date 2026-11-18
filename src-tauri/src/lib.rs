@@ -14,6 +14,7 @@
 //! 4. 窗口就绪后再启动功能域采样线程（早于窗口订阅会丢首帧事件）。
 
 pub mod cli;
+pub mod control;
 pub mod dock;
 pub mod island;
 pub mod settings;
@@ -56,23 +57,18 @@ pub fn run() {
 
     winplat::log::log("== GlassSuite 启动 ==");
 
-    let _instance_guard = match winplat::instance::acquire(winplat::instance::NAME) {
-        Ok(Some(guard)) => Some(guard),
-        Ok(None) => {
-            winplat::log::log("already running");
-            println!("already running");
-            std::process::exit(0);
-        }
-        Err(e) => {
-            // 取不到锁不是致命错误：继续启动，但记下来以便排查。
-            winplat::log::log(&format!("单实例锁创建失败，继续启动：{e}"));
-            None
-        }
-    };
+    // OC-20261118-001：自研命名锁已移除，改用 tauri-plugin-single-instance。
+    // 旧锁在二启时直接 exit(0)、不通知首实例 → 用户双击 .lnk "没反应"。
+    // 插件必须在 builder 链首注册（见下方 .plugin(single_instance)）。
 
     let shared = Arc::new(state::SharedState::default());
 
     tauri::Builder::default()
+        // OC-20261118-001：单实例唤起控制页。必须第一个注册。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            winplat::log::log("second instance: 唤起控制页");
+            let _ = control::ensure_control_window(app);
+        }))
         // updater 只注册能力：`plugins.updater.endpoints` 为空且前端不主动 check()，
         // 因此默认零外联；签名公钥在 tauri.conf.json，私钥只在 CI secrets 里。
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -138,6 +134,10 @@ pub fn run() {
             shell::create_windows(&handle)?;
             shell::create_dock_windows(&handle)?;
             winplat::log::log("窗口就绪：island + dock + startmenu");
+
+            // OC-20261118-001：首实例若带 --control（桌面 .lnk）则弹控制页。
+            // 开机 Run key 不带此参数 → 只岛+dock 自启，桌面保持原生。
+            control::boot_if_requested(&handle);
 
             let st = app.state::<Arc<state::SharedState>>().inner().clone();
             cache_hwnd(&handle, &st);

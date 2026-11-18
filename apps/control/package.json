@@ -1,0 +1,26 @@
+{
+  "name": "@glasssuite/control",
+  "private": true,
+  "version": "0.1.4",
+  "type": "module",
+  "description": "GlassSuite 控制中心窗口前端（四开关）。",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@glasssuite/ipc-types": "workspace:*",
+    "@tauri-apps/api": "^2.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.8.0",
+    "vite": "^6.0.0"
+  }
+}
