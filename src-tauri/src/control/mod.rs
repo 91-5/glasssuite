@@ -7,6 +7,13 @@
 //! - `ensure_control_window`：幂等唤起（存在则 show+unminimize+focus，否则 build）；
 //! - `restore_native_desktop`：退出前主动还原任务栏 + 桌面图标（解 F3，让点 X 立即恢复原生）；
 //! - `boot_if_requested`：首实例启动时按 `--control` argv 决定是否弹控制页。
+//!
+//! 子模块（OC-20261118-002）：
+//! - `state`：守卫意图文件 + 5s 心跳；
+//! - `api`：四开关 IPC。
+
+pub mod api;
+pub mod state;
 
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
@@ -55,33 +62,13 @@ pub fn boot_if_requested(app: &AppHandle) {
     }
 }
 
-/// 退出前主动还原原生桌面（任务栏 + 桌面图标）。
+/// 退出前主动清除守卫意图（方案 B）。
 ///
-/// 与守卫 `tb_guard.ps1 -Restore` 同一套还原三件套；这里同步调一次，
-/// 让用户点控制页 X 后立即看到原生桌面，而不是等守卫下一轮 250ms 轮询（甚至崩溃时永不还原）。
-/// 正常退出走这里；崩溃（taskkill /F）不触发，靠守卫心跳 fail-safe（OC-20261118-002）。
+/// 守卫每 250ms 读 `guard_state.json`：文件不存在 → 安全默认（任务栏/图标全显示），
+/// 比 spawn `-Restore` 更简单、也不会与常驻守卫抢着写注册表。
+/// 崩溃（taskkill /F）走不到这里，靠守卫 10s 心跳超时 fail-safe（OC-20261118-002）。
 pub fn restore_native_desktop() {
-    let script = r"D:\15812\tools\tb_guard.ps1";
-    if !std::path::Path::new(script).exists() {
-        winplat::log::log("control: 守卫脚本不存在，跳过退出还原");
-        return;
-    }
-    match std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-WindowStyle",
-            "Hidden",
-            "-File",
-            script,
-            "-Restore",
-        ])
-        .spawn()
-    {
-        Ok(_) => winplat::log::log("control: 退出还原已触发 (-Restore)"),
-        Err(e) => winplat::log::log(&format!("control: 退出还原 spawn 失败: {e}")),
-    }
+    state::clear_on_exit();
 }
 
 #[cfg(test)]

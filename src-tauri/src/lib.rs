@@ -81,6 +81,12 @@ pub fn run() {
             settings::settings_update,
             island::ai::ai_reload,
             island::ai::ai_test_connection,
+            // 控制中心四开关（OC-20261118-002）
+            control::api::control_get_state,
+            control::api::control_set_island,
+            control::api::control_set_dock,
+            control::api::control_set_icons,
+            control::api::control_set_taskbar,
             // 岛功能域
             island::log_frontend,
             island::media::media_control,
@@ -128,12 +134,24 @@ pub fn run() {
             // 配置先于窗口：窗口尺寸/内容依赖配置（例如天气是否显示）。
             // 放进 Mutex 是因为 settings_update 要整体替换它（前端保存即生效）。
             let settings = settings::load(&data_dir);
-            app.manage(Mutex::new(settings));
+            app.manage(Mutex::new(settings.clone()));
+
+            // OC-20261118-002：守卫意图初始化 + 心跳。
+            // 必须在窗口创建前写意图（守卫读文件即可生效），心跳线程保证活着时持续刷新。
+            control::state::initialize(
+                settings.control.taskbar_hidden,
+                settings.control.desktop_icons_hidden,
+            );
+            control::state::spawn_heartbeat();
 
             // 窗口：island 立即显示；dock / startmenu 先隐藏（glassdesk 模型）。
             shell::create_windows(&handle)?;
             shell::create_dock_windows(&handle)?;
             winplat::log::log("窗口就绪：island + dock + startmenu");
+
+            // OC-20261118-002：窗口创建后应用持久化的四开关（岛/Dock 初始可见态）。
+            // 必须在 create_windows 之后，否则 get_webview_window 返回 None。
+            control::api::apply_on_boot(&handle, &settings.control);
 
             // OC-20261118-001：首实例若带 --control（桌面 .lnk）则弹控制页。
             // 开机 Run key 不带此参数 → 只岛+dock 自启，桌面保持原生。

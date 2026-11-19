@@ -48,6 +48,34 @@ pub struct DockSettings {
     pub auto_hide: bool,
 }
 
+/// 控制中心四开关（OC-20261118-002）。默认：岛/Dock 开，图标/任务栏不隐藏。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ControlSettings {
+    /// 灵动岛显示。
+    pub island_enabled: bool,
+    /// 桌面 Dock 显示。
+    pub dock_enabled: bool,
+    /// 桌面原生图标隐藏（由守卫执行）。
+    pub desktop_icons_hidden: bool,
+    /// 系统底部任务栏隐藏（由守卫执行）。
+    pub taskbar_hidden: bool,
+}
+
+impl Default for ControlSettings {
+    fn default() -> Self {
+        // 默认沉浸态：与 GlassSuite 既有产品定位一致（岛+Dock，隐藏任务栏/原生图标）。
+        // 方案 B 守卫完全听 intent.json，若这里给 false，启动即把 sir 长期隐藏的
+        // 任务栏/图标放出来 = 退步。想回原生请显式关开关或点 X 退出。
+        Self {
+            island_enabled: true,
+            dock_enabled: true,
+            desktop_icons_hidden: true,
+            taskbar_hidden: true,
+        }
+    }
+}
+
 /// 应用配置。所有字段都有默认值：缺键 = 用默认（关闭）。
 ///
 /// 硬约束 12：天气坐标、网络探测地址、AI `base_url`、歌词源，首启模板里**全部为 null**。
@@ -93,6 +121,9 @@ pub struct Settings {
     /// 久坐提醒间隔（分钟）。缺省 = 60（上限一天 6 次，写死在 suggester）。
     #[serde(default, rename = "sedentaryIntervalMin")]
     pub sedentary_interval_min: Option<u64>,
+    /// 控制中心四开关（OC-20261118-002）。
+    #[serde(default)]
+    pub control: ControlSettings,
 }
 
 /// 配置文件名。放在 `%APPDATA%\com.glasssuite.app\` 下。
@@ -131,8 +162,8 @@ pub fn settings_get(settings: tauri::State<'_, Mutex<Settings>>) -> Settings {
 }
 
 /// 写回 settings.json（原子：临时文件 + rename，见 `winplat::config::save_json`）。
-/// 独立出来便于单测：命令层只做「写盘 → 换内存态 → 应用运行时」的编排。
-fn persist(data_dir: &Path, next: &Settings) -> Result<(), String> {
+/// 独立出来便于单测和 control/api.rs 调用。
+pub(crate) fn persist(data_dir: &Path, next: &Settings) -> Result<(), String> {
     config::save_json(&path(data_dir), next).map_err(|e| format!("配置写入失败：{e}"))
 }
 
@@ -188,6 +219,32 @@ pub async fn settings_update<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_section_defaults_and_persists() {
+        use crate::settings::ControlSettings;
+
+        let dir = std::env::temp_dir().join("gs-settings-control");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 缺键 = 沉浸态默认：岛/Dock 开，图标/任务栏隐藏。
+        let mut s = load(&dir);
+        assert_eq!(s.control, ControlSettings::default());
+        assert!(s.control.island_enabled && s.control.dock_enabled);
+        assert!(s.control.desktop_icons_hidden && s.control.taskbar_hidden);
+
+        // 改四开关 → 写盘 → reload 原样回来。
+        s.control.island_enabled = false;
+        s.control.taskbar_hidden = true;
+        persist(&dir, &s).unwrap();
+        let back = load(&dir);
+        assert!(!back.control.island_enabled);
+        assert!(back.control.taskbar_hidden);
+        assert!(back.control.dock_enabled, "未改的字段应保持");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn missing_file_writes_template_and_defaults_all_off() {

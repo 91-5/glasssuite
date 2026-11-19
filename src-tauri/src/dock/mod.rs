@@ -54,6 +54,15 @@ const FORCE_READY_AFTER_MS: u64 = 5000;
 /// dock WebView2 首帧是否已就绪（前端 `dock_ready` 上报）。
 static DOCK_READY: AtomicBool = AtomicBool::new(false);
 
+/// 控制中心 dock 开关（OC-20261118-002）：false = 用户要求隐藏 dock。
+/// dock_logic 每轮检查，关闭时强制隐藏并跳过定位/显示，不销毁窗口。
+static DOCK_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// 控制页切换 dock 显示（不改窗口生命周期，dock_logic 下一轮生效）。
+pub fn set_dock_enabled(enabled: bool) {
+    DOCK_ENABLED.store(enabled, Ordering::SeqCst);
+}
+
 /// 前端上报首帧已绘制。
 pub fn mark_ready() {
     DOCK_READY.store(true, Ordering::SeqCst);
@@ -885,6 +894,25 @@ pub fn dock_logic(app: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
         // 一次按压手势里窗口几何必须纹丝不动，否则 Chromium 不合成 click。
         // 超时由 interaction_locked() 就地强制释放，不会卡死定位循环。
         if interaction_locked() {
+            std::thread::sleep(Duration::from_millis(POLL_MS));
+            continue;
+        }
+
+        // OC-20261118-002：控制中心 dock 关闭 → 强制隐藏并跳过定位/显示逻辑。
+        // 不销毁窗口（保留 WebView2 状态），前端 DOM 仍在、指令仍可达。
+        if !DOCK_ENABLED.load(Ordering::Relaxed) {
+            if let Some(h) = hwnd {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                        h,
+                        windows::Win32::UI::WindowsAndMessaging::SW_HIDE,
+                    );
+                }
+            } else {
+                let _ = dock.hide();
+            }
+            crate::dock::preview::hide();
+            visible = false;
             std::thread::sleep(Duration::from_millis(POLL_MS));
             continue;
         }

@@ -83,6 +83,12 @@ export const COMMANDS = {
   dockInteractionEnd: "dock_interaction_end",
   /** 前端诊断 / 取证日志（写 menu.log）。 */
   debugNote: "debug_note",
+  /** OC-20261118-002：控制中心四开关。 */
+  controlGetState: "control_get_state",
+  controlSetIsland: "control_set_island",
+  controlSetDock: "control_set_dock",
+  controlSetIcons: "control_set_icons",
+  controlSetTaskbar: "control_set_taskbar",
 } as const;
 
 /**
@@ -585,3 +591,36 @@ export async function dockInteractionEnd(): Promise<void> {
 export async function debugNote(msg: string): Promise<void> {
   await invoke(COMMANDS.debugNote, { msg });
 }
+
+// ---------------------------------------------------------------------------
+// 控制中心四开关（OC-20261118-002）
+// ---------------------------------------------------------------------------
+
+/** 四个开关的当前状态（与 Rust `ControlSettings` 逐字段对应）。 */
+export interface ControlSettings {
+  islandEnabled: boolean;
+  dockEnabled: boolean;
+  desktopIconsHidden: boolean;
+  taskbarHidden: boolean;
+}
+
+export async function controlGetState(): Promise<ControlSettings> {
+  return invoke<ControlSettings>(COMMANDS.controlGetState);
+}
+
+async function setControlField(cmd: string, key: string, value: boolean): Promise<ControlSettings> {
+  return invoke<ControlSettings>(cmd, { [key]: value });
+}
+
+/** 灵动岛 开/关。 */
+export const controlSetIsland = (enabled: boolean) =>
+  setControlField(COMMANDS.controlSetIsland, "enabled", enabled);
+/** Dock 开/关。 */
+export const controlSetDock = (enabled: boolean) =>
+  setControlField(COMMANDS.controlSetDock, "enabled", enabled);
+/** 桌面原生图标 隐藏/显示。 */
+export const controlSetIcons = (hidden: boolean) =>
+  setControlField(COMMANDS.controlSetIcons, "hidden", hidden);
+/** 系统任务栏 隐藏/显示。 */
+export const controlSetTaskbar = (hidden: boolean) =>
+  setControlField(COMMANDS.controlSetTaskbar, "hidden", hidden);
