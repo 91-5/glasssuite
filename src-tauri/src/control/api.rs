@@ -13,6 +13,91 @@ pub fn control_get_state(store: State<'_, std::sync::Mutex<Settings>>) -> Contro
     store.lock().unwrap().control.clone()
 }
 
+/// OC-20261118-003 §2.1：逃生热键 Ctrl+Alt+G 是否注册成功。
+/// 控制页首次加载查询；false 时显式告警"逃生舱不可用，请勿同时隐藏任务栏和桌面图标"。
+#[tauri::command]
+pub fn control_hotkey_status() -> bool {
+    crate::control::state::hotkey_registered()
+}
+
+/// OC-20261118-003 §2.3：实况回显——返回"实际"桌面/窗口状态，供控制页对比"意图"告警。
+/// 与 control_get_state（意图）分开：守卫没跑/权限不足时两者会背离，控制页据此橙色告警。
+#[derive(Clone, serde::Serialize)]
+pub struct ControlLiveStatus {
+    /// 主屏任务栏是否真的可见（IsWindowVisible(Shell_TrayWnd)）。
+    pub taskbar_visible: bool,
+    /// 桌面原生图标是否被隐藏（注册表 HideIcons==1）。
+    pub icons_hidden: bool,
+    /// 灵动岛窗口是否可见。
+    pub island_visible: bool,
+    /// Dock 窗口是否可见。
+    pub dock_visible: bool,
+}
+
+#[tauri::command]
+pub fn control_live_status(app: AppHandle) -> ControlLiveStatus {
+    #[cfg(windows)]
+    let taskbar_visible = {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, IsWindowVisible};
+        unsafe {
+            FindWindowW(w!("Shell_TrayWnd"), windows::core::PCWSTR::null())
+                .map(|h| IsWindowVisible(h).as_bool())
+                .unwrap_or(true)
+        }
+    };
+    #[cfg(not(windows))]
+    let taskbar_visible = true;
+
+    #[cfg(windows)]
+    let icons_hidden = {
+        use windows::Win32::System::Registry::{
+            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+        };
+        use windows::core::w;
+        let subkey = w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced");
+        let value = w!("HideIcons");
+        let mut hk = HKEY(std::ptr::null_mut());
+        let mut out: u32 = 0;
+        let mut found = false;
+        unsafe {
+            if RegOpenKeyExW(HKEY_CURRENT_USER, subkey, Some(0), KEY_READ, &mut hk).is_ok() {
+                let mut ty = windows::Win32::System::Registry::REG_DWORD;
+                let mut len = std::mem::size_of::<u32>() as u32;
+                if RegQueryValueExW(
+                    hk,
+                    value,
+                    None,
+                    Some(&mut ty),
+                    Some(&mut out as *mut u32 as *mut u8),
+                    Some(&mut len),
+                )
+                .is_ok()
+                {
+                    found = true;
+                }
+                let _ = RegCloseKey(hk);
+            }
+        }
+        found && out == 1
+    };
+    #[cfg(not(windows))]
+    let icons_hidden = false;
+
+    let win_visible = |label: &str| {
+        app.get_webview_window(label)
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false)
+    };
+
+    ControlLiveStatus {
+        taskbar_visible,
+        icons_hidden,
+        island_visible: win_visible("island"),
+        dock_visible: win_visible("dock"),
+    }
+}
+
 /// 通用：更新 control 段的一个字段并持久化 + 生效。
 fn update_control<F: FnOnce(&mut ControlSettings)>(
     app: &AppHandle,

@@ -189,6 +189,14 @@ fn apply(
     configured
 }
 
+/// OC-20261118-003 / 浮香 #007 advisory A：岛前端整份 Settings 保存不带 control 段，
+/// 反序列化会得到默认沉浸态，写盘即把用户四开关刷回默认。用当前内存态回填。
+/// 提取纯函数便于单测锁死；控制页自己的四开关走 control_set_* 专用 IPC，不经过此路。
+fn preserve_control(mut next: Settings, current: &Settings) -> Settings {
+    next.control = current.control.clone();
+    next
+}
+
 /// 前端保存配置：写回文件 + 更新 managed state + 应用运行时，一次调用全部完成。
 ///
 /// 写盘失败时不动内存态并返回 `Err`（前端提示保存失败）；成功则新配置即刻生效，
@@ -203,6 +211,12 @@ pub async fn settings_update<R: tauri::Runtime>(
     notif: tauri::State<'_, Arc<crate::island::notification::NotificationState>>,
     next: Settings,
 ) -> Result<Settings, String> {
+    // OC-20261118-003 / 浮香 #007 advisory A：岛前端 Settings interface 没有 control 字段，
+    // 整份写盘会把 Rust #[serde(default)] 的沉浸态默认值覆盖掉——岛里任何一次保存都会
+    // 静默把四开关刷回默认。这里用当前内存态的 control 段回填 next，再写盘。
+    // 控制页自己的四开关走 control_set_* 专用 IPC，不经过本命令，互不干扰。
+    let next = preserve_control(next, &store.lock().unwrap());
+
     persist(&data_dir(), &next)?;
 
     let configured = apply(&next, &store, &ai, &network);
@@ -244,6 +258,20 @@ mod tests {
         assert!(back.control.dock_enabled, "未改的字段应保持");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn island_save_preserves_current_control_section() {
+        // 浮香 #007 advisory A：岛整份保存（前端无 control 字段→默认沉浸态）
+        // 不得冲掉用户当前的四开关设置。
+        let mut current = Settings::default();
+        current.control.island_enabled = false;
+        current.control.taskbar_hidden = false;
+
+        let incoming = Settings::default(); // 模拟前端反序列化出的默认 control
+        let merged = preserve_control(incoming, &current);
+        assert_eq!(merged.control, current.control);
+        assert!(!merged.control.island_enabled && !merged.control.taskbar_hidden);
     }
 
     #[test]

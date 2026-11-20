@@ -895,7 +895,9 @@ function App() {
               onMouseLeave={leaveIcon}
             >
               <IconCanvas icon={sc.icon} />
-              {running.has(sc.id) && <RunDot />}
+              {/* OC-20261118-003 §2.2：GlassSuite 自身图标常驻 RunDot——宿主进程在跑
+                  （dock 本身就是它渲染的），不依赖 006 运行快照（自身被排除）。 */}
+              {(running.has(sc.id) || sc.name.toLowerCase() === "glasssuite") && <RunDot />}
             </button>
           );
         })}

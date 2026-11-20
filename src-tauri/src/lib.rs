@@ -63,12 +63,37 @@ pub fn run() {
 
     let shared = Arc::new(state::SharedState::default());
 
+    // OC-20261118-003 §2.1：全局逃生热键 Ctrl+Alt+G。全藏任务栏/图标后唯一的键盘入口。
+    // with_shortcut 解析失败（组合串非法）视为未注册；真正的"被占用"失败发生在插件 setup
+    // 注册到系统时——两者都通过 set_hotkey_registered(false) 让控制页告警。
+    let hotkey_plugin = tauri_plugin_global_shortcut::Builder::new()
+        .with_shortcut("ctrl+alt+g")
+        .and_then(|b| {
+            Ok(b.with_handler(|app, _sc, ev| {
+                if ev.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                    winplat::log::log("逃生热键 Ctrl+Alt+G 触发：唤起控制页");
+                    let _ = control::ensure_control_window(app);
+                }
+            }))
+        })
+        .map(|b| b.build());
+    let hotkey_ok = hotkey_plugin.is_ok();
+    control::state::set_hotkey_registered(hotkey_ok);
+    if !hotkey_ok {
+        winplat::log::log("逃生热键 Ctrl+Alt+G 注册失败（组合非法）：控制页将告警");
+    }
+    let hotkey_plugin = hotkey_plugin.unwrap_or_else(|_| {
+        tauri_plugin_global_shortcut::Builder::new().build()
+    });
+
     tauri::Builder::default()
         // OC-20261118-001：单实例唤起控制页。必须第一个注册。
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             winplat::log::log("second instance: 唤起控制页");
             let _ = control::ensure_control_window(app);
         }))
+        // OC-20261118-003：全局逃生热键（注册失败也挂空插件，保持 handler 链稳定）。
+        .plugin(hotkey_plugin)
         // updater 只注册能力：`plugins.updater.endpoints` 为空且前端不主动 check()，
         // 因此默认零外联；签名公钥在 tauri.conf.json，私钥只在 CI secrets 里。
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -83,6 +108,8 @@ pub fn run() {
             island::ai::ai_test_connection,
             // 控制中心四开关（OC-20261118-002）
             control::api::control_get_state,
+            control::api::control_hotkey_status,
+            control::api::control_live_status,
             control::api::control_set_island,
             control::api::control_set_dock,
             control::api::control_set_icons,

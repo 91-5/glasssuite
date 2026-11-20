@@ -135,6 +135,23 @@ fn launch_shortcut_blocking(app: &tauri::AppHandle, path: &str) -> Result<(), St
         .and_then(|cfg| {
             crate::dock::find_shortcut_by_path(&cfg, path).and_then(|s| s.aumid.clone())
         });
+
+    // OC-20261118-003 §2.2：自身应用（GlassSuite）固定图标 → 唤起控制页。
+    // 自身窗口被 running.rs 排除（不进运行快照），activate_or_launch 必然落空回退
+    // ShellExecute 重启，导致"最小化后点 dock 打不开控制页"。这里在命令层特判：
+    // 能点 dock 就说明宿主在跑，直接幂等 ensure_control_window（不碰 006 快照逻辑）。
+    // 用 name 判定（大小写不敏感）；用户重命名该条目则自然退化为原行为。
+    let is_self = crate::dock::config_path(app)
+        .map(|p| crate::dock::load_config(&p))
+        .and_then(|cfg| crate::dock::find_shortcut_by_path(&cfg, path).cloned())
+        .map(|s| s.name.eq_ignore_ascii_case("GlassSuite"))
+        .unwrap_or(false);
+    if is_self {
+        winplat::log::log("dock click: GlassSuite 自身图标 → 唤起控制页");
+        let _ = crate::control::ensure_control_window(app);
+        return Ok(());
+    }
+
     crate::dock::activate_or_launch(&aumid, path)
 }
 

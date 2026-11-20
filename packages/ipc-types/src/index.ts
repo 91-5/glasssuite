@@ -85,6 +85,8 @@ export const COMMANDS = {
   debugNote: "debug_note",
   /** OC-20261118-002：控制中心四开关。 */
   controlGetState: "control_get_state",
+  controlHotkeyStatus: "control_hotkey_status",
+  controlLiveStatus: "control_live_status",
   controlSetIsland: "control_set_island",
   controlSetDock: "control_set_dock",
   controlSetIcons: "control_set_icons",
@@ -606,6 +608,23 @@ export interface ControlSettings {
 
 export async function controlGetState(): Promise<ControlSettings> {
   return invoke<ControlSettings>(COMMANDS.controlGetState);
+}
+
+/** OC-20261118-003 §2.1：逃生热键 Ctrl+Alt+G 是否注册成功。 */
+export async function controlHotkeyStatus(): Promise<boolean> {
+  return invoke<boolean>(COMMANDS.controlHotkeyStatus);
+}
+
+/** OC-20261118-003 §2.3：实况（实际桌面/窗口状态），用于对比意图告警。 */
+export interface ControlLiveStatus {
+  taskbarVisible: boolean;
+  iconsHidden: boolean;
+  islandVisible: boolean;
+  dockVisible: boolean;
+}
+
+export async function controlLiveStatus(): Promise<ControlLiveStatus> {
+  return invoke<ControlLiveStatus>(COMMANDS.controlLiveStatus);
 }
 
 async function setControlField(cmd: string, key: string, value: boolean): Promise<ControlSettings> {

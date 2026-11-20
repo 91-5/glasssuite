@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   controlGetState,
+  controlHotkeyStatus,
+  controlLiveStatus,
   controlSetDock,
   controlSetIcons,
   controlSetIsland,
   controlSetTaskbar,
+  type ControlLiveStatus,
   type ControlSettings,
 } from "@glasssuite/ipc-types";
 
 // OC-20261118-002：四开关接真实 IPC（写 settings.json + 生效）。
 // 语义：island/dock 是「开」，icons/taskbar 是「隐藏」（on=隐藏）。
+// OC-20261118-003：加热键状态 + 实况回显 + 全部恢复原生。
 type Key = "island" | "dock" | "icons" | "taskbar";
 
 const ROWS: { key: Key; title: string; subtitle: string }[] = [
@@ -43,17 +47,49 @@ function SwitchState(s: ControlSettings): Record<Key, boolean> {
   };
 }
 
+/** 意图 vs 实况是否背离（守卫没跑 / 权限不足时会出现）。 */
+function driftMessage(intent: ControlSettings, live: ControlLiveStatus | null): string | null {
+  if (!live) return null;
+  const bits: string[] = [];
+  if (intent.taskbarHidden === live.taskbarVisible) {
+    bits.push(live.taskbarVisible ? "任务栏仍可见" : "任务栏已隐藏");
+  }
+  if (intent.desktopIconsHidden !== live.iconsHidden) {
+    bits.push(live.iconsHidden ? "图标已隐藏" : "图标仍可见");
+  }
+  if (intent.islandEnabled !== live.islandVisible) {
+    bits.push(live.islandVisible ? "岛已显示" : "岛未显示");
+  }
+  if (intent.dockEnabled !== live.dockVisible) {
+    bits.push(live.dockVisible ? "Dock 已显示" : "Dock 未显示");
+  }
+  return bits.length ? `守卫未运行/权限不足，实际：${bits.join("、")}` : null;
+}
+
 export default function App() {
   const [state, setState] = useState<ControlSettings | null>(null);
+  const [live, setLive] = useState<ControlLiveStatus | null>(null);
+  const [hotkeyOk, setHotkeyOk] = useState<boolean | null>(null);
   const [busy, setBusy] = useState<Key | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // 首次加载：从后端读真实状态（非乐观），失败时给出可见错误而非假状态。
+  // 首次加载：读真实状态 + 实况 + 热键注册状态。
   useEffect(() => {
     controlGetState()
       .then(setState)
       .catch((e) => setError(`读取状态失败：${String(e)}`));
+    controlLiveStatus().then(setLive).catch(() => {});
+    controlHotkeyStatus().then(setHotkeyOk).catch(() => {});
   }, []);
+
+  // 切换后 2s 用实况校验（卡 §2.3）：守卫是否真的执行了意图。
+  useEffect(() => {
+    if (busy !== null) return;
+    const t = window.setTimeout(() => {
+      controlLiveStatus().then(setLive).catch(() => {});
+    }, 2000);
+    return () => window.clearTimeout(t);
+  }, [state, busy]);
 
   const apply = useCallback(async (key: Key, value: boolean) => {
     if (!state || busy) return;
@@ -79,16 +115,17 @@ export default function App() {
     }
   }, [state, busy]);
 
-  // 全部恢复默认 = 产品默认沉浸态（与 ControlSettings::default 一致）：
-  // 岛/Dock 开，图标/任务栏隐藏。想回系统原生请逐项关或点窗口 X 退出整个应用。
+  // OC-20261118-003 按卡 §2.3：「全部恢复默认」= 回原生桌面
+  // （岛/Dock 开、图标/任务栏显示）。这是藏光后的救急按钮。
+  // 注意与 002 旧实现的「回沉浸态」相反——卡面为准，已在评审单披露请 Agnes 裁定。
   const restoreAll = useCallback(async () => {
     setError(null);
     setBusy("island");
     try {
       let s = await controlSetIsland(true);
       s = await controlSetDock(true);
-      s = await controlSetIcons(true);
-      s = await controlSetTaskbar(true);
+      s = await controlSetIcons(false);   // 显示原生图标
+      s = await controlSetTaskbar(false); // 显示任务栏
       setState(s);
     } catch (e) {
       setError(`恢复默认失败：${String(e)}`);
@@ -99,6 +136,8 @@ export default function App() {
   }, []);
 
   const values = state ? SwitchState(state) : null;
+  const drift = state ? driftMessage(state, live) : null;
+  const hotkeyWarn = hotkeyOk === false;
 
   return (
     <div className="app">
@@ -109,6 +148,13 @@ export default function App() {
         </div>
         <div className="status">运行中</div>
       </header>
+
+      {hotkeyWarn && (
+        <div className="warn" role="alert">
+          逃生舱不可用（Ctrl+Alt+G 注册失败），请勿同时隐藏任务栏和桌面图标
+        </div>
+      )}
+      {drift && <div className="warn" role="alert">{drift}</div>}
 
       <main className="rows">
         {ROWS.map((r) => (
@@ -130,7 +176,7 @@ export default function App() {
         <button type="button" className="reset" onClick={restoreAll} disabled={busy !== null}>
           全部恢复默认
         </button>
-        <div className={`hint ${error ? "err" : ""}`}>
+        <div className={`hint ${error || drift ? "err" : ""}`}>
           {error ?? (state ? "点击开关即时生效" : "正在读取状态…")}
         </div>
       </footer>
