@@ -9,7 +9,7 @@
 //! - 只取收集到的**第一段文本**作标题，其余正文不进入数据结构、不进日志。
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc::Sender, Arc, Mutex};
 use std::time::Duration;
 
@@ -54,7 +54,7 @@ fn toast_size_ok(w: i32, h: i32) -> bool {
     w > 0 && h > 0 && w <= MAX_TOAST_W && h <= MAX_TOAST_H
 }
 
-pub fn spawn(tx: Sender<RawNotification>, enabled: bool, stop: Arc<AtomicBool>) -> bool {
+pub fn spawn(tx: Sender<RawNotification>, enabled: bool, running: Arc<AtomicBool>) -> bool {
     if !enabled {
         winplat::log::log("notifications: uia source disabled by config count=0");
         return false;
@@ -70,7 +70,7 @@ pub fn spawn(tx: Sender<RawNotification>, enabled: bool, stop: Arc<AtomicBool>) 
             match automation {
                 Ok(a) => {
                     winplat::log::log("notifications: uia source started count=1");
-                    poll(a, tx, stop);
+                    poll(a, tx, running);
                 }
                 Err(_) => {
                     winplat::log::log("notifications: uia source unavailable, degraded count=1")
@@ -80,11 +80,11 @@ pub fn spawn(tx: Sender<RawNotification>, enabled: bool, stop: Arc<AtomicBool>) 
         .is_ok()
 }
 
-fn poll(automation: IUIAutomation, tx: Sender<RawNotification>, stop: Arc<AtomicBool>) {
+fn poll(automation: IUIAutomation, tx: Sender<RawNotification>, running: Arc<AtomicBool>) {
     let seen = Mutex::new(HashSet::<String>::new());
     loop {
-        if stop.load(Ordering::Relaxed) {
-            break; // 总开关热停（OC-20261113-001 P2）
+        if super::source_should_stop(&running) {
+            break; // 总开关热停（OC-20261113-001 P2；极性修于 OC-20261121-002）
         }
         let ctx = PollCtx {
             automation: &automation,

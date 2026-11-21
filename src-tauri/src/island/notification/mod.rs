@@ -114,6 +114,16 @@ impl NotificationState {
     }
 }
 
+/// 采集源统一的「是否应停机」判据（OC-20261121-002）。
+///
+/// 旗的语义只有一种：`running=true` 表示域在运行。源线程应持续工作到
+/// 旗变 false（热停）。集中成纯函数，避免各源各写一次 `if flag.load()` 时
+/// 把极性写反——那正是 3fe73e0 引入、导致 db/uia/listener 启动即自停的 bug。
+#[inline]
+pub(crate) fn source_should_stop(running: &AtomicBool) -> bool {
+    !running.load(Ordering::Relaxed)
+}
+
 /// 启动通知功能域。`enabled=false` 时**完全不启动任何线程、零监听**（红线 B3）。
 pub fn spawn(handle: AppHandle, cfg: NotificationConfig, state: Arc<NotificationState>) {
     if !cfg.enabled {
@@ -167,11 +177,12 @@ fn run_aggregator<R: tauri::Runtime>(
 ) {
     let (tx, rx) = mpsc::channel::<RawNotification>();
 
-    // 采集源直接观察 running 旗：热停时各自在下一个检查点退出。
-    let source_stop = Arc::clone(&state.running);
-    let db_started = db::spawn(tx.clone(), Arc::clone(&source_stop));
-    let listener_started = listener::spawn(tx.clone(), Arc::clone(&source_stop));
-    let uia_started = uia::spawn(tx.clone(), cfg.uia_fallback, source_stop);
+    // 采集源直接观察 running 旗（true=运行）：热停时旗变 false，各自在下一个检查点退出。
+    // OC-20261121-002：参数名从 source_stop 改为 running，杜绝「名叫 stop、值是 true」的极性陷阱。
+    let running = Arc::clone(&state.running);
+    let db_started = db::spawn(tx.clone(), Arc::clone(&running));
+    let listener_started = listener::spawn(tx.clone(), Arc::clone(&running));
+    let uia_started = uia::spawn(tx.clone(), cfg.uia_fallback, running);
     // ingest 的停机旗 = NotificationState.ingest_shutdown 本体（同一把 Arc）：
     // 热停置位后 accept 循环退出、TcpListener drop、端口即刻解绑。
     let ingest = ingest::spawn(tx, Arc::clone(&state.ingest_shutdown));
@@ -281,6 +292,23 @@ mod tests {
         assert!(
             st.ingest_shutdown.load(Ordering::Relaxed),
             "停机必须同时停 ingest"
+        );
+    }
+
+    /// OC-20261121-002：采集源停机判据极性回归锁。
+    /// running=true（域在跑）→ 源必须继续；running=false（热停）→ 源退出。
+    /// 旧实现三源写反成 `if stop.load() break`，启动即自停，此测试在改造前会失败。
+    #[test]
+    fn source_should_stop_polarity() {
+        let running = AtomicBool::new(true);
+        assert!(
+            !super::source_should_stop(&running),
+            "running=true 表示在运行，不应停机"
+        );
+        running.store(false, Ordering::Relaxed);
+        assert!(
+            super::source_should_stop(&running),
+            "running=false 表示热停，应退出"
         );
     }
 }

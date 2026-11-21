@@ -127,7 +127,7 @@ struct Mark {
     id: i64,
 }
 
-pub fn spawn(tx: Sender<RawNotification>, stop: Arc<AtomicBool>) -> bool {
+pub fn spawn(tx: Sender<RawNotification>, running: Arc<AtomicBool>) -> bool {
     let Some(dir) = db_dir() else {
         winplat::log::log("notifications: db source unavailable (no LOCALAPPDATA)");
         return false;
@@ -149,11 +149,11 @@ pub fn spawn(tx: Sender<RawNotification>, stop: Arc<AtomicBool>) -> bool {
             winplat::log::log("notifications: db source started count=1");
 
             loop {
-                if stop.load(Ordering::Relaxed) {
-                    break; // 总开关热停（OC-20261113-001 P2）
+                if super::source_should_stop(&running) {
+                    break; // 总开关热停（OC-20261113-001 P2；极性修于 OC-20261121-002）
                 }
                 std::thread::sleep(POLL);
-                if stop.load(Ordering::Relaxed) {
+                if super::source_should_stop(&running) {
                     break;
                 }
                 let current_wal = wal_stamp(&dir);
