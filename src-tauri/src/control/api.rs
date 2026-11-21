@@ -84,6 +84,20 @@ pub fn control_live_status(app: AppHandle) -> ControlLiveStatus {
     #[cfg(not(windows))]
     let icons_hidden = false;
 
+    // OC-20261121-007：实况必须用 Win32 IsWindowVisible(hwnd)，不能用 Tauri
+    // WebviewWindow::is_visible()。dock 窗口创建时 show:false，之后靠 dock_logic /
+    // lib.rs 的 Win32 ShowWindow 显隐；Tauri 内部可见标志不会同步这个外部调用，
+    // 导致 is_visible() 恒返回 false → 控制页误报「Dock 未显示」。island 也会被
+    // apply_styles_noactivate 等 Win32 操作改写属性，口径统一走 hwnd 最稳。
+    #[cfg(windows)]
+    let win_visible = |label: &str| {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+        app.get_webview_window(label)
+            .and_then(|w| w.hwnd().ok())
+            .map(|h| unsafe { IsWindowVisible(h).as_bool() })
+            .unwrap_or(false)
+    };
+    #[cfg(not(windows))]
     let win_visible = |label: &str| {
         app.get_webview_window(label)
             .and_then(|w| w.is_visible().ok())
