@@ -64,27 +64,11 @@ pub fn run() {
     let shared = Arc::new(state::SharedState::default());
 
     // OC-20261118-003 §2.1：全局逃生热键 Ctrl+Alt+G。全藏任务栏/图标后唯一的键盘入口。
-    // with_shortcut 解析失败（组合串非法）视为未注册；真正的"被占用"失败发生在插件 setup
-    // 注册到系统时——两者都通过 set_hotkey_registered(false) 让控制页告警。
-    let hotkey_plugin = tauri_plugin_global_shortcut::Builder::new()
-        .with_shortcut("ctrl+alt+g")
-        .and_then(|b| {
-            Ok(b.with_handler(|app, _sc, ev| {
-                if ev.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                    winplat::log::log("逃生热键 Ctrl+Alt+G 触发：唤起控制页");
-                    let _ = control::ensure_control_window(app);
-                }
-            }))
-        })
-        .map(|b| b.build());
-    let hotkey_ok = hotkey_plugin.is_ok();
-    control::state::set_hotkey_registered(hotkey_ok);
-    if !hotkey_ok {
-        winplat::log::log("逃生热键 Ctrl+Alt+G 注册失败（组合非法）：控制页将告警");
-    }
-    let hotkey_plugin = hotkey_plugin.unwrap_or_else(|_| {
-        tauri_plugin_global_shortcut::Builder::new().build()
-    });
+    // 注册放在 setup 里用 `on_shortcut`（返回 Result，可捕获），**不用 Builder::with_shortcut**——
+    // 后者把 OS 级注册错误装进 plugin.setup 的 `?`，会让 tauri build() 返回 Err；
+    // 若再被 unwrap_or_else(panic) 放大就是全 app 崩溃（2026-11-21 真机实测：ctrl+alt+g
+    // 被占用 → 整个 app 起不来，桌面回原生态）。现在占用只降级为"告警 + 热键不工作"。
+    let hotkey_plugin = tauri_plugin_global_shortcut::Builder::new().build();
 
     tauri::Builder::default()
         // OC-20261118-001：单实例唤起控制页。必须第一个注册。
@@ -157,6 +141,30 @@ pub fn run() {
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+
+            // OC-20261118-003 §2.1：在 setup 里注册逃生热键（见上方 build 处说明）。
+            // on_shortcut 返回 Result：占用/失败只记日志 + 置标志让控制页告警，绝不 panic。
+            {
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+                let reg = app.global_shortcut().on_shortcut("ctrl+alt+g", |app, _sc, ev| {
+                    if ev.state == ShortcutState::Pressed {
+                        winplat::log::log("逃生热键 Ctrl+Alt+G 触发：唤起控制页");
+                        let _ = control::ensure_control_window(app);
+                    }
+                });
+                match reg {
+                    Ok(()) => {
+                        control::state::set_hotkey_registered(true);
+                        winplat::log::log("逃生热键 Ctrl+Alt+G 注册成功");
+                    }
+                    Err(e) => {
+                        control::state::set_hotkey_registered(false);
+                        winplat::log::log(&format!(
+                            "逃生热键 Ctrl+Alt+G 注册失败（被占用/无效）：控制页将告警，app 正常运行: {e}"
+                        ));
+                    }
+                }
+            }
 
             // 配置先于窗口：窗口尺寸/内容依赖配置（例如天气是否显示）。
             // 放进 Mutex 是因为 settings_update 要整体替换它（前端保存即生效）。
