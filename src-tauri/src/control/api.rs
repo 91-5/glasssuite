@@ -22,7 +22,11 @@ pub fn control_hotkey_status() -> bool {
 
 /// OC-20261118-003 §2.3：实况回显——返回"实际"桌面/窗口状态，供控制页对比"意图"告警。
 /// 与 control_get_state（意图）分开：守卫没跑/权限不足时两者会背离，控制页据此橙色告警。
+// OC-20261121-008：必须 camelCase，否则前端 ControlLiveStatus interface 读
+// iconsHidden/islandVisible/dockVisible 全是 undefined → driftMessage 三项恒报
+// 「图标仍可见/岛未显示/Dock未显示」误报。与 ControlSettings 的 rename_all 口径一致。
 #[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ControlLiveStatus {
     /// 主屏任务栏是否真的可见（IsWindowVisible(Shell_TrayWnd)）。
     pub taskbar_visible: bool,
@@ -202,5 +206,24 @@ mod tests {
         assert!(c.dock_enabled, "Dock 默认开");
         assert!(c.desktop_icons_hidden, "沉浸态默认：桌面图标隐藏");
         assert!(c.taskbar_hidden, "沉浸态默认：任务栏隐藏");
+    }
+
+    #[test]
+    fn control_live_status_serializes_camel_case_keys() {
+        // OC-20261121-008：前端 interface 读 camelCase；snake_case 会让
+        // driftMessage 三项恒报误报。锁死序列化键名，防回归。
+        let live = ControlLiveStatus {
+            taskbar_visible: false,
+            icons_hidden: true,
+            island_visible: true,
+            dock_visible: true,
+        };
+        let json = serde_json::to_value(&live).unwrap();
+        let obj = json.as_object().unwrap();
+        for key in ["taskbarVisible", "iconsHidden", "islandVisible", "dockVisible"] {
+            assert!(obj.contains_key(key), "缺少 camelCase 键 {key}: {obj:?}");
+        }
+        assert!(!obj.contains_key("icons_hidden"), "不得输出 snake_case");
+        assert_eq!(obj["iconsHidden"], serde_json::json!(true));
     }
 }
