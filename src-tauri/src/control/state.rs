@@ -32,8 +32,8 @@ pub struct IntentFlags {
 
 static FLAGS: OnceLock<Mutex<IntentFlags>> = OnceLock::new();
 
-/// OC-20261118-003：全局逃生热键 Ctrl+Alt+G 是否注册成功。
-/// 注册失败（被占用）时控制页要显式告警——全藏任务栏/图标后无键盘入口。
+/// OC-20261118-003 / OC-20261121-003：全局逃生热键是否注册成功（多候选其一）。
+/// 注册失败（候选全被占用）时控制页要显式告警——全藏任务栏/图标后无键盘入口。
 static HOTKEY_REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_hotkey_registered(ok: bool) {

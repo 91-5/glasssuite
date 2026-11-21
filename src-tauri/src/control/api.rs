@@ -13,7 +13,7 @@ pub fn control_get_state(store: State<'_, std::sync::Mutex<Settings>>) -> Contro
     store.lock().unwrap().control.clone()
 }
 
-/// OC-20261118-003 §2.1：逃生热键 Ctrl+Alt+G 是否注册成功。
+/// OC-20261118-003 / OC-20261121-003 §2.1：逃生热键（多候选其一）是否注册成功。
 /// 控制页首次加载查询；false 时显式告警"逃生舱不可用，请勿同时隐藏任务栏和桌面图标"。
 #[tauri::command]
 pub fn control_hotkey_status() -> bool {

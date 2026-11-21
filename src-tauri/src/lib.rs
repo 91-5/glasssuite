@@ -63,7 +63,8 @@ pub fn run() {
 
     let shared = Arc::new(state::SharedState::default());
 
-    // OC-20261118-003 §2.1：全局逃生热键 Ctrl+Alt+G。全藏任务栏/图标后唯一的键盘入口。
+    // OC-20261118-003 §2.1 / OC-20261121-003：全局逃生热键（首选 Ctrl+Alt+H，
+    // 占用时依次回退 Ctrl+Alt+K / Ctrl+Alt+J）。全藏任务栏/图标后唯一的键盘入口。
     // 注册放在 setup 里用 `on_shortcut`（返回 Result，可捕获），**不用 Builder::with_shortcut**——
     // 后者把 OS 级注册错误装进 plugin.setup 的 `?`，会让 tauri build() 返回 Err；
     // 若再被 unwrap_or_else(panic) 放大就是全 app 崩溃（2026-11-21 真机实测：ctrl+alt+g
@@ -144,24 +145,36 @@ pub fn run() {
 
             // OC-20261118-003 §2.1：在 setup 里注册逃生热键（见上方 build 处说明）。
             // on_shortcut 返回 Result：占用/失败只记日志 + 置标志让控制页告警，绝不 panic。
+            // OC-20261121-003：改为多候选依次尝试，首个注册成功者生效——单一组合被占用
+            // 就彻底没有逃生入口是安全隐患（浮香 #8 advisory），换键 + fallback 一并根治。
             {
                 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
-                let reg = app.global_shortcut().on_shortcut("ctrl+alt+g", |app, _sc, ev| {
-                    if ev.state == ShortcutState::Pressed {
-                        winplat::log::log("逃生热键 Ctrl+Alt+G 触发：唤起控制页");
-                        let _ = control::ensure_control_window(app);
+                // H=Hide 首选；K/J 作后备。均为本机实测空闲组合（2026-11-21）。
+                const CANDIDATES: [&str; 3] = ["ctrl+alt+h", "ctrl+alt+k", "ctrl+alt+j"];
+                let mut registered: Option<&str> = None;
+                for combo in CANDIDATES {
+                    let reg = app.global_shortcut().on_shortcut(combo, |app, _sc, ev| {
+                        if ev.state == ShortcutState::Pressed {
+                            // 不写死键名：闭包不捕获循环变量，避免 'static 生命周期问题。
+                            winplat::log::log("逃生热键触发：唤起控制页");
+                            let _ = control::ensure_control_window(app);
+                        }
+                    });
+                    if reg.is_ok() {
+                        registered = Some(combo);
+                        break;
                     }
-                });
-                match reg {
-                    Ok(()) => {
+                }
+                match registered {
+                    Some(combo) => {
                         control::state::set_hotkey_registered(true);
-                        winplat::log::log("逃生热键 Ctrl+Alt+G 注册成功");
+                        winplat::log::log(&format!("逃生热键 {combo} 注册成功"));
                     }
-                    Err(e) => {
+                    None => {
                         control::state::set_hotkey_registered(false);
-                        winplat::log::log(&format!(
-                            "逃生热键 Ctrl+Alt+G 注册失败（被占用/无效）：控制页将告警，app 正常运行: {e}"
-                        ));
+                        winplat::log::log(
+                            "逃生热键注册失败（三个候选均被占用/无效）：控制页将告警，app 正常运行",
+                        );
                     }
                 }
             }
