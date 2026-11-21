@@ -152,7 +152,9 @@ fn launch_shortcut_blocking(app: &tauri::AppHandle, path: &str) -> Result<(), St
         return Ok(());
     }
 
-    crate::dock::activate_or_launch(&aumid, path)
+    // OC-20261121-001：枚举/解析仍在 blocking 线程；仅窗口置前由底层投递主线程，
+    // 规避 Windows 前台锁（工作线程 SetForegroundWindow 会被静默拒绝）。
+    crate::dock::activate_or_launch(&aumid, path, Some(app))
 }
 
 /// 任务 B：悬停预览显示（前端悬停图标 ≥300ms 后调用）。
@@ -392,13 +394,15 @@ pub fn pin_transient(app: tauri::AppHandle, key: String) -> Result<crate::dock::
 /// 前台切换 + 可能的 ShellExecute 兜底，全部在阻塞线程池跑）。
 #[tauri::command]
 pub async fn transient_activate(
+    app: tauri::AppHandle,
     key: String,
     path: String,
     aumid: Option<String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _ = key; // key 主要供前端标识；激活走与固定条目同一条 activate_or_launch 通路
-        crate::dock::transient_activate(&aumid, &path)
+        // OC-20261121-001：仅窗口置前由底层投递主线程，规避工作线程前台锁。
+        crate::dock::transient_activate(&aumid, &path, Some(&app))
     })
     .await
     .map_err(|e| format!("transient activate task join failed: {e}"))?
@@ -423,10 +427,15 @@ mod launch_tests {
     fn already_running_activates_without_launch() {
         static LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let r =
-            crate::dock::activate_or_launch_decide(Some((1234, false)), "C:\\anything.exe", |_| {
-                LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            });
+            crate::dock::activate_or_launch_decide(
+                Some((1234, false)),
+                "C:\\anything.exe",
+                |_| {
+                    LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                },
+                |_, _| {}, // 置前注入：测试用空闭包，证实纯 Win32 契约不依赖 AppHandle
+            );
         assert!(r.is_ok());
         assert_eq!(
             LAUNCHES.load(std::sync::atomic::Ordering::Relaxed),

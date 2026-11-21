@@ -782,46 +782,64 @@ pub fn launch(path: &str) -> Result<(), String> {
 /// 单实例转发去恢复窗口，比系统任务栏（直接 `ShowWindow(SW_RESTORE)`）明显慢。
 /// 这里复用运行指示已有的 `running::find_window_for_key`（同一套 key 体系），
 /// 命中就直接还原并置前；未命中才回退 `launch`。
-pub fn activate_or_launch(aumid: &Option<String>, path: &str) -> Result<(), String> {
+pub fn activate_or_launch(
+    aumid: &Option<String>,
+    path: &str,
+    app: Option<&tauri::AppHandle>,
+) -> Result<(), String> {
     let key = crate::dock::running::key_for_shortcut(aumid, path);
     let found = crate::dock::running::find_window_for_key(&key);
-    activate_or_launch_decide(found, path, launch)
+    let foreground = move |src: isize, minimized: bool| foreground_for_click(src, minimized, app);
+    activate_or_launch_decide(found, path, launch, foreground)
 }
 
 /// 决策与执行分离（005 A1 注入点）：`found` 由调用方给（生产 = EnumWindows 匹配，
-/// 测试 = 直接构造），启动动作用闭包注入（生产 = ShellExecuteW，测试 = 计数器）。
+/// 测试 = 直接构造），启动动作用闭包注入（生产 = ShellExecuteW，测试 = 计数器），
+/// 置前动作用闭包注入（生产 = 主线程投递，测试 = 空闭包）。
 /// 已在运行（found=Some）→ 只激活、**不启新实例**。
 fn activate_or_launch_decide(
     found: Option<(isize, bool)>,
     path: &str,
     do_launch: impl FnOnce(&str) -> Result<(), String>,
+    do_foreground: impl FnOnce(isize, bool),
 ) -> Result<(), String> {
     match found {
         Some((src, minimized)) => {
-            activate_window(src, minimized);
+            do_foreground(src, minimized);
             Ok(())
         }
         None => do_launch(path),
     }
 }
 
-/// 还原最小化 + 置前（activate_or_launch 专用；preview 行点击有自己的副本）。
-fn activate_window(src: isize, minimized: bool) {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
+/// 还原最小化 + 置前的**纯 Win32 原语**：不依赖 AppHandle，可在任意线程直调。
+/// `app=Some` 时由调用方投递到主线程执行，`app=None` 时直调（供测试/兜底）。
+/// OC-20261121-001：SetForegroundWindow 从 spawn_blocking 工作线程挪到主线程，
+/// 规避 Windows 前台锁——工作线程非前台线程，置前请求会被静默拒绝。
+fn foreground_for_click(src: isize, minimized: bool, app: Option<&tauri::AppHandle>) {
+    let do_it = move || {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
+        };
+        let hwnd = HWND(src as *mut c_void);
+        unsafe {
+            if minimized {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            // 前台锁：主线程是收到点击的前台线程，SetForegroundWindow 通常成功；
+            // 被系统拒绝（返回 0）时退回 SwitchToThisWindow（无需 AttachThreadInput 的
+            // 额外 feature，也不改动目标线程输入队列）。
+            if !SetForegroundWindow(hwnd).as_bool() {
+                SwitchToThisWindow(hwnd, true);
+            }
+        }
     };
-    let hwnd = HWND(src as *mut c_void);
-    unsafe {
-        if minimized {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+    match app {
+        Some(app) => {
+            let _ = app.run_on_main_thread(do_it);
         }
-        // 前台锁：用户刚点了 dock（本进程即前台），一次 SetForegroundWindow 通常够；
-        // 被系统拒绝（返回 0）时退回 SwitchToThisWindow（无需 AttachThreadInput 的
-        // 额外 feature，也不改动目标线程输入队列）。
-        if !SetForegroundWindow(hwnd).as_bool() {
-            SwitchToThisWindow(hwnd, true);
-        }
+        None => do_it(),
     }
 }
 
@@ -1523,12 +1541,11 @@ pub fn pin_transient_key(cfg_path: &Path, key: &str) -> Result<Shortcut, String>
 
 /// 单击临时图标 → 激活该应用（复用 activate_or_launch 的 find_window_for_key 快路径；
 /// 临时条目必然在运行，快路径命中，launch 只是类型完备的兜底）。
-pub fn transient_activate(aumid: &Option<String>, path: &str) -> Result<(), String> {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        SetForegroundWindow, ShowWindow, SwitchToThisWindow, SW_RESTORE,
-    };
-
+pub fn transient_activate(
+    aumid: &Option<String>,
+    path: &str,
+    app: Option<&tauri::AppHandle>,
+) -> Result<(), String> {
     // OC-20261115-003 D4：同一应用多窗口已合并成一条临时图标；
     // 全部最小化 → 还原最前那一个，否则把最前的可见窗口置前。
     let key = crate::dock::running::key_for_shortcut(aumid, path);
@@ -1541,19 +1558,12 @@ pub fn transient_activate(aumid: &Option<String>, path: &str) -> Result<(), Stri
             wins.iter().find(|(_, m)| !*m).or_else(|| wins.first())
         };
         if let Some((raw, _)) = target {
-            let hwnd = HWND(*raw as *mut c_void);
-            unsafe {
-                if all_minimized {
-                    let _ = ShowWindow(hwnd, SW_RESTORE);
-                }
-                if !SetForegroundWindow(hwnd).as_bool() {
-                    SwitchToThisWindow(hwnd, true);
-                }
-            }
+            // OC-20261121-001：置前投递主线程，规避工作线程前台锁。
+            foreground_for_click(*raw, all_minimized, app);
             return Ok(());
         }
     }
-    activate_or_launch(aumid, path)
+    activate_or_launch(aumid, path, app)
 }
 
 // ---------------------------------------------------------------------------
@@ -1901,6 +1911,33 @@ mod transient_tests {
         // 没有对应 AUMID 时 exe 条目原样保留
         let plain = merge_alias_keys(vec!["exe:d:\\other\\app.exe".to_string()], &aliases);
         assert_eq!(plain.len(), 1);
+    }
+
+    /// OC-20261121-001：置前动作可注入（测试用闭包捕获，无 AppHandle）。
+    /// found=Some 时只走置前闭包、不启新实例，且 hwnd/minimized 正确透传。
+    #[test]
+    fn activate_decide_foreground_is_injectable_off_main_thread() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static FG: AtomicUsize = AtomicUsize::new(0);
+        static LAUNCH: AtomicUsize = AtomicUsize::new(0);
+        FG.store(0, Ordering::Relaxed);
+        LAUNCH.store(0, Ordering::Relaxed);
+        let r = activate_or_launch_decide(
+            Some((4242, true)),
+            "C:\\anything.exe",
+            |_| {
+                LAUNCH.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            |src, minimized| {
+                assert_eq!(src, 4242, "hwnd 应透传");
+                assert!(minimized, "minimized 应透传");
+                FG.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        assert!(r.is_ok());
+        assert_eq!(FG.load(Ordering::Relaxed), 1, "置前闭包应被调用一次");
+        assert_eq!(LAUNCH.load(Ordering::Relaxed), 0, "已运行不得启新实例");
     }
 }
 
