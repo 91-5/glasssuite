@@ -172,6 +172,33 @@ fn collect_rows(key: &str) -> Vec<PreviewWin> {
     truncate_rows(rows)
 }
 
+/// OC-20261121-005：自身 fixed 图标（GlassSuite）的预览行。
+/// 自身窗口被 running.rs:516 排除（不进运行快照），故不能走 collect_rows/windows_for_key。
+/// 改从 AppHandle 管理的窗口 label 直接取句柄：只列岛 + 控制中心（sir 拍板范围），
+/// dock/startmenu 是悬浮操作的载体，列入会自我套娃。完全不碰 running.rs。
+fn collect_self_rows(app: &tauri::AppHandle) -> Vec<PreviewWin> {
+    let mut rows: Vec<PreviewWin> = Vec::new();
+    for (label, title) in [("island", "灵动岛"), ("control", "控制中心")] {
+        let Some(win) = app.get_webview_window(label) else {
+            continue;
+        };
+        if !win.is_visible().unwrap_or(false) {
+            continue;
+        }
+        let Ok(h) = win.hwnd() else {
+            continue;
+        };
+        let src = h.0 as isize;
+        let minimized = unsafe { IsIconic(HWND(src as *mut c_void)) }.as_bool();
+        rows.push(PreviewWin {
+            src,
+            title: title.to_string(),
+            degraded: degrade_reason(src, minimized),
+        });
+    }
+    rows
+}
+
 /// 解析悬停的快捷方式 → **全部**匹配窗口 → 投递 Show（007 多窗口预览）。
 /// 由 Tauri 命令调用（lib.rs `preview_show`）。
 /// `x/y/w/h` 为图标按钮矩形（CSS px，前端 getBoundingClientRect）。
@@ -204,9 +231,17 @@ pub fn show_for(
     let cx = pos.x + ((x + w / 2.0) * scale as f64) as i32;
     let top = pos.y + (y * scale as f64) as i32;
 
-    // 源窗口：全部可见匹配（复用任务 A 的 key 体系），z 序最前在前
-    let key = crate::dock::running::key_for_shortcut(&sc.aumid, &sc.path);
-    let rows = collect_rows(&key);
+    // OC-20261121-005：自身 fixed 图标（GlassSuite）→ 从 AppHandle 管理的窗口取预览行。
+    // 自身窗口被 running.rs 排除，走 key/collect_rows 必然空；用 name 判定（大小写不敏感），
+    // 用户重命名该条目则自然退化为原行为（同 api.rs:147 的自身判定口径）。
+    let is_self = sc.name.eq_ignore_ascii_case("GlassSuite");
+    let rows = if is_self {
+        collect_self_rows(app)
+    } else {
+        // 源窗口：全部可见匹配（复用任务 A 的 key 体系），z 序最前在前
+        let key = crate::dock::running::key_for_shortcut(&sc.aumid, &sc.path);
+        collect_rows(&key)
+    };
     if rows.is_empty() {
         log(&format!(
             "show id={id} name='{}' -> no matching window, no preview",
