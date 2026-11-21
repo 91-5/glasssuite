@@ -352,7 +352,7 @@ fn dock_setup(handle: &tauri::AppHandle) {
 
     // 预览渲染进程：读 dock.json 同级目录的图标缓存。
     if let Some(dir) = dock::config_path(handle).and_then(|p| p.parent().map(|d| d.to_path_buf())) {
-        dock::preview::spawn(dir);
+        dock::preview::spawn(handle.clone(), dir);
     }
 
     // 开始菜单数据源。

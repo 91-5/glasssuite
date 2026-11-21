@@ -117,15 +117,21 @@ enum Cmd {
 static SENDER: LazyLock<Mutex<Option<std::sync::mpsc::Sender<Cmd>>>> =
     LazyLock::new(|| Mutex::new(None));
 static LOG_PATH: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
+/// OC-20261121-006：预览线程点击格时的置前需投递主线程（避 Windows 前台锁）。
+/// wndproc 是独立 extern fn 拿不到线程局部 AppHandle，故存 static（AppHandle: Clone+Send+Sync+'static）。
+static APP_HANDLE: LazyLock<Mutex<Option<tauri::AppHandle>>> = LazyLock::new(|| Mutex::new(None));
 
 /// 启动预览线程。`log_dir` 为应用数据目录（preview.log 落这里）。
-pub fn spawn(log_dir: PathBuf) {
+pub fn spawn(app: tauri::AppHandle, log_dir: PathBuf) {
     let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
     if let Ok(mut g) = SENDER.lock() {
         *g = Some(tx);
     }
     if let Ok(mut g) = LOG_PATH.lock() {
         *g = Some(log_dir.join("preview.log"));
+    }
+    if let Ok(mut g) = APP_HANDLE.lock() {
+        *g = Some(app);
     }
     let _ = std::thread::Builder::new()
         .name("glassdesk-preview".into())
@@ -899,8 +905,17 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                 src.map(|s| format!("0x{:x}", s)).unwrap_or_else(|| "NONE".into())
             ));
             if let Some(src) = src {
-                unsafe { activate_window(src) };
-                log(&format!("activate called src=0x{:x}", src));
+                // OC-20261121-006：置前调用投递主线程，规避预览线程（非前台线程）
+                // 的 Windows 前台锁——与 dock 点击 OC-001 同方案。activate_window
+                // 的 Win32 逻辑与诊断日志原样保留，仅换执行线程；src: isize 是 Copy，
+                // 闭包 'static 安全。AppHandle 缺失时（理论不会发生）降级直调兜底。
+                let app = APP_HANDLE.lock().ok().and_then(|g| g.clone());
+                if let Some(app) = app {
+                    let _ = app.run_on_main_thread(move || unsafe { activate_window(src) });
+                } else {
+                    unsafe { activate_window(src) };
+                }
+                log(&format!("activate dispatched src=0x{:x}", src));
             }
             // 经 Cmd::Hide 让预览线程自行销毁（wndproc 无 ThreadState 上下文）
             send(Cmd::Hide);
