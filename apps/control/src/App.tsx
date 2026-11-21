@@ -13,7 +13,7 @@ import {
 
 // OC-20261118-002：四开关接真实 IPC（写 settings.json + 生效）。
 // 语义：island/dock 是「开」，icons/taskbar 是「隐藏」（on=隐藏）。
-// OC-20261118-003：加热键状态 + 实况回显 + 全部恢复原生。
+// OC-20261118-003：加热键状态 + 实况回显。OC-20261121-004：裁撤冗余的全部恢复按钮。
 type Key = "island" | "dock" | "icons" | "taskbar";
 
 const ROWS: { key: Key; title: string; subtitle: string }[] = [
@@ -115,26 +115,6 @@ export default function App() {
     }
   }, [state, busy]);
 
-  // OC-20261118-003 按卡 §2.3：「全部恢复默认」= 回原生桌面
-  // （岛/Dock 开、图标/任务栏显示）。这是藏光后的救急按钮。
-  // 注意与 002 旧实现的「回沉浸态」相反——卡面为准，已在评审单披露请 Agnes 裁定。
-  const restoreAll = useCallback(async () => {
-    setError(null);
-    setBusy("island");
-    try {
-      let s = await controlSetIsland(true);
-      s = await controlSetDock(true);
-      s = await controlSetIcons(false);   // 显示原生图标
-      s = await controlSetTaskbar(false); // 显示任务栏
-      setState(s);
-    } catch (e) {
-      setError(`恢复默认失败：${String(e)}`);
-      controlGetState().then(setState).catch(() => {});
-    } finally {
-      setBusy(null);
-    }
-  }, []);
-
   const values = state ? SwitchState(state) : null;
   const drift = state ? driftMessage(state, live) : null;
   const hotkeyWarn = hotkeyOk === false;
@@ -151,7 +131,7 @@ export default function App() {
 
       {hotkeyWarn && (
         <div className="warn" role="alert">
-          逃生舱不可用（Ctrl+Alt+G 注册失败），请勿同时隐藏任务栏和桌面图标
+          逃生舱不可用（逃生热键注册失败），请勿同时隐藏任务栏和桌面图标
         </div>
       )}
       {drift && <div className="warn" role="alert">{drift}</div>}
@@ -173,9 +153,6 @@ export default function App() {
       </main>
 
       <footer className="foot">
-        <button type="button" className="reset" onClick={restoreAll} disabled={busy !== null}>
-          全部恢复默认
-        </button>
         <div className={`hint ${error || drift ? "err" : ""}`}>
           {error ?? (state ? "点击开关即时生效" : "正在读取状态…")}
         </div>

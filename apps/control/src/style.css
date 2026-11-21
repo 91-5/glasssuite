@@ -42,12 +42,6 @@ body { background: #f5f6f8; color: #1c1f24; }
 .switch.off .knob { transform: translateX(0); }
 
 .foot { display: flex; flex-direction: column; gap: 8px; align-items: center; }
-.reset {
-  width: 100%; padding: 11px; border: 1px solid #dcdfe5; border-radius: 10px;
-  background: #fff; font-size: 14px; font-weight: 600; cursor: pointer; color: #3a3f47;
-}
-.reset:hover { background: #f0f1f4; }
-.reset:disabled { opacity: .5; cursor: default; }
 .hint { font-size: 11px; color: #a6acb5; }
 .hint.err { color: #d13438; }
 /* OC-20261118-003 §2.3：热键注册失败 / 意图实况背离的橙色告警条 */
