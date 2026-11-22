@@ -1,8 +1,0 @@
-chore(ci): 修 fmt/clippy 阻塞以满足发版门禁
-
-cargo fmt --check 失败(preview.rs 等4文件格式) + clippy -D warnings 失败
-(dock/api.rs:358 未使用 PhysicalPosition import) —— 这是历史 CI run 全 failure
-的根因，会阻塞 v0.1.5 发版(check job 不过则 build job 不执行)。
-
-修：cargo fmt --all 格式化4文件 + 删未使用 import。纯格式/清理，零逻辑变化。
-验证：fmt --check 0 / clippy -D warnings 0 / cargo test 全绿 / pnpm check 0 / pnpm build Done。
