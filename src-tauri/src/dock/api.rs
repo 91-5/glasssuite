@@ -355,7 +355,7 @@ pub fn fit_dock(
 
 /// 真正的几何写入（主线程执行）。锁期间只允许经 flush 走到这里。
 pub(crate) fn apply_fit_dock(window: &tauri::WebviewWindow, w: f64, h: f64) -> Result<(), String> {
-    use tauri::{LogicalSize, PhysicalPosition};
+    use tauri::LogicalSize;
     let w = w.max(120.0);
     let h = h.max(48.0);
     // 2026-11-16 修复（dock 整体不可见，OC-20261116-001）：旧实现在这里用
@@ -401,7 +401,7 @@ pub async fn transient_activate(
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _ = key; // key 主要供前端标识；激活走与固定条目同一条 activate_or_launch 通路
-        // OC-20261121-001：仅窗口置前由底层投递主线程，规避工作线程前台锁。
+                     // OC-20261121-001：仅窗口置前由底层投递主线程，规避工作线程前台锁。
         crate::dock::transient_activate(&aumid, &path, Some(&app))
     })
     .await
@@ -426,16 +426,15 @@ mod launch_tests {
     #[test]
     fn already_running_activates_without_launch() {
         static LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let r =
-            crate::dock::activate_or_launch_decide(
-                Some((1234, false)),
-                "C:\\anything.exe",
-                |_| {
-                    LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Ok(())
-                },
-                |_, _| {}, // 置前注入：测试用空闭包，证实纯 Win32 契约不依赖 AppHandle
-            );
+        let r = crate::dock::activate_or_launch_decide(
+            Some((1234, false)),
+            "C:\\anything.exe",
+            |_| {
+                LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+            |_, _| {}, // 置前注入：测试用空闭包，证实纯 Win32 契约不依赖 AppHandle
+        );
         assert!(r.is_ok());
         assert_eq!(
             LAUNCHES.load(std::sync::atomic::Ordering::Relaxed),

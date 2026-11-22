@@ -55,10 +55,10 @@ pub fn control_live_status(app: AppHandle) -> ControlLiveStatus {
 
     #[cfg(windows)]
     let icons_hidden = {
+        use windows::core::w;
         use windows::Win32::System::Registry::{
             RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
         };
-        use windows::core::w;
         let subkey = w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced");
         let value = w!("HideIcons");
         let mut hk = HKEY(std::ptr::null_mut());
@@ -220,7 +220,12 @@ mod tests {
         };
         let json = serde_json::to_value(&live).unwrap();
         let obj = json.as_object().unwrap();
-        for key in ["taskbarVisible", "iconsHidden", "islandVisible", "dockVisible"] {
+        for key in [
+            "taskbarVisible",
+            "iconsHidden",
+            "islandVisible",
+            "dockVisible",
+        ] {
             assert!(obj.contains_key(key), "缺少 camelCase 键 {key}: {obj:?}");
         }
         assert!(!obj.contains_key("icons_hidden"), "不得输出 snake_case");

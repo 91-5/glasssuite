@@ -173,7 +173,11 @@ fn collect_rows(key: &str) -> Vec<PreviewWin> {
             title
         };
         let degraded = degrade_reason(src, minimized);
-        rows.push(PreviewWin { src, title, degraded });
+        rows.push(PreviewWin {
+            src,
+            title,
+            degraded,
+        });
     }
     truncate_rows(rows)
 }
@@ -536,7 +540,12 @@ unsafe fn show_preview(st: &mut ThreadState, req: ShowReq) {
     }
     // 007 断桥修复：登记预览窗屏幕 rect，供 dock 显隐循环并入 hover 判定
     if let Ok(mut pr) = PREVIEW_RECT.write() {
-        *pr = Some(RECT { left: x, top: y, right: x + w, bottom: y + h });
+        *pr = Some(RECT {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + h,
+        });
     }
     st.hover_row = -1;
 
@@ -902,7 +911,8 @@ unsafe extern "system" fn preview_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                 "LBUTTONDOWN client=({},{}) src={}",
                 x,
                 y,
-                src.map(|s| format!("0x{:x}", s)).unwrap_or_else(|| "NONE".into())
+                src.map(|s| format!("0x{:x}", s))
+                    .unwrap_or_else(|| "NONE".into())
             ));
             if let Some(src) = src {
                 // OC-20261121-006：置前调用投递主线程，规避预览线程（非前台线程）

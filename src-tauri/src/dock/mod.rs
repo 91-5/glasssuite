@@ -214,7 +214,10 @@ pub fn load_config(path: &Path) -> DockConfig {
                 if std::fs::rename(path, &corrupt).is_ok() {
                     winplat::log::log(&format!(
                         "dock: dock.json 解析失败（{e}），原文件已保留为 {}",
-                        corrupt.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                        corrupt
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default()
                     ));
                 } else {
                     winplat::log::log(&format!(
@@ -2106,7 +2109,11 @@ mod config_resilience_tests {
             id: "y".to_string(),
             name: "New".to_string(),
             path: "C:\\new.exe".to_string(),
-            icon: IconData { w: 1, h: 1, rgba: String::new() },
+            icon: IconData {
+                w: 1,
+                h: 1,
+                rgba: String::new(),
+            },
             aumid: None,
             mode: IconMode::Dock,
             free_rect: None,
