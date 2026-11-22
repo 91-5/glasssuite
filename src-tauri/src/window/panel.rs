@@ -104,6 +104,23 @@ pub fn collapse_panel(
     Ok(())
 }
 
+/// 全屏让路退出后，各窗口要补回的 ExStyle 决策（纯函数，便于单测）。
+///
+/// 返回 `(tool_window, no_activate)`：
+/// - island：常显装饰窗，补 TOOLWINDOW + NOACTIVATE（不进任务栏、点击不抢焦点）；
+/// - dock / startmenu：工具窗但不抢焦点需求不同——dock 要能拿焦点（文件对话框依附），
+///   startmenu 是弹出面板，二者只补 TOOLWINDOW、不补 NOACTIVATE；
+/// - control：**标准系统窗口**，两个都不能补。旧实现用 `label != "dock" && label != "startmenu"`
+///   把 control 一起误伤，导致它被加 NOACTIVATE（点击无法置前）+ TOOLWINDOW
+///   （标题栏变窄、最小化按钮消失）——正是 sir 报的两个症状（OC-20261122-001）。
+pub(crate) fn fullscreen_restore_styles(label: &str) -> (bool, bool) {
+    match label {
+        "island" => (true, true),
+        "dock" | "startmenu" => (true, false),
+        _ => (false, false),
+    }
+}
+
 /// 统一全屏让位：一个检测源（`winplat::fullscreen`）同时决定**所有**窗显隐。
 ///
 /// 旧两仓各判一次，出现过「岛藏了 dock 没藏」；合并后这里只问一次。
@@ -137,14 +154,17 @@ pub fn spawn_fullscreen_watch(app: AppHandle, state: Arc<SharedState>) {
                             let _ = win.hide();
                         } else if seen.contains(&label) {
                             let _ = win.show();
-                            // show() 后 tao 可能重设 ExStyle，补回工具窗样式。
-                            // NOACTIVATE 只给 island：dock 要保留拿焦点的能力
-                            // （添加程序的文件对话框依附前台窗口，见 glassdesk v0.7.1）。
+                            // show() 后 tao 可能重设 ExStyle，按窗口类型补回样式。
+                            // OC-20261122-001：control 是标准窗口，绝不能补工具样式
+                            // （否则标题栏最小化按钮消失 + 点击无法激活置前）。
                             #[cfg(windows)]
                             if let Ok(h) = win.hwnd() {
                                 let raw = h.0 as isize;
-                                let _ = winplat::style::hide_from_alt_tab(raw);
-                                if label != "dock" && label != "startmenu" {
+                                let (tool, no_activate) = fullscreen_restore_styles(&label);
+                                if tool {
+                                    let _ = winplat::style::hide_from_alt_tab(raw);
+                                }
+                                if no_activate {
                                     let _ = winplat::style::set_no_activate(raw, true);
                                 }
                             }
@@ -160,4 +180,24 @@ pub fn spawn_fullscreen_watch(app: AppHandle, state: Arc<SharedState>) {
             }
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fullscreen_restore_styles;
+
+    #[test]
+    fn control_is_never_given_tool_styles() {
+        // OC-20261122-001：控制页两个样式都不能补，否则最小化按钮消失+无法置前。
+        assert_eq!(fullscreen_restore_styles("control"), (false, false));
+        // 未知窗口也走安全默认（不误伤）。
+        assert_eq!(fullscreen_restore_styles("something_else"), (false, false));
+    }
+
+    #[test]
+    fn island_dock_startmenu_keep_their_styles() {
+        assert_eq!(fullscreen_restore_styles("island"), (true, true));
+        assert_eq!(fullscreen_restore_styles("dock"), (true, false));
+        assert_eq!(fullscreen_restore_styles("startmenu"), (true, false));
+    }
 }

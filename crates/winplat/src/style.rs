@@ -32,6 +32,14 @@ pub fn tool_window_bits(ex: isize) -> isize {
     (ex | TOOLWINDOW) & !APPWINDOW
 }
 
+/// 恢复标准窗口：清 TOOLWINDOW、清 NOACTIVATE、置 APPWINDOW，其余位原样保留。
+///
+/// 控制页曾被全屏让路恢复逻辑误加 TOOLWINDOW|NOACTIVATE，导致标题栏变窄（最小化
+/// 按钮消失）且点击无法激活置前。此函数用于唤起时幂等自愈（OC-20261122-001）。
+pub fn normal_window_bits(ex: isize) -> isize {
+    ((ex & !TOOLWINDOW) & !NOACTIVATE) | APPWINDOW
+}
+
 /// 开关 NOACTIVATE，其余位原样保留。
 pub fn no_activate_bits(ex: isize, enabled: bool) -> isize {
     if enabled {
@@ -63,6 +71,12 @@ pub fn hide_from_alt_tab(raw_hwnd: isize) -> Result<(), String> {
 #[cfg(windows)]
 pub fn set_no_activate(raw_hwnd: isize, enabled: bool) -> Result<(), String> {
     imp::update_ex_style(raw_hwnd, |ex| no_activate_bits(ex, enabled))
+}
+
+/// 恢复标准窗口样式（清 TOOLWINDOW/NOACTIVATE，置 APPWINDOW）。控制页唤起时自愈用。
+#[cfg(windows)]
+pub fn as_normal_window(raw_hwnd: isize) -> Result<(), String> {
+    imp::update_ex_style(raw_hwnd, normal_window_bits)
 }
 
 /// 开关鼠标穿透。开启时窗口对鼠标完全透明（事件落到下层窗口）。
@@ -133,6 +147,21 @@ mod tests {
         let on = no_activate_bits(off, true);
         assert_eq!(on & NOACTIVATE, NOACTIVATE);
         assert_eq!(no_activate_bits(on, false), off);
+    }
+
+    /// OC-20261122-001：控制页被误加工具样式后，唤起自愈必须清干净三处。
+    #[test]
+    fn normal_window_clears_tool_and_noactivate() {
+        // 被污染的样式：APPWINDOW 已清、TOOLWINDOW|NOACTIVATE 已置、TOPMOST 无关。
+        let polluted = (0x0000_0118 | TOOLWINDOW | NOACTIVATE) & !APPWINDOW;
+        let fixed = normal_window_bits(polluted);
+        assert_eq!(fixed & TOOLWINDOW, 0, "TOOLWINDOW 必须清除");
+        assert_eq!(fixed & NOACTIVATE, 0, "NOACTIVATE 必须清除");
+        assert_eq!(fixed & APPWINDOW, APPWINDOW, "APPWINDOW 必须恢复");
+        // 其余位原样保留。
+        assert_eq!(fixed & 0x118, 0x118);
+        // 幂等：对已正常的窗口再跑一次结果不变。
+        assert_eq!(normal_window_bits(fixed), fixed);
     }
 
     #[test]

@@ -22,6 +22,12 @@ pub fn ensure_control_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     if let Some(w) = app.get_webview_window("control") {
         w.show()?;
         w.unminimize()?;
+        // OC-20261122-001：全屏让路恢复曾误给 control 加 TOOLWINDOW|NOACTIVATE，
+        // 导致最小化按钮消失、点击无法置前。唤起时幂等自愈为标准窗口样式。
+        #[cfg(windows)]
+        if let Ok(h) = w.hwnd() {
+            let _ = winplat::style::as_normal_window(h.0 as isize);
+        }
         w.set_focus()?;
         winplat::log::log("control: 唤起已有窗口");
         return Ok(w);
@@ -47,6 +53,10 @@ pub fn ensure_control_window(app: &AppHandle) -> tauri::Result<WebviewWindow> {
             app_handle.exit(0);
         }
     });
+    #[cfg(windows)]
+    if let Ok(h) = w.hwnd() {
+        let _ = winplat::style::as_normal_window(h.0 as isize);
+    }
     w.set_focus()?;
     winplat::log::log("control: 新建窗口");
     Ok(w)
