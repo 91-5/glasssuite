@@ -353,11 +353,48 @@ pub fn fit_dock(
     apply_fit_dock(&window, w, h)
 }
 
+// ---------------------------------------------------------------------------
+// 目标尺寸权威化（OC-20261124-001：dock 右半被截断）
+//
+// 背景：dock 窗口的宽度有两个写入源——前端 `fit_dock`（内容真实宽度）与
+// `shell.rs` 的 `ScaleFactorChanged` 分支（曾把窗口写回建窗启动尺寸 800）。
+// 后者一旦发生，前端因「上次已上报过该宽度」而去重，不再重报，窗口就永久
+// 卡在 800（内容需 ~1064），右侧图标被裁（症状：微信图标被切一半）。
+//
+// 现在：dock 的**目标尺寸以最后一次前端上报为准**（本模块状态），
+// 定位循环每轮核对「实际尺寸 vs 目标尺寸」，不一致就纠正回目标。
+// 这样即使有第二个尺寸写入源出现，也会在一个轮询周期（120ms）内被拉回。
+// ---------------------------------------------------------------------------
+
+/// 前端上报的目标尺寸（CSS 逻辑像素）。None = 尚未收到过上报。
+static TARGET_SIZE: std::sync::Mutex<Option<(f64, f64)>> = std::sync::Mutex::new(None);
+
+fn remember_target_size(w: f64, h: f64) {
+    if let Ok(mut t) = TARGET_SIZE.lock() {
+        *t = Some((w, h));
+    }
+}
+
+/// 取当前目标尺寸。
+pub(crate) fn target_size() -> Option<(f64, f64)> {
+    TARGET_SIZE.lock().ok().and_then(|t| *t)
+}
+
+/// 判断「实际尺寸是否偏离目标尺寸」。
+///
+/// 纯函数，便于单测锁定病灶层（OC-20261124-001）。
+/// 容差 1.0px：低于此视为浮点/取整噪声，避免逐帧抖动式重设。
+pub(crate) fn size_mismatch(actual_w: f64, actual_h: f64, target: (f64, f64)) -> bool {
+    (actual_w - target.0).abs() > 1.0 || (actual_h - target.1).abs() > 1.0
+}
+
 /// 真正的几何写入（主线程执行）。锁期间只允许经 flush 走到这里。
 pub(crate) fn apply_fit_dock(window: &tauri::WebviewWindow, w: f64, h: f64) -> Result<(), String> {
     use tauri::LogicalSize;
     let w = w.max(120.0);
     let h = h.max(48.0);
+    remember_target_size(w, h);
+
     // 2026-11-16 修复（dock 整体不可见，OC-20261116-001）：旧实现在这里用
     // `window.current_monitor()` 算水平居中 x，而窗口的「当前显示器」取决于它此刻
     // 挂在哪块屏上——主屏任务栏被外部守卫藏住时 dock 被摆到两块屏之间的无人区，
@@ -456,5 +493,36 @@ mod launch_tests {
             rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
             "工作线程上应返回 Err 而非挂死"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 尺寸权威化单测（OC-20261124-001）
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod size_authority_tests {
+    use super::size_mismatch;
+
+    #[test]
+    fn exact_match_is_not_mismatch() {
+        assert!(!size_mismatch(1064.0, 76.0, (1064.0, 76.0)));
+    }
+
+    #[test]
+    fn startup_width_800_is_detected_as_mismatch() {
+        // 症状态：窗口被写回建窗启动宽度 800，内容需 1064 → 必须判为偏离
+        assert!(size_mismatch(800.0, 76.0, (1064.0, 76.0)));
+    }
+
+    #[test]
+    fn sub_pixel_noise_is_tolerated() {
+        // 容差 1.0px：浮点/取整噪声不得触发重设（否则逐帧抖动）
+        assert!(!size_mismatch(1064.2, 76.0, (1064.0, 76.0)));
+        assert!(!size_mismatch(1064.0, 75.5, (1064.0, 76.0)));
+    }
+
+    #[test]
+    fn height_drift_is_detected() {
+        assert!(size_mismatch(1064.0, 60.0, (1064.0, 76.0)));
     }
 }

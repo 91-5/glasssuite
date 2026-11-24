@@ -980,6 +980,31 @@ pub fn dock_logic(app: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
         let size = dock
             .outer_size()
             .unwrap_or(tauri::PhysicalSize::new(780, 76));
+
+        // OC-20261124-001：尺寸权威化——目标尺寸以最后一次前端 `fit_dock` 上报为准。
+        // 若实际窗口尺寸偏离目标（例如被 `ScaleFactorChanged` 分支写回建窗启动尺寸
+        // 800，或任何第二个尺寸写入源），本轮直接纠正回目标尺寸。
+        // 前端去重逻辑只认「自己上次上报过什么」，察觉不到窗口被外部改宽，
+        // 所以这层兜底是必需的——否则窗口会永久卡在旧宽度，右侧图标被裁。
+        //
+        // 单位：目标尺寸是 CSS 逻辑像素（同 `apply_fit_dock` 的 LogicalSize 口径），
+        // `outer_size()` 是物理像素——必须先乘窗口自身的 scale_factor 换算到同一域，
+        // 否则在 150% 缩放屏上会把「正常尺寸」误判成「偏离」而无限重设。
+        if let Some((tw, th)) = crate::dock::api::target_size() {
+            let scale = dock.scale_factor().unwrap_or(1.0);
+            let expect_w = tw * scale;
+            let expect_h = th * scale;
+            let actual_w = size.width as f64;
+            let actual_h = size.height as f64;
+            if crate::dock::api::size_mismatch(actual_w, actual_h, (expect_w, expect_h)) {
+                let _ = dock.set_size(tauri::LogicalSize::new(tw, th));
+                crate::dock::menu::debug_note(&format!(
+                    "dock: size corrected actual={}x{} expect={}x{} (scale={})",
+                    actual_w, actual_h, expect_w, expect_h, scale
+                ));
+            }
+        }
+
         let x = (tr.left + tr.right - size.width as i32) / 2;
         let y = tr.top - size.height as i32 - DOCK_MARGIN;
         if last_pos != Some((x, y)) {

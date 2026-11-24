@@ -431,6 +431,8 @@ function App() {
   // 等于「药丸宽 + 12」，否则右侧被裁 2px（旧的 +8 是 padding=4 时代的常数）。
   const DOCK_PAD_X = 6;
   const lastFit = useRef<{ w: number; h: number } | null>(null);
+  // OC-20261124-001：强制下次 effect 重测（DPI 事件后 Rust 侧通知）。
+  const forceRefit = useRef(false);
   useEffect(() => {
     const pill = pillRef.current;
     if (!pill) return;
@@ -438,10 +440,41 @@ function App() {
     const w = r.width + DOCK_PAD_X * 2;
     const h = r.height + DOCK_PAD_X * 2;
     const prev = lastFit.current;
-    if (prev && Math.abs(prev.w - w) < 0.5 && Math.abs(prev.h - h) < 0.5) return;
+    // 窗口实际宽度被**外部**改动（OS / 其它路径）时的自愈判定。
+    //
+    // 旧实现只跟「上次上报值」比较：窗口被压回 800 后，前端仍记得自己报过 1076
+    // → 认为无需变更 → 永远不再上报 → 窗口永久卡在 800 → 右侧图标被裁。
+    //
+    // 现在由 Rust 侧接管这条路径（OC-20261124-001）：
+    //   ① Rust 记住前端最后一次上报的目标尺寸，定位循环（120ms）核对「实际 vs 目标」，
+    //      偏离就纠正回目标（实测日志：size corrected actual=800x76 expect=1134x76）；
+    //   ② Rust 在 DPI 事件后发 `dock-refit` 事件，前端清掉去重基线并立即重测。
+    //
+    // 这里**不再**用 window.innerWidth 做启发式推断——该值与上报值存在稳定偏差时
+    // 会每 500ms 重复 invoke，且可能与 Rust 侧纠正逻辑形成反馈环。
+    // 权威判定统一由 Rust 侧（单一真相源）负责。
+    if (!forceRefit.current &&
+      prev &&
+      Math.abs(prev.w - w) < 0.5 &&
+      Math.abs(prev.h - h) < 0.5)
+      return;
+    forceRefit.current = false;
     lastFit.current = { w, h };
     invoke("fit_dock", { w, h }).catch(() => {});
   }, [icons, transients]);
+
+  // OC-20261124-001：Rust 侧在 ScaleFactorChanged 时发现窗口尺寸被外部改动
+  // （旧实现用 STARTUP_DOCK=800 覆盖了前端上报的 1076），发事件让前端立刻重测
+  // （不等下一个 transients 轮询节拍）。
+  useEffect(
+    () =>
+      subscribe<void>(EVENTS.dockRefit, () => {
+        forceRefit.current = true;
+        // 触发一次 effect 重跑（transients 每 500ms 也会跑，但立刻重测更快）。
+        setTransients((prev) => prev.slice());
+      }),
+    [],
+  );
 
   // 禁用 WebView 默认右键菜单（透明区右键会弹出浏览器菜单）
   useEffect(() => {

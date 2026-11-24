@@ -113,6 +113,8 @@ export const PRESS_GESTURE = {
 export const EVENTS = {
   /** 运行标识统一快照推送（OC-20261115-006：watcher 变化 / 配置 bump 时全量下发）。 */
   runningChanged: "dock-running",
+  /** dock 尺寸需重新测量（OC-20261124-001：DPI 事件后窗口尺寸被外部改动）。 */
+  dockRefit: "dock-refit",
   /** 系统指标（1s 一次）。 */
   sysMetrics: "sys-metrics",
   /** 天气（15min 一次；未配置时永不触发）。 */

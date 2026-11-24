@@ -173,12 +173,40 @@ fn build_window(
         let own_label = label.to_string();
         win.on_window_event(move |event| {
             if let tauri::WindowEvent::ScaleFactorChanged { .. } = event {
-                // startmenu 不能按 Anchor::Dock 摆（会摆到任务栏上方 dock 位）。
-                // 它走 menu::toggle 的自适应几何（含目标屏 scale），这里只清缓存强制重算。
-                if own_label == "startmenu" {
-                    crate::dock::menu::invalidate_anchor_cache();
-                } else if let Some(w) = handle.get_webview_window(&own_label) {
-                    let _ = place(&w, anchor_copy, size.0, size.1);
+                match scale_changed_action(&own_label) {
+                    // startmenu 不能按 Anchor::Dock 摆（会摆到任务栏上方 dock 位）。
+                    // 它走 menu::toggle 的自适应几何（含目标屏 scale），这里只清缓存强制重算。
+                    ScaleChangedAction::InvalidateMenuAnchor => {
+                        crate::dock::menu::invalidate_anchor_cache();
+                    }
+                    // dock 的**宽度单一真相源是前端 fit_dock**（药丸实际宽度 + padding），
+                    // 不是这里的 startup 常量。
+                    //
+                    // 2026-11-24 修复（OC-20261124-001，sir 报「dock 右半被截断、偶尔发生」）：
+                    // 旧实现对 dock 也走 `place(&w, anchor_copy, size.0, size.1)`，
+                    // 而 `size` = startup = STARTUP_DOCK = (800, 76)。于是：
+                    //   ① 前端 fit_dock 已把窗口撑到内容宽（实测 1076）；
+                    //   ② 触发 ScaleFactorChanged（换屏 / 改 DPI）→ place(startup) 把窗口
+                    //      **写回 800**；
+                    //   ③ 前端 lastFit 去重是「与上次**上报值**比较」，它仍记得自己报过
+                    //      1076 → 认为无需变更 → **永远不再上报**；
+                    //   ④ 窗口永久卡在 800，内容 1064 被裁掉右侧约 264px（微信等图标
+                    //      只显示一半）。
+                    // 「偶尔」的成因：只有触发 DPI 事件时才发生（换显示器、跨屏）。
+                    //
+                    // 现在：dock 只**重定位**不**改尺寸**（尺寸交给前端 fit_dock），
+                    // 且重定位后主动通知前端重新测量，避免外部改动后前端不自知。
+                    ScaleChangedAction::RepositionOnly => {
+                        if let Some(w) = handle.get_webview_window(&own_label) {
+                            let _ = reposition_only(&w, anchor_copy);
+                            notify_refit(&w);
+                        }
+                    }
+                    ScaleChangedAction::PlaceWithStartupSize => {
+                        if let Some(w) = handle.get_webview_window(&own_label) {
+                            let _ = place(&w, anchor_copy, size.0, size.1);
+                        }
+                    }
                 }
             }
         });
@@ -270,6 +298,63 @@ fn compute_geometry(
         PhysicalPosition::new(x, y),
         PhysicalSize::new(pw as u32, ph as u32),
     ))
+}
+
+/// ScaleFactorChanged 时各窗口应采取的动作（OC-20261124-001）。
+///
+/// 抽成纯函数是为了能单测锁死「dock 绝不能用 startup 尺寸覆盖」这条规则——
+/// 它是「dock 右半被截断」那个 bug 的根因，属于必须被测试覆盖的决策层。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ScaleChangedAction {
+    /// startmenu：清锚点缓存，由 menu::toggle 按目标屏 scale 重算几何。
+    InvalidateMenuAnchor,
+    /// dock：只重定位、不改尺寸（宽度真相源在前端 fit_dock）+ 通知前端重测。
+    RepositionOnly,
+    /// island 等固定尺寸窗口：按启动尺寸重新 place（位置与尺寸都重算）。
+    PlaceWithStartupSize,
+}
+
+/// 决策：某个窗口在 ScaleFactorChanged 时该怎么做。
+pub fn scale_changed_action(label: &str) -> ScaleChangedAction {
+    match label {
+        "startmenu" => ScaleChangedAction::InvalidateMenuAnchor,
+        // dock 必须走 RepositionOnly：用 STARTUP_DOCK(800) 覆盖前端上报的内容宽
+        // 会把窗口压回初始宽，右侧图标被裁，且前端因去重不再上报 → 永久卡死。
+        "dock" => ScaleChangedAction::RepositionOnly,
+        _ => ScaleChangedAction::PlaceWithStartupSize,
+    }
+}
+
+/// 只重定位、不改尺寸（OC-20261124-001）。
+///
+/// dock 的宽度由前端 `fit_dock` 上报（药丸实际宽 + padding），是**单一真相源**；
+/// Rust 侧若在 DPI 事件里用启动常量（STARTUP_DOCK=800）改尺寸，会把窗口压回
+/// 初始宽 → 右侧图标被裁（见 build_window 里的 ScaleFactorChanged 分支注释）。
+///
+/// 这里复用 `compute_geometry` 的定位算法，但尺寸取**窗口当前实际尺寸**，
+/// 因此只移动位置、不改变大小。
+fn reposition_only(window: &WebviewWindow, anchor: Anchor) -> Result<(), String> {
+    let current = window.outer_size().map_err(|e| e.to_string())?;
+    let monitor = window
+        .primary_monitor()
+        .map_err(|e| e.to_string())?
+        .or_else(|| window.current_monitor().ok().flatten())
+        .ok_or_else(|| "找不到主显示器".to_string())?;
+    let scale = monitor.scale_factor();
+    // 当前尺寸是物理像素 → 换算回逻辑像素交给 compute_geometry 定位（它会再乘一次 scale）。
+    let w_logical = current.width as f64 / scale;
+    let h_logical = current.height as f64 / scale;
+    let (position, _size) = compute_geometry(window, anchor, w_logical, h_logical)?;
+    window.set_position(position).map_err(|e| e.to_string())
+}
+
+/// 通知前端重新测量并上报 dock 尺寸（OC-20261124-001）。
+///
+/// 场景：窗口尺寸被外部（OS / 其它路径）改动后，前端并不知道，继续沿用旧的
+/// `lastFit` 去重基线 → 永远不再上报 → 窗口卡在错误宽度。
+/// 这里发一个事件，前端收到后清掉去重基线并强制重新测量。
+fn notify_refit(window: &WebviewWindow) {
+    let _ = window.emit("dock-refit", ());
 }
 
 /// 计算并应用窗口位置与尺寸（逻辑 → 物理在此一次性换算）。
@@ -379,4 +464,58 @@ pub fn fit_island(
         return Ok(());
     }
     place(&window, Anchor::Island, ISLAND_W, ISLAND_H)
+}
+
+// ---------------------------------------------------------------------------
+// OC-20261124-001：ScaleFactorChanged 的按窗口决策
+//
+// 背景（sir 报「dock 右半被截断、偶尔发生」）：
+//   dock 宽度由前端 fit_dock 上报（药丸实际宽 + padding），是单一真相源；
+//   但旧实现在 DPI 事件里对 dock 调 `place(startup)`，而 startup = STARTUP_DOCK
+//   = (800, 76) → 把窗口写回初始宽 → 右侧内容（实测 1064px）被裁掉约 264px。
+//   前端 lastFit 去重是「与上次**上报值**比较」，它仍记得报过 1076 → 永远不再上报
+//   → 窗口永久卡在 800 → 「偶尔发生」（只在换屏/跨屏触发 DPI 事件时）。
+//
+// 这里的单测把「dock 绝不能用启动尺寸覆盖」这条规则锁死，防止将来重构改回去。
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod scale_changed_tests {
+    use super::*;
+
+    #[test]
+    fn dock_must_not_use_startup_size() {
+        // dock 走 RepositionOnly：只挪位置，不改尺寸。
+        assert_eq!(
+            scale_changed_action("dock"),
+            ScaleChangedAction::RepositionOnly
+        );
+        // 回归防线：dock 绝不能落到 PlaceWithStartupSize 分支。
+        assert_ne!(
+            scale_changed_action("dock"),
+            ScaleChangedAction::PlaceWithStartupSize
+        );
+    }
+
+    #[test]
+    fn startmenu_invalidates_anchor_cache() {
+        assert_eq!(
+            scale_changed_action("startmenu"),
+            ScaleChangedAction::InvalidateMenuAnchor
+        );
+    }
+
+    #[test]
+    fn island_and_unknown_use_startup_size() {
+        // island 是固定尺寸窗口，重算位置与尺寸都正确。
+        assert_eq!(
+            scale_changed_action("island"),
+            ScaleChangedAction::PlaceWithStartupSize
+        );
+        // 未知窗口保持旧行为（按启动尺寸 place），避免行为漂移。
+        assert_eq!(
+            scale_changed_action("some-future-window"),
+            ScaleChangedAction::PlaceWithStartupSize
+        );
+    }
 }
