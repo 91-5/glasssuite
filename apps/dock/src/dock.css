@@ -163,7 +163,9 @@ body,
   flex: 1;
   overflow-y: auto;
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  /* 自适应列数：面板随显示器 DPI 缩放变动宽度时，列数随之调整，
+     避免固定 4 列在窄面板下把图标/名称挤到只显示一半（2026-11-22 OC-002）。 */
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
   gap: 4px;
   align-content: start;
   padding: 2px;

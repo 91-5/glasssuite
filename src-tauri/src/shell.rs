@@ -173,7 +173,11 @@ fn build_window(
         let own_label = label.to_string();
         win.on_window_event(move |event| {
             if let tauri::WindowEvent::ScaleFactorChanged { .. } = event {
-                if let Some(w) = handle.get_webview_window(&own_label) {
+                // startmenu 不能按 Anchor::Dock 摆（会摆到任务栏上方 dock 位）。
+                // 它走 menu::toggle 的自适应几何（含目标屏 scale），这里只清缓存强制重算。
+                if own_label == "startmenu" {
+                    crate::dock::menu::invalidate_anchor_cache();
+                } else if let Some(w) = handle.get_webview_window(&own_label) {
                     let _ = place(&w, anchor_copy, size.0, size.1);
                 }
             }

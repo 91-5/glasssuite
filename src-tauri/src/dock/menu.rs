@@ -36,7 +36,7 @@ use std::sync::{LazyLock, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::Manager;
+use tauri::{Manager, PhysicalSize};
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HWND, PROPERTYKEY, RECT};
 use windows::Win32::UI::Shell::{
@@ -54,9 +54,20 @@ const PANEL_GAP: i32 = 6;
 const BLUR_DELAY_MS: u64 = 150;
 /// 失焦复查的代数：每次 show/hide 自增，延迟任务过期即弃。
 static BLUR_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// 上次面板锚点（dock 没动 → 展开 时跳过 SetWindowPos）。
-static LAST_ANCHOR: LazyLock<std::sync::Mutex<Option<(i32, i32)>>> =
+/// 面板几何缓存键：(x, y, 物理宽, 物理高, scale.to_bits)。
+type PanelAnchorKey = (i32, i32, u32, u32, u64);
+
+/// 上次面板几何（dock 没动且缩放没变 → 展开时跳过 SetWindowPos）。
+/// 含 scale 保证换显示器/改缩放后必然失效重摆。
+static LAST_ANCHOR: LazyLock<std::sync::Mutex<Option<PanelAnchorKey>>> =
     LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// 缩放/换屏变化时清除锚点缓存，强制下次展开按新 scale 重算几何。
+pub fn invalidate_anchor_cache() {
+    if let Ok(mut l) = LAST_ANCHOR.lock() {
+        *l = None;
+    }
+}
 
 static MENU: RwLock<Option<Vec<MenuApp>>> = RwLock::new(None);
 static ICONS: RwLock<Option<HashMap<String, IconData>>> = RwLock::new(None);
@@ -527,21 +538,26 @@ pub fn toggle(app: &tauri::AppHandle) {
     // 热路径优化：dock 没动就跳过 SetWindowPos（二次展开 ≤50ms 判据的敏感项）。
     let t_toggle = std::time::Instant::now();
     let mut positioned = false;
-    if let Some((x, y)) = app
+    if let Some((x, y, w, h, scale)) = app
         .get_webview_window("dock")
-        .and_then(|d| panel_anchor(&d, &win))
+        .and_then(|d| panel_geometry(&d, &win))
     {
+        // 缓存键含 (x,y,w,h,scale)：换显示器/改缩放后 scale 变 → 必然重摆，
+        // 不再用旧物理坐标把面板停在错误位置（原 positioned=false 直接跳过根因）。
+        let key = (x, y, w, h, scale.to_bits());
         let changed = {
             let last = LAST_ANCHOR.lock().ok();
             match last.as_deref() {
-                Some(a) => *a != Some((x, y)),
+                Some(a) => *a != Some(key),
                 None => true,
             }
         };
         if changed {
+            // 先 set_size 再 set_position：set_size 保持左上角，顺序反了会先挪再缩。
+            let _ = win.set_size(PhysicalSize::new(w, h));
             let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
             if let Ok(mut l) = LAST_ANCHOR.lock() {
-                *l = Some((x, y));
+                *l = Some(key);
             }
             positioned = true;
         }
@@ -592,12 +608,21 @@ pub fn toggle(app: &tauri::AppHandle) {
     log("panel show (toggle, focused)");
 }
 
-/// 面板锚点：dock 窗口左端上方，夹回面板所在显示器。
-fn panel_anchor(dock: &tauri::WebviewWindow, win: &tauri::WebviewWindow) -> Option<(i32, i32)> {
+/// 面板自适应几何（2026-11-22 OC-20261122-002）：与 `shell.rs::compute_geometry`
+/// 同口径——尺寸按目标屏 scale 做逻辑→物理换算，位置在物理像素域算，夹回面板所在
+/// 显示器。换显示器（96→144dpi）后 scale 变化，返回的几何随之变化，配合 LAST_ANCHOR
+/// 缓存键含 scale 实现自动失效。
+///
+/// 返回 `(x, y, 物理宽, 物理高, scale)`。
+fn panel_geometry(
+    dock: &tauri::WebviewWindow,
+    win: &tauri::WebviewWindow,
+) -> Option<(i32, i32, u32, u32, f64)> {
+    let scale = win.scale_factor().ok()?.max(0.25);
+    let (w, h) = panel_physical_size(scale);
     let hwnd = HWND(dock.hwnd().ok()?.0);
     let mut r = RECT::default();
     unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut r).ok()? };
-    let size = win.outer_size().ok()?;
     let hmon = unsafe {
         windows::Win32::Graphics::Gdi::MonitorFromWindow(
             hwnd,
@@ -612,9 +637,34 @@ fn panel_anchor(dock: &tauri::WebviewWindow, win: &tauri::WebviewWindow) -> Opti
         let _ = windows::Win32::Graphics::Gdi::GetMonitorInfoW(hmon, &mut mi);
     };
     let m = mi.rcMonitor;
-    let x = r.left.clamp(m.left + 4, m.right - size.width as i32 - 4);
-    let y = (r.top - size.height as i32 - PANEL_GAP).max(m.top + 4);
-    Some((x, y))
+    let x = r.left.clamp(m.left + 4, m.right - w as i32 - 4);
+    // 面板底边压在 dock 上沿之上（留 PANEL_GAP），杜绝「被 dock 遮挡」。
+    let y = (r.top - h as i32 - PANEL_GAP).max(m.top + 4);
+    Some((x, y, w, h, scale))
+}
+
+/// 面板逻辑尺寸 → 目标屏物理尺寸（纯函数，供单测锁定 DPI 自适应口径）。
+fn panel_physical_size(scale: f64) -> (u32, u32) {
+    let s = scale.max(0.25);
+    (
+        (PANEL_W * s).round().max(1.0) as u32,
+        (PANEL_H * s).round().max(1.0) as u32,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panel_size_scales_with_monitor_dpi() {
+        // 100% DPI：360×480；150% DPI：540×720——尺寸随目标屏缩放线性变化。
+        assert_eq!(panel_physical_size(1.0), (360, 480));
+        assert_eq!(panel_physical_size(1.5), (540, 720));
+        assert_eq!(panel_physical_size(1.25), (450, 600));
+        // 防异常 scale 产生零/负尺寸。
+        assert_eq!(panel_physical_size(0.0), (90, 120));
+    }
 }
 
 /// 失焦收回：延迟 150ms 复查前台——前台仍属**本进程**（面板自身/dock，含焦点在
